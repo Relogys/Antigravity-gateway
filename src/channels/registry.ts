@@ -7,8 +7,9 @@ import { errorMessage } from "./utils.js";
  *   `createAdapter(config: GatewayConfig): ChannelAdapter`
  * where the returned adapter's `name` equals `<channel>` (photon, telegram, discord,
  * slack, feishu, dingtalk, onebot, webhook, wecom, qqbot, matrix, mattermost,
- * line, irc). Modules are loaded lazily through the computed specifier below so a
- * missing or broken channel never prevents the others from starting.
+ * line, irc, whatsapp, zulip, rocketchat, signal, teams, googlechat). Modules
+ * are loaded lazily through the computed specifier below so a missing or broken
+ * channel never prevents the others from starting.
  */
 export interface AdapterFactoryModule {
   createAdapter(config: GatewayConfig): ChannelAdapter;

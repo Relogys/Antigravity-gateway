@@ -231,6 +231,12 @@ const CHANNEL_HINTS: Record<ChannelName, string> = {
   mattermost: "set MATTERMOST_BASE_URL + MATTERMOST_BOT_TOKEN",
   line: "set LINE_CHANNEL_ACCESS_TOKEN + LINE_CHANNEL_SECRET",
   irc: "set IRC_HOST",
+  whatsapp: "set WHATSAPP_ACCESS_TOKEN + WHATSAPP_PHONE_NUMBER_ID",
+  zulip: "set ZULIP_SITE + ZULIP_BOT_EMAIL + ZULIP_API_KEY",
+  rocketchat: "set ROCKETCHAT_URL + ROCKETCHAT_USER_ID + ROCKETCHAT_AUTH_TOKEN",
+  signal: "set SIGNAL_API_URL + SIGNAL_ACCOUNT",
+  teams: "set TEAMS_WEBHOOK_SECRET or TEAMS_APP_ID + TEAMS_APP_PASSWORD or TEAMS_INCOMING_WEBHOOK_URL",
+  googlechat: "set GOOGLECHAT_WEBHOOK_URL or GOOGLECHAT_ACCESS_TOKEN or GOOGLECHAT_VERIFICATION_TOKEN",
 };
 
 function channelHint(name: ChannelName): string {
@@ -272,6 +278,18 @@ function describeChannel(name: ChannelName, cfg?: GatewayConfig): string {
       return `${cfg.line?.host}:${cfg.line?.port} allowedUsers=${cfg.line?.allowedUsers.size}`;
     case "irc":
       return `${cfg.irc?.host}:${cfg.irc?.port} tls=${cfg.irc?.tls} channels=${cfg.irc?.channels.length} allowedUsers=${cfg.irc?.allowedUsers.size}`;
+    case "whatsapp":
+      return `${cfg.whatsapp?.webhookHost}:${cfg.whatsapp?.webhookPort}${cfg.whatsapp?.webhookPath} api=${cfg.whatsapp?.apiVersion} allowedUsers=${cfg.whatsapp?.allowedUsers.size}`;
+    case "zulip":
+      return `streams=${cfg.zulip?.streams.length} mention=${cfg.zulip?.requireMention} allowedUsers=${cfg.zulip?.allowedUsers.size}`;
+    case "rocketchat":
+      return `mention=${cfg.rocketchat?.requireMention} allowedUsers=${cfg.rocketchat?.allowedUsers.size}`;
+    case "signal":
+      return `poll=${cfg.signal?.pollIntervalMs}ms allowedUsers=${cfg.signal?.allowedUsers.size}`;
+    case "teams":
+      return `${cfg.teams?.webhookHost}:${cfg.teams?.webhookPort}${cfg.teams?.webhookPath} allowedUsers=${cfg.teams?.allowedUsers.size}`;
+    case "googlechat":
+      return `${cfg.googlechat?.webhookHost}:${cfg.googlechat?.webhookPort}${cfg.googlechat?.webhookPath} allowedUsers=${cfg.googlechat?.allowedUsers.size}`;
   }
 }
 

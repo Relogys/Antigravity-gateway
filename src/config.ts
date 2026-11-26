@@ -19,6 +19,12 @@ export const CHANNEL_NAMES = [
   "mattermost",
   "line",
   "irc",
+  "whatsapp",
+  "zulip",
+  "rocketchat",
+  "signal",
+  "teams",
+  "googlechat",
 ] as const;
 
 export type ChannelName = (typeof CHANNEL_NAMES)[number];
@@ -259,6 +265,52 @@ const envSchema = z.object({
   IRC_PASSWORD: optionalString,
   IRC_CHANNELS: optionalString,
   IRC_ALLOWED_USERS: optionalString,
+
+  WHATSAPP_ACCESS_TOKEN: optionalString,
+  WHATSAPP_PHONE_NUMBER_ID: optionalString,
+  WHATSAPP_VERIFY_TOKEN: optionalString,
+  WHATSAPP_APP_SECRET: optionalString,
+  WHATSAPP_API_VERSION: optionalString,
+  WHATSAPP_WEBHOOK_HOST: optionalString,
+  WHATSAPP_WEBHOOK_PORT: numberEnv(1, 65535, 18794),
+  WHATSAPP_WEBHOOK_PATH: optionalString,
+  WHATSAPP_ALLOWED_USERS: optionalString,
+
+  ZULIP_SITE: optionalString,
+  ZULIP_BOT_EMAIL: optionalString,
+  ZULIP_API_KEY: optionalString,
+  ZULIP_STREAMS: optionalString,
+  ZULIP_REQUIRE_MENTION: optionalString,
+  ZULIP_ALLOWED_USERS: optionalString,
+
+  ROCKETCHAT_URL: optionalString,
+  ROCKETCHAT_USER_ID: optionalString,
+  ROCKETCHAT_AUTH_TOKEN: optionalString,
+  ROCKETCHAT_REQUIRE_MENTION: optionalString,
+  ROCKETCHAT_ALLOWED_USERS: optionalString,
+
+  SIGNAL_API_URL: optionalString,
+  SIGNAL_ACCOUNT: optionalString,
+  SIGNAL_POLL_INTERVAL_MS: numberEnv(200, 300_000, 3000),
+  SIGNAL_ALLOWED_USERS: optionalString,
+
+  TEAMS_WEBHOOK_SECRET: optionalString,
+  TEAMS_APP_ID: optionalString,
+  TEAMS_APP_PASSWORD: optionalString,
+  TEAMS_TENANT_ID: optionalString,
+  TEAMS_INCOMING_WEBHOOK_URL: optionalString,
+  TEAMS_WEBHOOK_HOST: optionalString,
+  TEAMS_WEBHOOK_PORT: numberEnv(1, 65535, 18795),
+  TEAMS_WEBHOOK_PATH: optionalString,
+  TEAMS_ALLOWED_USERS: optionalString,
+
+  GOOGLECHAT_WEBHOOK_URL: optionalString,
+  GOOGLECHAT_ACCESS_TOKEN: optionalString,
+  GOOGLECHAT_VERIFICATION_TOKEN: optionalString,
+  GOOGLECHAT_WEBHOOK_HOST: optionalString,
+  GOOGLECHAT_WEBHOOK_PORT: numberEnv(1, 65535, 18796),
+  GOOGLECHAT_WEBHOOK_PATH: optionalString,
+  GOOGLECHAT_ALLOWED_USERS: optionalString,
 });
 
 export interface PhotonConfig {
@@ -365,6 +417,70 @@ export interface IrcConfig {
   allowedUsers: Set<string>;
 }
 
+export interface WhatsAppConfig {
+  enabled: boolean;
+  accessToken: string;
+  phoneNumberId: string;
+  verifyToken: string;
+  appSecret: string;
+  apiVersion: string;
+  webhookHost: string;
+  webhookPort: number;
+  webhookPath: string;
+  allowedUsers: Set<string>;
+}
+
+export interface ZulipConfig {
+  enabled: boolean;
+  site: string;
+  botEmail: string;
+  apiKey: string;
+  streams: string[];
+  requireMention: boolean;
+  allowedUsers: Set<string>;
+}
+
+export interface RocketChatConfig {
+  enabled: boolean;
+  url: string;
+  userId: string;
+  authToken: string;
+  requireMention: boolean;
+  allowedUsers: Set<string>;
+}
+
+export interface SignalConfig {
+  enabled: boolean;
+  apiUrl: string;
+  account: string;
+  pollIntervalMs: number;
+  allowedUsers: Set<string>;
+}
+
+export interface TeamsConfig {
+  enabled: boolean;
+  webhookSecret: string;
+  appId: string;
+  appPassword: string;
+  tenantId: string;
+  incomingWebhookUrl: string;
+  webhookHost: string;
+  webhookPort: number;
+  webhookPath: string;
+  allowedUsers: Set<string>;
+}
+
+export interface GoogleChatConfig {
+  enabled: boolean;
+  webhookUrl: string;
+  accessToken: string;
+  verificationToken: string;
+  webhookHost: string;
+  webhookPort: number;
+  webhookPath: string;
+  allowedUsers: Set<string>;
+}
+
 export interface GatewayConfig {
   /** Global allowlist: photon phone/email entries, or `<channel>:<userId>` for other channels. */
   allowedSenders: Set<string>;
@@ -398,6 +514,12 @@ export interface GatewayConfig {
   mattermost?: MattermostConfig;
   line?: LineConfig;
   irc?: IrcConfig;
+  whatsapp?: WhatsAppConfig;
+  zulip?: ZulipConfig;
+  rocketchat?: RocketChatConfig;
+  signal?: SignalConfig;
+  teams?: TeamsConfig;
+  googlechat?: GoogleChatConfig;
 }
 
 export interface LoadConfigOptions {
@@ -447,6 +569,18 @@ export function getChannelAllowedUsers(
       return config.line?.allowedUsers ?? new Set();
     case "irc":
       return config.irc?.allowedUsers ?? new Set();
+    case "whatsapp":
+      return config.whatsapp?.allowedUsers ?? new Set();
+    case "zulip":
+      return config.zulip?.allowedUsers ?? new Set();
+    case "rocketchat":
+      return config.rocketchat?.allowedUsers ?? new Set();
+    case "signal":
+      return config.signal?.allowedUsers ?? new Set();
+    case "teams":
+      return config.teams?.allowedUsers ?? new Set();
+    case "googlechat":
+      return config.googlechat?.allowedUsers ?? new Set();
     default:
       return new Set();
   }
@@ -501,6 +635,29 @@ export function loadConfig(
   const lineChannelAccessToken = cleanEnv(parsed.LINE_CHANNEL_ACCESS_TOKEN);
   const lineChannelSecret = cleanEnv(parsed.LINE_CHANNEL_SECRET);
   const ircHost = cleanEnv(parsed.IRC_HOST);
+  const whatsappAccessToken = cleanEnv(parsed.WHATSAPP_ACCESS_TOKEN);
+  const whatsappPhoneNumberId = cleanEnv(parsed.WHATSAPP_PHONE_NUMBER_ID);
+  const zulipSite = cleanEnv(parsed.ZULIP_SITE);
+  const zulipBotEmail = cleanEnv(parsed.ZULIP_BOT_EMAIL);
+  const zulipApiKey = cleanEnv(parsed.ZULIP_API_KEY);
+  const rocketchatUrl = cleanEnv(parsed.ROCKETCHAT_URL);
+  const rocketchatUserId = cleanEnv(parsed.ROCKETCHAT_USER_ID);
+  const rocketchatAuthToken = cleanEnv(parsed.ROCKETCHAT_AUTH_TOKEN);
+  const signalApiUrl = cleanEnv(parsed.SIGNAL_API_URL);
+  const signalAccount = cleanEnv(parsed.SIGNAL_ACCOUNT);
+  const teamsWebhookSecret = cleanEnv(parsed.TEAMS_WEBHOOK_SECRET) ?? "";
+  const teamsAppId = cleanEnv(parsed.TEAMS_APP_ID) ?? "";
+  const teamsAppPassword = cleanEnv(parsed.TEAMS_APP_PASSWORD) ?? "";
+  const teamsIncomingWebhookUrl = cleanEnv(parsed.TEAMS_INCOMING_WEBHOOK_URL) ?? "";
+  const teamsEnabled = Boolean(
+    teamsWebhookSecret || (teamsAppId && teamsAppPassword) || teamsIncomingWebhookUrl,
+  );
+  const googlechatWebhookUrl = cleanEnv(parsed.GOOGLECHAT_WEBHOOK_URL) ?? "";
+  const googlechatAccessToken = cleanEnv(parsed.GOOGLECHAT_ACCESS_TOKEN) ?? "";
+  const googlechatVerificationToken = cleanEnv(parsed.GOOGLECHAT_VERIFICATION_TOKEN) ?? "";
+  const googlechatEnabled = Boolean(
+    googlechatWebhookUrl || googlechatAccessToken || googlechatVerificationToken,
+  );
 
   if (onebotUrl && !/^wss?:\/\//i.test(onebotUrl)) {
     throw new Error("ONEBOT_WS_URL must start with ws:// or wss://");
@@ -651,6 +808,80 @@ export function loadConfig(
           password: cleanEnv(parsed.IRC_PASSWORD),
           channels: parseListEnv(parsed.IRC_CHANNELS, []),
           allowedUsers: parseAllowedUsers(parsed.IRC_ALLOWED_USERS),
+        }
+      : undefined,
+    whatsapp:
+      whatsappAccessToken && whatsappPhoneNumberId
+        ? {
+            enabled: true,
+            accessToken: whatsappAccessToken,
+            phoneNumberId: whatsappPhoneNumberId,
+            verifyToken: cleanEnv(parsed.WHATSAPP_VERIFY_TOKEN) ?? "",
+            appSecret: cleanEnv(parsed.WHATSAPP_APP_SECRET) ?? "",
+            apiVersion: cleanEnv(parsed.WHATSAPP_API_VERSION) ?? "v21.0",
+            webhookHost: cleanEnv(parsed.WHATSAPP_WEBHOOK_HOST) ?? "127.0.0.1",
+            webhookPort: parsed.WHATSAPP_WEBHOOK_PORT,
+            webhookPath: cleanEnv(parsed.WHATSAPP_WEBHOOK_PATH) ?? "/whatsapp/webhook",
+            allowedUsers: parseAllowedUsers(parsed.WHATSAPP_ALLOWED_USERS),
+          }
+        : undefined,
+    zulip:
+      zulipSite && zulipBotEmail && zulipApiKey
+        ? {
+            enabled: true,
+            site: zulipSite,
+            botEmail: zulipBotEmail,
+            apiKey: zulipApiKey,
+            streams: parseListEnv(parsed.ZULIP_STREAMS, []),
+            requireMention: parseBoolEnv(parsed.ZULIP_REQUIRE_MENTION, true),
+            allowedUsers: parseAllowedUsers(parsed.ZULIP_ALLOWED_USERS),
+          }
+        : undefined,
+    rocketchat:
+      rocketchatUrl && rocketchatUserId && rocketchatAuthToken
+        ? {
+            enabled: true,
+            url: rocketchatUrl,
+            userId: rocketchatUserId,
+            authToken: rocketchatAuthToken,
+            requireMention: parseBoolEnv(parsed.ROCKETCHAT_REQUIRE_MENTION, true),
+            allowedUsers: parseAllowedUsers(parsed.ROCKETCHAT_ALLOWED_USERS),
+          }
+        : undefined,
+    signal:
+      signalApiUrl && signalAccount
+        ? {
+            enabled: true,
+            apiUrl: signalApiUrl,
+            account: signalAccount,
+            pollIntervalMs: parsed.SIGNAL_POLL_INTERVAL_MS,
+            allowedUsers: parseAllowedUsers(parsed.SIGNAL_ALLOWED_USERS),
+          }
+        : undefined,
+    teams: teamsEnabled
+      ? {
+          enabled: true,
+          webhookSecret: teamsWebhookSecret,
+          appId: teamsAppId,
+          appPassword: teamsAppPassword,
+          tenantId: cleanEnv(parsed.TEAMS_TENANT_ID) ?? "botframework.com",
+          incomingWebhookUrl: teamsIncomingWebhookUrl,
+          webhookHost: cleanEnv(parsed.TEAMS_WEBHOOK_HOST) ?? "127.0.0.1",
+          webhookPort: parsed.TEAMS_WEBHOOK_PORT,
+          webhookPath: cleanEnv(parsed.TEAMS_WEBHOOK_PATH) ?? "/teams/messages",
+          allowedUsers: parseAllowedUsers(parsed.TEAMS_ALLOWED_USERS),
+        }
+      : undefined,
+    googlechat: googlechatEnabled
+      ? {
+          enabled: true,
+          webhookUrl: googlechatWebhookUrl,
+          accessToken: googlechatAccessToken,
+          verificationToken: googlechatVerificationToken,
+          webhookHost: cleanEnv(parsed.GOOGLECHAT_WEBHOOK_HOST) ?? "127.0.0.1",
+          webhookPort: parsed.GOOGLECHAT_WEBHOOK_PORT,
+          webhookPath: cleanEnv(parsed.GOOGLECHAT_WEBHOOK_PATH) ?? "/googlechat/events",
+          allowedUsers: parseAllowedUsers(parsed.GOOGLECHAT_ALLOWED_USERS),
         }
       : undefined,
   };
