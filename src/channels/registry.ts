@@ -6,8 +6,9 @@ import { errorMessage } from "./utils.js";
  * Adapter module convention: `src/channels/<channel>.ts` exports
  *   `createAdapter(config: GatewayConfig): ChannelAdapter`
  * where the returned adapter's `name` equals `<channel>` (photon, telegram, discord,
- * slack, feishu, dingtalk, onebot, webhook). Modules are loaded lazily so a missing or
- * broken channel never prevents the others from starting.
+ * slack, feishu, dingtalk, onebot, webhook, wecom, qqbot, matrix, mattermost,
+ * line, irc). Modules are loaded lazily through the computed specifier below so a
+ * missing or broken channel never prevents the others from starting.
  */
 export interface AdapterFactoryModule {
   createAdapter(config: GatewayConfig): ChannelAdapter;

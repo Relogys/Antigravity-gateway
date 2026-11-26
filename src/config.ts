@@ -13,6 +13,12 @@ export const CHANNEL_NAMES = [
   "dingtalk",
   "onebot",
   "webhook",
+  "wecom",
+  "qqbot",
+  "matrix",
+  "mattermost",
+  "line",
+  "irc",
 ] as const;
 
 export type ChannelName = (typeof CHANNEL_NAMES)[number];
@@ -213,6 +219,46 @@ const envSchema = z.object({
   WEBHOOK_SECRET: optionalString,
   WEBHOOK_CALLBACK_URL: optionalString,
   WEBHOOK_ALLOWED_USERS: optionalString,
+
+  WECOM_CORP_ID: optionalString,
+  WECOM_AGENT_ID: z.preprocess(
+    (v) => (typeof v === "string" && v.trim() === "" ? undefined : v),
+    z.coerce.number().int().min(1).max(Number.MAX_SAFE_INTEGER).optional(),
+  ),
+  WECOM_SECRET: optionalString,
+  WECOM_TOKEN: optionalString,
+  WECOM_ENCODING_AES_KEY: optionalString,
+  WECOM_HOST: optionalString,
+  WECOM_PORT: numberEnv(1, 65535, 18792),
+  WECOM_ALLOWED_USERS: optionalString,
+
+  QQBOT_APP_ID: optionalString,
+  QQBOT_CLIENT_SECRET: optionalString,
+  QQBOT_SANDBOX: optionalString,
+  QQBOT_ALLOWED_USERS: optionalString,
+
+  MATRIX_HOMESERVER_URL: optionalString,
+  MATRIX_ACCESS_TOKEN: optionalString,
+  MATRIX_USER_ID: optionalString,
+  MATRIX_ALLOWED_USERS: optionalString,
+
+  MATTERMOST_BASE_URL: optionalString,
+  MATTERMOST_BOT_TOKEN: optionalString,
+  MATTERMOST_ALLOWED_USERS: optionalString,
+
+  LINE_CHANNEL_ACCESS_TOKEN: optionalString,
+  LINE_CHANNEL_SECRET: optionalString,
+  LINE_HOST: optionalString,
+  LINE_PORT: numberEnv(1, 65535, 18793),
+  LINE_ALLOWED_USERS: optionalString,
+
+  IRC_HOST: optionalString,
+  IRC_PORT: numberEnv(1, 65535, 6697),
+  IRC_TLS: optionalString,
+  IRC_NICK: optionalString,
+  IRC_PASSWORD: optionalString,
+  IRC_CHANNELS: optionalString,
+  IRC_ALLOWED_USERS: optionalString,
 });
 
 export interface PhotonConfig {
@@ -270,6 +316,55 @@ export interface WebhookConfig {
   allowedUsers: Set<string>;
 }
 
+export interface WeComConfig {
+  corpId: string;
+  agentId: number;
+  secret: string;
+  token?: string;
+  encodingAesKey?: string;
+  host: string;
+  port: number;
+  allowedUsers: Set<string>;
+}
+
+export interface QQBotConfig {
+  appId: string;
+  clientSecret: string;
+  sandbox: boolean;
+  allowedUsers: Set<string>;
+}
+
+export interface MatrixConfig {
+  homeserverUrl: string;
+  accessToken: string;
+  userId?: string;
+  allowedUsers: Set<string>;
+}
+
+export interface MattermostConfig {
+  baseUrl: string;
+  botToken: string;
+  allowedUsers: Set<string>;
+}
+
+export interface LineConfig {
+  channelAccessToken: string;
+  channelSecret: string;
+  host: string;
+  port: number;
+  allowedUsers: Set<string>;
+}
+
+export interface IrcConfig {
+  host: string;
+  port: number;
+  tls: boolean;
+  nick: string;
+  password?: string;
+  channels: string[];
+  allowedUsers: Set<string>;
+}
+
 export interface GatewayConfig {
   /** Global allowlist: photon phone/email entries, or `<channel>:<userId>` for other channels. */
   allowedSenders: Set<string>;
@@ -297,6 +392,12 @@ export interface GatewayConfig {
   dingtalk?: DingTalkConfig;
   onebot?: OneBotConfig;
   webhook?: WebhookConfig;
+  wecom?: WeComConfig;
+  qqbot?: QQBotConfig;
+  matrix?: MatrixConfig;
+  mattermost?: MattermostConfig;
+  line?: LineConfig;
+  irc?: IrcConfig;
 }
 
 export interface LoadConfigOptions {
@@ -334,6 +435,18 @@ export function getChannelAllowedUsers(
       return config.onebot?.allowedUsers ?? new Set();
     case "webhook":
       return config.webhook?.allowedUsers ?? new Set();
+    case "wecom":
+      return config.wecom?.allowedUsers ?? new Set();
+    case "qqbot":
+      return config.qqbot?.allowedUsers ?? new Set();
+    case "matrix":
+      return config.matrix?.allowedUsers ?? new Set();
+    case "mattermost":
+      return config.mattermost?.allowedUsers ?? new Set();
+    case "line":
+      return config.line?.allowedUsers ?? new Set();
+    case "irc":
+      return config.irc?.allowedUsers ?? new Set();
     default:
       return new Set();
   }
@@ -377,6 +490,17 @@ export function loadConfig(
   const dingId = cleanEnv(parsed.DINGTALK_CLIENT_ID);
   const dingSecret = cleanEnv(parsed.DINGTALK_CLIENT_SECRET);
   const onebotUrl = cleanEnv(parsed.ONEBOT_WS_URL);
+  const wecomCorpId = cleanEnv(parsed.WECOM_CORP_ID);
+  const wecomSecret = cleanEnv(parsed.WECOM_SECRET);
+  const qqbotAppId = cleanEnv(parsed.QQBOT_APP_ID);
+  const qqbotClientSecret = cleanEnv(parsed.QQBOT_CLIENT_SECRET);
+  const matrixHomeserverUrl = cleanEnv(parsed.MATRIX_HOMESERVER_URL);
+  const matrixAccessToken = cleanEnv(parsed.MATRIX_ACCESS_TOKEN);
+  const mattermostBaseUrl = cleanEnv(parsed.MATTERMOST_BASE_URL);
+  const mattermostBotToken = cleanEnv(parsed.MATTERMOST_BOT_TOKEN);
+  const lineChannelAccessToken = cleanEnv(parsed.LINE_CHANNEL_ACCESS_TOKEN);
+  const lineChannelSecret = cleanEnv(parsed.LINE_CHANNEL_SECRET);
+  const ircHost = cleanEnv(parsed.IRC_HOST);
 
   if (onebotUrl && !/^wss?:\/\//i.test(onebotUrl)) {
     throw new Error("ONEBOT_WS_URL must start with ws:// or wss://");
@@ -467,6 +591,66 @@ export function loadConfig(
           secret: cleanEnv(parsed.WEBHOOK_SECRET),
           callbackUrl: cleanEnv(parsed.WEBHOOK_CALLBACK_URL),
           allowedUsers: parseAllowedUsers(parsed.WEBHOOK_ALLOWED_USERS),
+        }
+      : undefined,
+    wecom:
+      wecomCorpId && parsed.WECOM_AGENT_ID !== undefined && wecomSecret
+        ? {
+            corpId: wecomCorpId,
+            agentId: parsed.WECOM_AGENT_ID,
+            secret: wecomSecret,
+            token: cleanEnv(parsed.WECOM_TOKEN),
+            encodingAesKey: cleanEnv(parsed.WECOM_ENCODING_AES_KEY),
+            host: cleanEnv(parsed.WECOM_HOST) ?? "127.0.0.1",
+            port: parsed.WECOM_PORT,
+            allowedUsers: parseAllowedUsers(parsed.WECOM_ALLOWED_USERS),
+          }
+        : undefined,
+    qqbot:
+      qqbotAppId && qqbotClientSecret
+        ? {
+            appId: qqbotAppId,
+            clientSecret: qqbotClientSecret,
+            sandbox: parseBoolEnv(parsed.QQBOT_SANDBOX, false),
+            allowedUsers: parseAllowedUsers(parsed.QQBOT_ALLOWED_USERS),
+          }
+        : undefined,
+    matrix:
+      matrixHomeserverUrl && matrixAccessToken
+        ? {
+            homeserverUrl: matrixHomeserverUrl,
+            accessToken: matrixAccessToken,
+            userId: cleanEnv(parsed.MATRIX_USER_ID),
+            allowedUsers: parseAllowedUsers(parsed.MATRIX_ALLOWED_USERS),
+          }
+        : undefined,
+    mattermost:
+      mattermostBaseUrl && mattermostBotToken
+        ? {
+            baseUrl: mattermostBaseUrl,
+            botToken: mattermostBotToken,
+            allowedUsers: parseAllowedUsers(parsed.MATTERMOST_ALLOWED_USERS),
+          }
+        : undefined,
+    line:
+      lineChannelAccessToken && lineChannelSecret
+        ? {
+            channelAccessToken: lineChannelAccessToken,
+            channelSecret: lineChannelSecret,
+            host: cleanEnv(parsed.LINE_HOST) ?? "127.0.0.1",
+            port: parsed.LINE_PORT,
+            allowedUsers: parseAllowedUsers(parsed.LINE_ALLOWED_USERS),
+          }
+        : undefined,
+    irc: ircHost
+      ? {
+          host: ircHost,
+          port: parsed.IRC_PORT,
+          tls: parseBoolEnv(parsed.IRC_TLS, true),
+          nick: cleanEnv(parsed.IRC_NICK) ?? "antigravity-bot",
+          password: cleanEnv(parsed.IRC_PASSWORD),
+          channels: parseListEnv(parsed.IRC_CHANNELS, []),
+          allowedUsers: parseAllowedUsers(parsed.IRC_ALLOWED_USERS),
         }
       : undefined,
   };

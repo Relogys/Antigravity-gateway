@@ -225,6 +225,12 @@ const CHANNEL_HINTS: Record<ChannelName, string> = {
   dingtalk: "set DINGTALK_CLIENT_ID + DINGTALK_CLIENT_SECRET",
   onebot: "set ONEBOT_WS_URL",
   webhook: "set WEBHOOK_ENABLED=true (+ WEBHOOK_TOKEN or WEBHOOK_SECRET)",
+  wecom: "set WECOM_CORP_ID + WECOM_AGENT_ID + WECOM_SECRET",
+  qqbot: "set QQBOT_APP_ID + QQBOT_CLIENT_SECRET",
+  matrix: "set MATRIX_HOMESERVER_URL + MATRIX_ACCESS_TOKEN",
+  mattermost: "set MATTERMOST_BASE_URL + MATTERMOST_BOT_TOKEN",
+  line: "set LINE_CHANNEL_ACCESS_TOKEN + LINE_CHANNEL_SECRET",
+  irc: "set IRC_HOST",
 };
 
 function channelHint(name: ChannelName): string {
@@ -254,6 +260,18 @@ function describeChannel(name: ChannelName, cfg?: GatewayConfig): string {
       const auth = w?.token || w?.secret ? "auth=set" : "auth=NONE";
       return `${w?.host}:${w?.port} ${auth} allowedUsers=${w?.allowedUsers.size}`;
     }
+    case "wecom":
+      return `${cfg.wecom?.host}:${cfg.wecom?.port} allowedUsers=${cfg.wecom?.allowedUsers.size}`;
+    case "qqbot":
+      return `sandbox=${cfg.qqbot?.sandbox} allowedUsers=${cfg.qqbot?.allowedUsers.size}`;
+    case "matrix":
+      return `allowedUsers=${cfg.matrix?.allowedUsers.size}`;
+    case "mattermost":
+      return `allowedUsers=${cfg.mattermost?.allowedUsers.size}`;
+    case "line":
+      return `${cfg.line?.host}:${cfg.line?.port} allowedUsers=${cfg.line?.allowedUsers.size}`;
+    case "irc":
+      return `${cfg.irc?.host}:${cfg.irc?.port} tls=${cfg.irc?.tls} channels=${cfg.irc?.channels.length} allowedUsers=${cfg.irc?.allowedUsers.size}`;
   }
 }
 
@@ -345,7 +363,7 @@ async function runDoctorCommand(): Promise<number> {
   for (const name of CHANNEL_NAMES) {
     const enabled = info.enabledChannels.includes(name);
     const detail = enabled ? describeChannel(name, info.config) : channelHint(name);
-    console.log(`  - ${name.padEnd(9)} ${enabled ? "configured" : "disabled  "}  ${detail}`);
+    console.log(`  - ${name.padEnd(10)} ${enabled ? "configured" : "disabled  "}  ${detail}`);
   }
 
   // 3. agy --version
