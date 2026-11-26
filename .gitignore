@@ -1,0 +1,20 @@
+# Dependencies & build output
+node_modules/
+dist/
+coverage/
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# Runtime state, logs, pid/lock files
+data/
+logs/
+*.pid
+*.lock
+*.log
+
+# OS / Editor
+.DS_Store
+Thumbs.db

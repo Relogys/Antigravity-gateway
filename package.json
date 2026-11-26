@@ -1,0 +1,37 @@
+{
+  "name": "antigravity-gateway",
+  "version": "0.1.0",
+  "description": "Dedicated iMessage (Photon Spectrum) gateway for Google Antigravity CLI (agy acp).",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "antigravity-gateway": "./dist/cli.js"
+  },
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "cli": "tsx src/cli.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "probe:acp": "tsx scripts/probe-acp.ts",
+    "audit:secrets": "node scripts/audit-secrets.mjs"
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "^2.12.0",
+    "dotenv": "^16.4.7",
+    "spectrum-ts": "^12.16.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.8.0",
+    "vitest": "^3.1.0"
+  }
+}
