@@ -14,6 +14,7 @@ import {
 const IRC_MAX_LINE_BYTES = 400;
 const DEFAULT_STARTUP_TIMEOUT_MS = 5_000;
 const DEDUPE_TTL_MS = 10_000;
+const MAX_LINE_BUFFER_CHARS = 64 * 1024;
 
 /** Minimal socket surface satisfied by `net.Socket` and `tls.TLSSocket`. */
 export interface IrcSocketLike {
@@ -170,6 +171,7 @@ export class IrcChannelAdapter extends BaseChannelAdapter {
     maxEntries: 2000,
   });
   private abort?: AbortController;
+  private loop?: Promise<void>;
   private socket?: IrcSocketLike;
   private registered = false;
 
@@ -186,6 +188,9 @@ export class IrcChannelAdapter extends BaseChannelAdapter {
   }
 
   async start(onMessage: InboundHandler): Promise<void> {
+    if (this.abort) {
+      return;
+    }
     this.handler = onMessage;
     this.abort = new AbortController();
     const signal = this.abort.signal;
@@ -194,7 +199,7 @@ export class IrcChannelAdapter extends BaseChannelAdapter {
     const ready = new Promise<void>((resolve) => {
       markReady = resolve;
     });
-    void this.runLoop(signal, markReady);
+    this.loop = this.runLoop(signal, markReady);
 
     const timeoutMs = this.options.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS;
     await Promise.race([ready, sleepWithAbort(timeoutMs, signal)]);
@@ -213,6 +218,11 @@ export class IrcChannelAdapter extends BaseChannelAdapter {
       } catch {
         // ignore
       }
+    }
+    const loop = this.loop;
+    this.loop = undefined;
+    if (loop) {
+      await loop.catch(() => undefined);
     }
     this.handler = undefined;
   }
@@ -298,6 +308,11 @@ export class IrcChannelAdapter extends BaseChannelAdapter {
       socket.on("secureConnect", onConnect);
       socket.on("data", (data: Buffer | string) => {
         buffer += typeof data === "string" ? data : data.toString("utf8");
+        if (buffer.length > MAX_LINE_BUFFER_CHARS && !buffer.includes("\n")) {
+          this.noteError("IRC inbound line buffer overflow");
+          buffer = "";
+          return;
+        }
         let newline = buffer.indexOf("\n");
         while (newline !== -1) {
           const rawLine = buffer.slice(0, newline).replace(/\r$/, "");
@@ -350,7 +365,7 @@ export class IrcChannelAdapter extends BaseChannelAdapter {
       return;
     }
     if (command === "PRIVMSG") {
-      void this.handlePrivmsg(rawLine, parsed);
+      void this.handlePrivmsg(rawLine, parsed).catch((err) => this.noteError(err));
     }
   }
 

@@ -1,7 +1,6 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import http from "node:http";
-import type { AddressInfo } from "node:net";
 import type { GatewayConfig, WhatsAppConfig } from "../config.js";
 import type {
   AttachmentKind,
@@ -12,7 +11,17 @@ import type {
   OutboundMessage,
 } from "../types.js";
 import { BaseChannelAdapter, type InboundHandler } from "./base.js";
-import { BoundedDedupeCache, chunkText, isMentioned } from "./utils.js";
+import {
+  BoundedDedupeCache,
+  chunkText,
+  closeHttpServer,
+  configureHttpServerTimeouts,
+  isLoopbackHost,
+  isMentioned,
+  listenHttpServer,
+  parseRequestUrl,
+  readBoundedHttpBody,
+} from "./utils.js";
 
 const GRAPH_BASE = "https://graph.facebook.com";
 const MAX_TEXT_CHARS = 4096;
@@ -180,6 +189,7 @@ export class WhatsAppChannelAdapter extends BaseChannelAdapter {
   private readonly whatsappConfig: WhatsAppConfig;
   private readonly fetchImpl: typeof fetch;
   private readonly dedupe = new BoundedDedupeCache();
+  private readonly inFlight = new Set<Promise<void>>();
   private server?: http.Server;
   private boundPort: number | null = null;
 
@@ -204,6 +214,12 @@ export class WhatsAppChannelAdapter extends BaseChannelAdapter {
 
   async start(onMessage: InboundHandler): Promise<void> {
     const cfg = this.whatsappConfig;
+    const host = cfg.webhookHost || "127.0.0.1";
+    if (!isLoopbackHost(host) && !cfg.appSecret) {
+      throw new Error(
+        `WhatsApp refuses to listen on non-loopback host "${host}" without WHATSAPP_APP_SECRET`,
+      );
+    }
     this.handler = onMessage;
 
     const server = http.createServer((req, res) => {
@@ -218,17 +234,16 @@ export class WhatsAppChannelAdapter extends BaseChannelAdapter {
         });
       });
     });
+    configureHttpServerTimeouts(server, { requestTimeoutMs: 30_000 });
     this.server = server;
 
-    await new Promise<void>((resolve, reject) => {
-      const onError = (err: Error) => reject(err);
-      server.once("error", onError);
-      server.listen(cfg.webhookPort, cfg.webhookHost || "127.0.0.1", () => {
-        server.off("error", onError);
-        resolve();
-      });
-    });
-    this.boundPort = (server.address() as AddressInfo).port;
+    try {
+      this.boundPort = await listenHttpServer(server, cfg.webhookPort, host);
+    } catch (err) {
+      this.server = undefined;
+      this.handler = undefined;
+      throw err;
+    }
     this.setConnected(true);
   }
 
@@ -239,12 +254,9 @@ export class WhatsAppChannelAdapter extends BaseChannelAdapter {
     this.server = undefined;
     this.boundPort = null;
     this.handler = undefined;
-    if (server) {
-      await new Promise<void>((resolve) => {
-        server.close(() => resolve());
-        server.closeAllConnections?.();
-      });
-    }
+    await closeHttpServer(server);
+    await Promise.allSettled(this.inFlight);
+    this.inFlight.clear();
   }
 
   // ------------------------------------------------------------------ HTTP
@@ -262,6 +274,7 @@ export class WhatsAppChannelAdapter extends BaseChannelAdapter {
     res.writeHead(status, {
       "content-type": "application/json; charset=utf-8",
       "content-length": Buffer.byteLength(payload),
+      ...(status === 413 ? { connection: "close" } : {}),
     });
     res.end(payload);
   }
@@ -273,27 +286,18 @@ export class WhatsAppChannelAdapter extends BaseChannelAdapter {
     res.writeHead(status, {
       "content-type": "text/plain; charset=utf-8",
       "content-length": Buffer.byteLength(body),
+      ...(status === 413 ? { connection: "close" } : {}),
     });
     res.end(body);
   }
 
   private async readBody(req: http.IncomingMessage): Promise<Buffer> {
     const limit = this.options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
-    const chunks: Buffer[] = [];
-    let total = 0;
-    for await (const chunk of req) {
-      const buf = chunk as Buffer;
-      total += buf.byteLength;
-      if (total > limit) {
-        throw new HttpError(413, "request body too large");
-      }
-      chunks.push(buf);
-    }
-    return Buffer.concat(chunks);
+    return readBoundedHttpBody(req, limit, () => new HttpError(413, "request body too large"));
   }
 
   private async route(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-    const url = new URL(req.url ?? "/", "http://localhost");
+    const url = parseRequestUrl(req.url, () => new HttpError(400, "invalid request URL"));
     const method = req.method ?? "GET";
 
     if (url.pathname === "/whatsapp/health") {
@@ -347,7 +351,7 @@ export class WhatsAppChannelAdapter extends BaseChannelAdapter {
     const header = req.headers["x-hub-signature-256"];
     const signature = Array.isArray(header) ? (header[0] ?? "") : (header ?? "");
     if (
-      this.whatsappConfig.appSecret &&
+      !this.whatsappConfig.appSecret ||
       !verifyWhatsAppSignature(this.whatsappConfig.appSecret, raw, signature)
     ) {
       throw new HttpError(401, "invalid signature");
@@ -364,7 +368,10 @@ export class WhatsAppChannelAdapter extends BaseChannelAdapter {
     }
 
     this.json(res, 200, { ok: true });
-    void this.handleWebhook(body);
+    const task = this.handleWebhook(body).finally(() => {
+      this.inFlight.delete(task);
+    });
+    this.inFlight.add(task);
   }
 
   private async handleWebhook(body: WhatsAppWebhookBody): Promise<void> {
@@ -541,7 +548,9 @@ export class WhatsAppChannelAdapter extends BaseChannelAdapter {
 
     let res: Response;
     try {
-      res = await this.fetchImpl(`${GRAPH_BASE}/${apiVersion}/${phoneNumberId}/media`, {
+      res = await this.fetchImpl(
+        `${GRAPH_BASE}/${encodeURIComponent(apiVersion)}/${encodeURIComponent(phoneNumberId)}/media`,
+        {
         method: "POST",
         headers: { Authorization: `Bearer ${accessToken}` },
         body: form,
@@ -573,7 +582,7 @@ export class WhatsAppChannelAdapter extends BaseChannelAdapter {
     let res: Response;
     try {
       res = await this.fetchImpl(
-        `${GRAPH_BASE}/${apiVersion}/${phoneNumberId}/messages`,
+        `${GRAPH_BASE}/${encodeURIComponent(apiVersion)}/${encodeURIComponent(phoneNumberId)}/messages`,
         {
           method: "POST",
           headers: {

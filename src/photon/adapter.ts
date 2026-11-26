@@ -37,6 +37,7 @@ import { StreamStalenessWatchdog } from "./staleness.js";
 const DEDUPE_TTL_MS = 48 * 60 * 60 * 1000;
 const DEDUPE_MAX_ENTRIES = 4000;
 const MAX_CACHED_MESSAGES = 1000;
+const MAX_CHAT_CACHE = 2000;
 const MAX_INLINE_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 const RICH_LINK_SUPPRESS_WINDOW_MS = 30 * 1000;
 const TYPING_COOLDOWN_MS = 5 * 1000;
@@ -271,6 +272,9 @@ export class PhotonChannelAdapter implements ChannelAdapter {
 
     this.spacesByChatId.clear();
     this.messagesById.clear();
+    this.lastServiceByChatId.clear();
+    this.lastUrlAtByChatId.clear();
+    this.lastTypingAtByChatId.clear();
   }
 
   private async createSpectrumApp(): Promise<Awaited<ReturnType<typeof Spectrum>>> {
@@ -321,6 +325,10 @@ export class PhotonChannelAdapter implements ChannelAdapter {
     while (!this.stopping && !signal.aborted) {
       try {
         const currentApp = await this.createSpectrumApp();
+        if (this.stopping || signal.aborted) {
+          await currentApp.stop().catch(() => undefined);
+          break;
+        }
         this.app = currentApp;
         this.connected = true;
         this.lastError = undefined;
@@ -359,11 +367,24 @@ export class PhotonChannelAdapter implements ChannelAdapter {
     }
   }
 
+  private rememberChatEntry<V>(map: Map<string, V>, key: string, value: V): void {
+    map.delete(key);
+    map.set(key, value);
+    while (map.size > MAX_CHAT_CACHE) {
+      const oldest = map.keys().next().value;
+      if (oldest === undefined) {
+        break;
+      }
+      map.delete(oldest);
+    }
+  }
+
   private isDuplicate(id: string, now: number): boolean {
     const existing = this.seenIds.get(id);
     if (existing !== undefined && now - existing < DEDUPE_TTL_MS) {
       return true;
     }
+    this.seenIds.delete(id);
     this.seenIds.set(id, now);
 
     if (this.seenIds.size > DEDUPE_MAX_ENTRIES) {
@@ -438,7 +459,7 @@ export class PhotonChannelAdapter implements ChannelAdapter {
     switch (rawContent.type) {
       case "text": {
         if (URL_RE.test(rawContent.text)) {
-          this.lastUrlAtByChatId.set(chatId, now);
+          this.rememberChatEntry(this.lastUrlAtByChatId, chatId, now);
         }
         return {
           textParts: [rawContent.text],
@@ -447,7 +468,7 @@ export class PhotonChannelAdapter implements ChannelAdapter {
         };
       }
       case "richlink": {
-        this.lastUrlAtByChatId.set(chatId, now);
+        this.rememberChatEntry(this.lastUrlAtByChatId, chatId, now);
         return {
           textParts: [rawContent.url],
           attachments: [],
@@ -545,7 +566,7 @@ export class PhotonChannelAdapter implements ChannelAdapter {
       return;
     }
 
-    this.spacesByChatId.set(chatId, space);
+    this.rememberChatEntry(this.spacesByChatId, chatId, space);
     this.cacheMessage(message);
 
     let isGroup = space.id.includes(";+;");
@@ -564,7 +585,7 @@ export class PhotonChannelAdapter implements ChannelAdapter {
       };
       service = imMsg.sender?.service;
       if (service) {
-        this.lastServiceByChatId.set(chatId, service);
+        this.rememberChatEntry(this.lastServiceByChatId, chatId, service);
       }
     }
 
@@ -620,13 +641,13 @@ export class PhotonChannelAdapter implements ChannelAdapter {
     const im = imessage(this.app);
     if (chatId.includes(";-;") || chatId.includes(";+;")) {
       const space = await im.space.get(chatId);
-      this.spacesByChatId.set(normalized, space);
+      this.rememberChatEntry(this.spacesByChatId, normalized, space);
       return space;
     }
 
     const user = await im.user(normalized);
     const space = await im.space.create(user);
-    this.spacesByChatId.set(normalized, space);
+    this.rememberChatEntry(this.spacesByChatId, normalized, space);
     return space;
   }
 
@@ -749,7 +770,7 @@ export class PhotonChannelAdapter implements ChannelAdapter {
       if (last !== undefined && now - last < TYPING_COOLDOWN_MS) {
         return;
       }
-      this.lastTypingAtByChatId.set(normalized, now);
+      this.rememberChatEntry(this.lastTypingAtByChatId, normalized, now);
     } else {
       this.lastTypingAtByChatId.delete(normalized);
     }

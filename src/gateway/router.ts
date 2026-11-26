@@ -35,6 +35,7 @@ import type { GatewayStore } from "./store.js";
 const TYPING_KEEPALIVE_MS = 4000;
 const QUOTA_CHECK_INTERVAL_MS = 5 * 60 * 1000;
 const GATEWAY_VERSION = "0.1.0";
+const MAX_SESSION_LIST_CACHE = 500;
 
 export interface ExtendedAgentBackend extends AgentBackend {
   getBusyMode?(chatId: string): BusyMode;
@@ -181,6 +182,7 @@ export class GatewayRouter {
   private readonly fallbackQueues = new Map<string, string[]>();
   private readonly fallbackBusyModes = new Map<string, BusyMode>();
   private readonly fallbackApprovalModes = new Map<string, ApprovalMode>();
+  private readonly hydratedChats = new Set<string>();
   private readonly sessionListCache = new Map<string, AcpSessionSummary[]>();
   private cachedQuota?: QuotaSummary;
 
@@ -262,25 +264,30 @@ export class GatewayRouter {
       this.channel.markRead(msg.chatId, msg.id).catch(() => {});
     }
 
-    if (!msg.isGroup && !this.store.getHomeChatId()) {
-      await this.store.setHomeChatId(msg.chatId).catch(() => {});
+    const homeSave =
+      !msg.isGroup && !this.store.getHomeChatId()
+        ? this.store.setHomeChatId(msg.chatId).catch(() => {})
+        : Promise.resolve();
+
+    try {
+      const bodyText = this.stripGroupMention(msg.text ?? "", msg.isGroup).trim();
+      const cmdMatch = /^\/([a-zA-Z0-9_-]+)(?:\s+([\s\S]*))?$/.exec(bodyText);
+
+      if (cmdMatch) {
+        const cmd = cmdMatch[1].toLowerCase();
+        const args = (cmdMatch[2] ?? "").trim();
+        await this.handleSlashCommand(msg, senderId, cmd, args);
+        return;
+      }
+
+      if (!bodyText && msg.attachments.length === 0) {
+        return;
+      }
+
+      await this.handleUserPrompt(msg, bodyText, msg.attachments);
+    } finally {
+      await homeSave;
     }
-
-    const bodyText = this.stripGroupMention(msg.text ?? "", msg.isGroup).trim();
-    const cmdMatch = /^\/([a-zA-Z0-9_-]+)(?:\s+([\s\S]*))?$/.exec(bodyText);
-
-    if (cmdMatch) {
-      const cmd = cmdMatch[1].toLowerCase();
-      const args = (cmdMatch[2] ?? "").trim();
-      await this.handleSlashCommand(msg, senderId, cmd, args);
-      return;
-    }
-
-    if (!bodyText && msg.attachments.length === 0) {
-      return;
-    }
-
-    await this.handleUserPrompt(msg, bodyText, msg.attachments);
   }
 
   /**
@@ -429,10 +436,39 @@ export class GatewayRouter {
     for (const pattern of this.config.groupMentionPatterns) {
       const trimmed = pattern.trim();
       if (!trimmed) continue;
-      const re = new RegExp(`^${escapeRegExp(trimmed)}\\b[:,\\s]*`, "i");
+      const re = new RegExp(`^${escapeRegExp(trimmed)}(?=$|[\\s:,.!?])[:,\\s]*`, "i");
       out = out.replace(re, "").trim();
     }
     return out;
+  }
+
+  private cacheSessionList(chatId: string, list: AcpSessionSummary[]): void {
+    this.sessionListCache.delete(chatId);
+    this.sessionListCache.set(chatId, list);
+    while (this.sessionListCache.size > MAX_SESSION_LIST_CACHE) {
+      const oldest = this.sessionListCache.keys().next().value;
+      if (oldest === undefined) break;
+      this.sessionListCache.delete(oldest);
+    }
+  }
+
+  private hydrateChatFromStore(chatId: string): void {
+    if (this.hydratedChats.has(chatId)) {
+      return;
+    }
+    this.hydratedChats.add(chatId);
+    const stored = this.store.getSession(chatId);
+    if (!stored) {
+      return;
+    }
+    if (stored.busyMode) {
+      this.backend.setBusyMode?.(chatId, stored.busyMode);
+      this.fallbackBusyModes.set(chatId, stored.busyMode);
+    }
+    if (stored.approvalMode) {
+      this.backend.setApprovalMode?.(chatId, stored.approvalMode);
+      this.fallbackApprovalModes.set(chatId, stored.approvalMode);
+    }
   }
 
   private getSessionGeneration(chatId: string): number {
@@ -452,6 +488,7 @@ export class GatewayRouter {
   }
 
   private getChatBusyMode(chatId: string): BusyMode {
+    this.hydrateChatFromStore(chatId);
     if (this.backend.getBusyMode) {
       return this.backend.getBusyMode(chatId);
     }
@@ -463,19 +500,14 @@ export class GatewayRouter {
   }
 
   private async setChatBusyMode(chatId: string, mode: BusyMode): Promise<void> {
+    this.hydratedChats.add(chatId);
     this.backend.setBusyMode?.(chatId, mode);
     this.fallbackBusyModes.set(chatId, mode);
-    const existing = this.store.getSession(chatId);
-    if (existing) {
-      await this.store.upsertSession({
-        ...existing,
-        busyMode: mode,
-        updatedAt: Date.now(),
-      });
-    }
+    await this.ensureSessionRecord(chatId, { busyMode: mode });
   }
 
   private getChatApprovalMode(chatId: string): ApprovalMode {
+    this.hydrateChatFromStore(chatId);
     if (this.backend.getApprovalMode) {
       return this.backend.getApprovalMode(chatId);
     }
@@ -490,16 +522,10 @@ export class GatewayRouter {
     chatId: string,
     mode: ApprovalMode,
   ): Promise<void> {
+    this.hydratedChats.add(chatId);
     this.backend.setApprovalMode?.(chatId, mode);
     this.fallbackApprovalModes.set(chatId, mode);
-    const existing = this.store.getSession(chatId);
-    if (existing) {
-      await this.store.upsertSession({
-        ...existing,
-        approvalMode: mode,
-        updatedAt: Date.now(),
-      });
-    }
+    await this.ensureSessionRecord(chatId, { approvalMode: mode });
   }
 
   private getChatQueue(chatId: string): string[] {
@@ -510,6 +536,7 @@ export class GatewayRouter {
   }
 
   private enqueueChatPrompt(chatId: string, prompt: string): number {
+    this.stopDrainChats.delete(chatId);
     if (this.backend.enqueuePrompt) {
       return this.backend.enqueuePrompt(chatId, prompt);
     }
@@ -648,9 +675,9 @@ export class GatewayRouter {
       case "reset": {
         this.bumpSessionGeneration(chatId);
         this.clearChatQueue(chatId);
+        this.stopDrainChats.delete(chatId);
         if (busy) {
           this.cancelledByUser.add(chatId);
-          this.stopDrainChats.add(chatId);
           await this.backend.cancelTurn(chatId);
         }
         const prev = this.store.getSession(chatId);
@@ -675,9 +702,13 @@ export class GatewayRouter {
       case "discard": {
         this.bumpSessionGeneration(chatId);
         this.clearChatQueue(chatId);
+        this.stopDrainChats.delete(chatId);
+        this.sessionListCache.delete(chatId);
+        this.fallbackBusyModes.delete(chatId);
+        this.fallbackApprovalModes.delete(chatId);
+        this.hydratedChats.delete(chatId);
         if (busy) {
           this.cancelledByUser.add(chatId);
-          this.stopDrainChats.add(chatId);
           await this.backend.cancelTurn(chatId);
         }
         await this.backend.resetSession(chatId);
@@ -976,7 +1007,7 @@ export class GatewayRouter {
         const cwd = this.store.getSession(chatId)?.cwd ?? this.config.defaultCwd;
         const list = await this.backend.listSessions(cwd);
         const sliced = list.slice(0, 10);
-        this.sessionListCache.set(chatId, sliced);
+        this.cacheSessionList(chatId, sliced);
         if (sliced.length === 0) {
           await this.sendReply(chatId, "No saved sessions found.", msg.id);
           return;
@@ -1008,7 +1039,7 @@ export class GatewayRouter {
           let cached = this.sessionListCache.get(chatId);
           if (!cached) {
             cached = (await this.backend.listSessions(cwd)).slice(0, 10);
-            this.sessionListCache.set(chatId, cached);
+            this.cacheSessionList(chatId, cached);
           }
           const idx = Number.parseInt(args, 10) - 1;
           const picked = cached[idx];
@@ -1204,7 +1235,8 @@ export class GatewayRouter {
         await this.sendReply(chatId, "Usage: /loop rm <id>", msg.id);
         return;
       }
-      const removed = await this.scheduler.removeLoop(id);
+      const owned = this.scheduler.listJobs(chatId).some((j) => j.id === id);
+      const removed = owned ? await this.scheduler.removeLoop(id) : false;
       await this.sendReply(
         chatId,
         removed ? `Removed loop [${id}].` : `Loop [${id}] not found.`,
@@ -1220,7 +1252,8 @@ export class GatewayRouter {
         return;
       }
       const enabled = sub === "resume";
-      const updated = await this.scheduler.toggleLoop(id, enabled);
+      const owned = this.scheduler.listJobs(chatId).some((j) => j.id === id);
+      const updated = owned ? await this.scheduler.toggleLoop(id, enabled) : null;
       await this.sendReply(
         chatId,
         updated
@@ -1294,9 +1327,6 @@ export class GatewayRouter {
           currentOptions,
         );
 
-        if (this.getSessionGeneration(chatId) !== turnGeneration) {
-          break;
-        }
         if (this.stopDrainChats.delete(chatId)) {
           break;
         }

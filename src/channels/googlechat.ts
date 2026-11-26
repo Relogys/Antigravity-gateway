@@ -1,6 +1,5 @@
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import http from "node:http";
-import type { AddressInfo } from "node:net";
 import type { GatewayConfig } from "../config.js";
 import type {
   AttachmentKind,
@@ -10,7 +9,18 @@ import type {
   OutboundMessage,
 } from "../types.js";
 import { BaseChannelAdapter, type InboundHandler } from "./base.js";
-import { chunkText, isMentioned } from "./utils.js";
+import {
+  BoundedDedupeCache,
+  chunkText,
+  closeHttpServer,
+  configureHttpServerTimeouts,
+  isLoopbackHost,
+  isMentioned,
+  listenHttpServer,
+  parseRequestUrl,
+  readBoundedHttpBody,
+  rememberBounded,
+} from "./utils.js";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -145,6 +155,8 @@ export class GoogleChatChannelAdapter extends BaseChannelAdapter {
   private readonly maxBodyBytes: number;
   private readonly groupMentionPatterns: string[];
   private readonly threads = new Map<string, string>();
+  private readonly dedupe = new BoundedDedupeCache();
+  private readonly inFlight = new Set<Promise<void>>();
 
   private server?: http.Server;
   private boundPort: number | null = null;
@@ -170,6 +182,12 @@ export class GoogleChatChannelAdapter extends BaseChannelAdapter {
   }
 
   async start(onMessage: InboundHandler): Promise<void> {
+    const host = this.cfg.webhookHost || DEFAULT_HOST;
+    if (!isLoopbackHost(host) && !this.cfg.verificationToken) {
+      throw new Error(
+        `Google Chat refuses to listen on non-loopback host "${host}" without GOOGLECHAT_VERIFICATION_TOKEN`,
+      );
+    }
     this.handler = onMessage;
     const server = http.createServer((req, res) => {
       void this.route(req, res).catch((err) => {
@@ -183,33 +201,30 @@ export class GoogleChatChannelAdapter extends BaseChannelAdapter {
         });
       });
     });
+    configureHttpServerTimeouts(server, { requestTimeoutMs: 30_000 });
     this.server = server;
 
-    await new Promise<void>((resolve, reject) => {
-      const onError = (err: Error) => reject(err);
-      server.once("error", onError);
-      server.listen(this.cfg.webhookPort, this.cfg.webhookHost || DEFAULT_HOST, () => {
-        server.off("error", onError);
-        resolve();
-      });
-    });
-    this.boundPort = (server.address() as AddressInfo).port;
+    try {
+      this.boundPort = await listenHttpServer(server, this.cfg.webhookPort, host);
+    } catch (err) {
+      this.server = undefined;
+      this.handler = undefined;
+      throw err;
+    }
     this.setConnected(true);
   }
 
   async stop(): Promise<void> {
     this.setConnected(false);
     this.threads.clear();
+    this.dedupe.clear();
     const server = this.server;
     this.server = undefined;
     this.boundPort = null;
     this.handler = undefined;
-    if (server) {
-      await new Promise<void>((resolve) => {
-        server.close(() => resolve());
-        server.closeAllConnections?.();
-      });
-    }
+    await closeHttpServer(server);
+    await Promise.allSettled(this.inFlight);
+    this.inFlight.clear();
   }
 
   // ------------------------------------------------------------------ HTTP
@@ -222,26 +237,21 @@ export class GoogleChatChannelAdapter extends BaseChannelAdapter {
     res.writeHead(status, {
       "content-type": "application/json; charset=utf-8",
       "content-length": Buffer.byteLength(payload),
+      ...(status === 413 ? { connection: "close" } : {}),
     });
     res.end(payload);
   }
 
   private async readBody(req: http.IncomingMessage): Promise<Buffer> {
-    const chunks: Buffer[] = [];
-    let total = 0;
-    for await (const chunk of req) {
-      const buf = chunk as Buffer;
-      total += buf.byteLength;
-      if (total > this.maxBodyBytes) {
-        throw new HttpError(413, "request body too large");
-      }
-      chunks.push(buf);
-    }
-    return Buffer.concat(chunks);
+    return readBoundedHttpBody(
+      req,
+      this.maxBodyBytes,
+      () => new HttpError(413, "request body too large"),
+    );
   }
 
   private async route(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-    const url = new URL(req.url ?? "/", "http://localhost");
+    const url = parseRequestUrl(req.url, () => new HttpError(400, "invalid request URL"));
     if (url.pathname !== this.webhookPath) {
       throw new HttpError(404, "not found");
     }
@@ -271,14 +281,19 @@ export class GoogleChatChannelAdapter extends BaseChannelAdapter {
 
     this.json(res, 200, {});
     if (event.type === "MESSAGE") {
-      void this.handleMessageEvent(event).catch((err) => this.noteError(err));
+      const task = this.handleMessageEvent(event)
+        .catch((err) => this.noteError(err))
+        .finally(() => {
+          this.inFlight.delete(task);
+        });
+      this.inFlight.add(task);
     }
   }
 
   private verifyToken(event: GoogleChatEvent, req: http.IncomingMessage): boolean {
     const expected = this.cfg.verificationToken;
     if (!expected) {
-      return true;
+      return false;
     }
     if (typeof event.token === "string" && safeEqual(event.token, expected)) {
       return true;
@@ -302,7 +317,11 @@ export class GoogleChatChannelAdapter extends BaseChannelAdapter {
       return;
     }
 
-    const messageId = message.name?.trim() || randomUUID();
+    const rawName = message.name?.trim();
+    if (rawName && this.dedupe.seen(rawName)) {
+      return;
+    }
+    const messageId = rawName || randomUUID();
     const rawText =
       typeof message.argumentText === "string" && message.argumentText.trim()
         ? message.argumentText
@@ -355,15 +374,7 @@ export class GoogleChatChannelAdapter extends BaseChannelAdapter {
   }
 
   private rememberThread(spaceName: string, threadName: string): void {
-    this.threads.delete(spaceName);
-    this.threads.set(spaceName, threadName);
-    while (this.threads.size > MAX_THREADS) {
-      const oldest = this.threads.keys().next().value;
-      if (oldest === undefined) {
-        break;
-      }
-      this.threads.delete(oldest);
-    }
+    rememberBounded(this.threads, spaceName, threadName, MAX_THREADS);
   }
 
   // -------------------------------------------------------------- outbound
@@ -382,7 +393,7 @@ export class GoogleChatChannelAdapter extends BaseChannelAdapter {
     let messageId: string | undefined;
     for (const chunk of chunks) {
       let body: { name?: string } | undefined;
-      if (this.cfg.accessToken && msg.chatId.startsWith("spaces/")) {
+      if (this.cfg.accessToken && /^spaces\/[A-Za-z0-9._-]+$/.test(msg.chatId)) {
         const endpoint = `${CHAT_API_BASE}/${msg.chatId}/messages`;
         const url = threadName
           ? `${endpoint}?messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD`

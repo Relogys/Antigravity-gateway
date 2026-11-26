@@ -1,4 +1,6 @@
 import { mkdir, writeFile } from "node:fs/promises";
+import type http from "node:http";
+import type { AddressInfo } from "node:net";
 import path from "node:path";
 
 /** Default cap for inline media downloads (20 MiB). */
@@ -163,13 +165,145 @@ export async function downloadToBuffer(
     if (declared > maxBytes) {
       throw new Error(`Download exceeds ${maxBytes} bytes`);
     }
+    const buf = await readResponseWithinLimit(res, maxBytes, controller);
+    return buf;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Stream a Fetch `Response` body into a Buffer while enforcing `maxBytes` incrementally. */
+export async function readResponseWithinLimit(
+  res: Response,
+  maxBytes: number,
+  abortController?: AbortController,
+): Promise<Buffer> {
+  if (!res.body) {
     const buf = Buffer.from(await res.arrayBuffer());
     if (buf.byteLength > maxBytes) {
       throw new Error(`Download exceeds ${maxBytes} bytes`);
     }
     return buf;
+  }
+  const reader = res.body.getReader();
+  const chunks: Buffer[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) {
+        break;
+      }
+      if (value) {
+        total += value.byteLength;
+        if (total > maxBytes) {
+          abortController?.abort();
+          await reader.cancel().catch(() => {});
+          throw new Error(`Download exceeds ${maxBytes} bytes`);
+        }
+        chunks.push(Buffer.from(value));
+      }
+    }
   } finally {
-    clearTimeout(timer);
+    reader.releaseLock();
+  }
+  return Buffer.concat(chunks);
+}
+
+/** True for loopback hosts (`127.0.0.0/8`, `localhost`, `::1`). */
+export function isLoopbackHost(host: string): boolean {
+  const h = host.trim().toLowerCase().replace(/^\[|\]$/g, "");
+  return h === "localhost" || h === "::1" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
+}
+
+/** Parse a request URL against localhost, throwing `onInvalid()` on malformed paths. */
+export function parseRequestUrl(rawUrl: string | undefined, onInvalid: () => Error): URL {
+  try {
+    return new URL(rawUrl ?? "/", "http://localhost");
+  } catch {
+    throw onInvalid();
+  }
+}
+
+/** Read an HTTP request body with early `Content-Length` check and streaming byte cap. */
+export async function readBoundedHttpBody(
+  req: http.IncomingMessage,
+  maxBytes: number,
+  onTooLarge: () => Error,
+): Promise<Buffer> {
+  const declared = Number(req.headers["content-length"] ?? 0);
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    req.resume();
+    throw onTooLarge();
+  }
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const chunk of req) {
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array);
+    total += buf.byteLength;
+    if (total > maxBytes) {
+      throw onTooLarge();
+    }
+    chunks.push(buf);
+  }
+  return Buffer.concat(chunks);
+}
+
+/** Configure safe keep-alive and request timeouts on an HTTP callback server. */
+export function configureHttpServerTimeouts(
+  server: http.Server,
+  options: { requestTimeoutMs?: number } = {},
+): void {
+  server.keepAliveTimeout = 60_000;
+  server.headersTimeout = 65_000;
+  if (options.requestTimeoutMs !== undefined) {
+    server.requestTimeout = options.requestTimeoutMs;
+  }
+}
+
+/** Start listening on an HTTP server and resolve with its bound port. */
+export async function listenHttpServer(
+  server: http.Server,
+  port: number,
+  host: string,
+): Promise<number> {
+  await new Promise<void>((resolve, reject) => {
+    const onError = (err: Error) => reject(err);
+    server.once("error", onError);
+    server.listen(port, host, () => {
+      server.off("error", onError);
+      resolve();
+    });
+  });
+  return (server.address() as AddressInfo).port;
+}
+
+/** Close an HTTP server and terminate keep-alive sockets immediately. */
+export async function closeHttpServer(server: http.Server | undefined): Promise<void> {
+  if (!server) {
+    return;
+  }
+  await new Promise<void>((resolve) => {
+    server.close(() => resolve());
+    server.closeAllConnections?.();
+  });
+}
+
+/** Insert or refresh a key in an LRU-bounded Map, evicting the oldest entry if full. */
+export function rememberBounded<K, V>(
+  map: Map<K, V>,
+  key: K,
+  value: V,
+  maxEntries: number,
+): void {
+  map.delete(key);
+  map.set(key, value);
+  while (map.size > maxEntries) {
+    const oldest = map.keys().next().value;
+    if (oldest === undefined) {
+      break;
+    }
+    map.delete(oldest);
   }
 }
 

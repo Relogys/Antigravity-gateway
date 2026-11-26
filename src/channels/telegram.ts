@@ -161,11 +161,20 @@ export class TelegramChannelAdapter extends BaseChannelAdapter {
     // One bounded attempt to learn the bot identity; the loop retries on failure.
     try {
       await this.loadBotIdentity(abort.signal);
+      if (abort.signal.aborted) {
+        return;
+      }
       this.setConnected(true);
     } catch (err) {
+      if (abort.signal.aborted) {
+        return;
+      }
       this.noteError(err);
     }
 
+    if (abort.signal.aborted) {
+      return;
+    }
     this.loop = this.pollLoop(abort.signal);
   }
 

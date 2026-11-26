@@ -9,9 +9,24 @@ const FORBIDDEN_PATTERNS = [
   { name: "Local Antigravity workspace path", regex: /E:[\\/]Antigravity/gi },
   { name: "Google AI API key", regex: /AIza[0-9A-Za-z_-]{30,}/g },
   { name: "Private key block", regex: /-----BEGIN [A-Z ]*PRIVATE KEY-----/g },
+  { name: "GitHub personal/app token", regex: /\b(?:gh[pousr]_[0-9A-Za-z]{30,}|github_pat_[0-9A-Za-z_]{30,})\b/g },
+  { name: "AWS Access Key ID", regex: /\bAKIA[0-9A-Z]{16}\b/g },
+  { name: "Slack token", regex: /\b(?:xox[baprs]-[0-9]{8,}-[0-9A-Za-z-]+|xapp-\d-[A-Z0-9]+-\d+-[A-Za-z0-9]+)\b/g },
+  { name: "Telegram Bot API token", regex: /\b\d{8,12}:AA[0-9A-Za-z_-]{33}\b/g },
+  { name: "OpenAI / Anthropic style secret key", regex: /\bsk-(?:proj-|ant-)?[0-9A-Za-z_-]{32,}\b/g },
   { name: "Real Spectrum secret assignment", regex: /SPECTRUM_PROJECT_SECRET=(?!your-spectrum-project-secret|<|\s*$)\S+/g },
   { name: "Real Spectrum UUID assignment", regex: /SPECTRUM_PROJECT_ID=[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi },
 ];
+
+function stripSurroundingQuotes(raw) {
+  if (
+    (raw.startsWith('"') && raw.endsWith('"')) ||
+    (raw.startsWith("'") && raw.endsWith("'"))
+  ) {
+    return raw.slice(1, -1).trim();
+  }
+  return raw;
+}
 
 /**
  * If a local `.env` exists, collect its real secret/PII values in memory (never printed)
@@ -25,7 +40,7 @@ function loadLocalEnvLiterals(repoRoot) {
   const literals = [];
   // Any credential-like or identity-like key in the local .env is scanned for literal leaks.
   const sensitivePattern =
-    /(TOKEN|SECRET|API_KEY|PASSWORD|CLIENT_ID|APP_ID|PROJECT_ID|SELF_ID|ALLOWED_USERS|ALLOWED_SENDERS|WS_URL|CALLBACK_URL)$/;
+    /(TOKEN|SECRET|API_KEY|AES_KEY|PASSWORD|CLIENT_ID|APP_ID|PROJECT_ID|CORP_ID|USER_ID|SELF_ID|PHONE_NUMBER_ID|BOT_EMAIL|ACCOUNT|ALLOWED_USERS|ALLOWED_SENDERS|WS_URL|CALLBACK_URL|WEBHOOK_URL|HOMESERVER_URL|BASE_URL|SITE)$/;
   const listKeys = /(ALLOWED_USERS|ALLOWED_SENDERS)$/;
   const lines = fs.readFileSync(envPath, "utf8").split(/\r?\n/);
   for (const line of lines) {
@@ -34,19 +49,20 @@ function loadLocalEnvLiterals(repoRoot) {
     const eqIdx = trimmed.indexOf("=");
     if (eqIdx === -1) continue;
     const key = trimmed.slice(0, eqIdx).trim();
-    const val = trimmed.slice(eqIdx + 1).trim();
+    const val = stripSurroundingQuotes(trimmed.slice(eqIdx + 1).trim());
     if (!sensitivePattern.test(key) || !val) continue;
     if (listKeys.test(key)) {
       for (const item of val.split(",")) {
-        const token = item.trim();
+        const token = stripSurroundingQuotes(item.trim());
         if (token.length >= 6 && !token.includes("example.com") && token !== "+15550001111") {
           literals.push({ key, token });
         }
       }
     } else if (
       val.length >= 8 &&
-      val !== "your-spectrum-project-id" &&
-      val !== "your-spectrum-project-secret"
+      !/^your-/i.test(val) &&
+      !val.includes("example.com") &&
+      !val.includes("example.org")
     ) {
       literals.push({ key, token: val });
     }
@@ -67,7 +83,7 @@ for (const file of files) {
     violations++;
     continue;
   }
-  if (!fs.existsSync(file)) continue;
+  if (!fs.existsSync(file) || !fs.statSync(file).isFile()) continue;
   const content = fs.readFileSync(file, "utf8");
   for (const { name, regex } of FORBIDDEN_PATTERNS) {
     regex.lastIndex = 0;

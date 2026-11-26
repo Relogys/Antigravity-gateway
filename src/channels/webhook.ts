@@ -1,7 +1,6 @@
 import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import http from "node:http";
-import type { AddressInfo } from "node:net";
 import path from "node:path";
 import type { GatewayConfig } from "../config.js";
 import type {
@@ -12,7 +11,18 @@ import type {
   OutboundMessage,
 } from "../types.js";
 import { BaseChannelAdapter, type InboundHandler } from "./base.js";
-import { errorMessage, saveInboundMedia } from "./utils.js";
+import {
+  closeHttpServer,
+  configureHttpServerTimeouts,
+  errorMessage,
+  isLoopbackHost,
+  listenHttpServer,
+  parseRequestUrl,
+  readBoundedHttpBody,
+  saveInboundMedia,
+} from "./utils.js";
+
+export { isLoopbackHost };
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -22,6 +32,7 @@ const DEFAULT_MAX_BODY_BYTES = 10 * 1024 * 1024;
 const MAX_OUTBOUND_ATTACHMENT_BYTES = 10 * 1024 * 1024;
 const DEFAULT_WAIT_TIMEOUT_MS = 120_000;
 const MAX_WAIT_TIMEOUT_MS = 600_000;
+const MAX_SSE_CLIENTS = 100;
 
 export interface WebhookAdapterOptions {
   fetchImpl?: typeof fetch;
@@ -55,18 +66,13 @@ interface Waiter {
   chatId: string;
   replies: WebhookReply[];
   onReply: () => void;
+  cancel: () => void;
 }
 
 interface SseClient {
   res: http.ServerResponse;
   chatId?: string;
-  heartbeat: NodeJS.Timeout;
-}
-
-/** True for loopback hosts (`127.0.0.0/8`, `localhost`, `::1`). */
-export function isLoopbackHost(host: string): boolean {
-  const h = host.trim().toLowerCase().replace(/^\[|\]$/g, "");
-  return h === "localhost" || h === "::1" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
+  cleanup: () => void;
 }
 
 function safeEqual(a: string, b: string): boolean {
@@ -146,37 +152,37 @@ export class WebhookChannelAdapter extends BaseChannelAdapter {
         });
       });
     });
+    configureHttpServerTimeouts(server, { requestTimeoutMs: 0 });
     this.server = server;
 
-    await new Promise<void>((resolve, reject) => {
-      const onError = (err: Error) => reject(err);
-      server.once("error", onError);
-      server.listen(cfg.port ?? DEFAULT_PORT, host, () => {
-        server.off("error", onError);
-        resolve();
-      });
-    });
-    this.boundPort = (server.address() as AddressInfo).port;
+    try {
+      this.boundPort = await listenHttpServer(server, cfg.port ?? DEFAULT_PORT, host);
+    } catch (err) {
+      this.server = undefined;
+      this.handler = undefined;
+      throw err;
+    }
     this.setConnected(true);
   }
 
   async stop(): Promise<void> {
     this.setConnected(false);
-    for (const client of this.sseClients) {
-      clearInterval(client.heartbeat);
-      client.res.end();
+    for (const waiter of [...this.waiters]) {
+      waiter.cancel();
+    }
+    this.waiters.clear();
+    for (const client of [...this.sseClients]) {
+      client.cleanup();
+      if (!client.res.destroyed && !client.res.writableEnded) {
+        client.res.end();
+      }
     }
     this.sseClients.clear();
     const server = this.server;
     this.server = undefined;
     this.boundPort = null;
     this.handler = undefined;
-    if (server) {
-      await new Promise<void>((resolve) => {
-        server.close(() => resolve());
-        server.closeAllConnections?.();
-      });
-    }
+    await closeHttpServer(server);
   }
 
   // ---------------------------------------------------------------- HTTP
@@ -189,6 +195,7 @@ export class WebhookChannelAdapter extends BaseChannelAdapter {
     res.writeHead(status, {
       "content-type": "application/json; charset=utf-8",
       "content-length": Buffer.byteLength(payload),
+      ...(status === 413 ? { connection: "close" } : {}),
     });
     res.end(payload);
   }
@@ -218,21 +225,11 @@ export class WebhookChannelAdapter extends BaseChannelAdapter {
 
   private async readBody(req: http.IncomingMessage): Promise<Buffer> {
     const limit = this.options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
-    const chunks: Buffer[] = [];
-    let total = 0;
-    for await (const chunk of req) {
-      const buf = chunk as Buffer;
-      total += buf.byteLength;
-      if (total > limit) {
-        throw new HttpError(413, "request body too large");
-      }
-      chunks.push(buf);
-    }
-    return Buffer.concat(chunks);
+    return readBoundedHttpBody(req, limit, () => new HttpError(413, "request body too large"));
   }
 
   private async route(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-    const url = new URL(req.url ?? "/", "http://localhost");
+    const url = parseRequestUrl(req.url, () => new HttpError(400, "invalid request URL"));
     const method = req.method ?? "GET";
 
     if (url.pathname === "/v1/health") {
@@ -270,20 +267,38 @@ export class WebhookChannelAdapter extends BaseChannelAdapter {
     res: http.ServerResponse,
     chatId: string | undefined,
   ): void {
+    if (this.sseClients.size >= MAX_SSE_CLIENTS) {
+      throw new HttpError(503, "too many SSE listeners");
+    }
     res.writeHead(200, {
       "content-type": "text/event-stream; charset=utf-8",
       "cache-control": "no-cache",
       connection: "keep-alive",
     });
-    res.write(": connected\n\n");
-    const heartbeat = setInterval(() => res.write(": ping\n\n"), 25_000);
-    heartbeat.unref();
-    const client: SseClient = { res, chatId, heartbeat };
-    this.sseClients.add(client);
-    req.on("close", () => {
+    let client: SseClient;
+    const cleanup = () => {
       clearInterval(heartbeat);
       this.sseClients.delete(client);
-    });
+    };
+    const writeSafe = (chunk: string) => {
+      if (res.destroyed || res.writableEnded) {
+        cleanup();
+        return;
+      }
+      try {
+        res.write(chunk);
+      } catch {
+        cleanup();
+      }
+    };
+    const heartbeat = setInterval(() => writeSafe(": ping\n\n"), 25_000);
+    heartbeat.unref();
+    client = { res, chatId, cleanup };
+    this.sseClients.add(client);
+    req.on("close", cleanup);
+    res.on("close", cleanup);
+    res.on("error", cleanup);
+    writeSafe(": connected\n\n");
   }
 
   private async handlePost(res: http.ServerResponse, raw: Buffer): Promise<void> {
@@ -398,7 +413,7 @@ export class WebhookChannelAdapter extends BaseChannelAdapter {
       let finished = false;
       let emitDone = false;
       let timer: NodeJS.Timeout | undefined;
-      const waiter: Waiter = { chatId: msg.chatId, replies: [], onReply: () => schedule() };
+      let hardTimeout: NodeJS.Timeout | undefined;
 
       const finish = (timedOut: boolean) => {
         if (finished) return;
@@ -407,6 +422,12 @@ export class WebhookChannelAdapter extends BaseChannelAdapter {
         clearTimeout(hardTimeout);
         this.waiters.delete(waiter);
         resolve({ replies: waiter.replies, timedOut });
+      };
+      const waiter: Waiter = {
+        chatId: msg.chatId,
+        replies: [],
+        onReply: () => schedule(),
+        cancel: () => finish(true),
       };
       const schedule = () => {
         if (finished) return;
@@ -417,7 +438,8 @@ export class WebhookChannelAdapter extends BaseChannelAdapter {
           timer = setTimeout(() => finish(false), graceMs);
         }
       };
-      const hardTimeout = setTimeout(() => finish(true), timeoutMs);
+      hardTimeout = setTimeout(() => finish(true), timeoutMs);
+      hardTimeout.unref?.();
 
       this.waiters.add(waiter);
       void this.emit(msg).finally(() => {
@@ -454,9 +476,17 @@ export class WebhookChannelAdapter extends BaseChannelAdapter {
     }
 
     const frame = `event: message\ndata: ${JSON.stringify(reply)}\n\n`;
-    for (const client of this.sseClients) {
+    for (const client of [...this.sseClients]) {
       if (!client.chatId || client.chatId === msg.chatId) {
-        client.res.write(frame);
+        if (client.res.destroyed || client.res.writableEnded) {
+          client.cleanup();
+          continue;
+        }
+        try {
+          client.res.write(frame);
+        } catch {
+          client.cleanup();
+        }
       }
     }
 

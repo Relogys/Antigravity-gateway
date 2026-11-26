@@ -109,6 +109,7 @@ export class QQBotChannelAdapter extends BaseChannelAdapter {
   private readonly now: () => number;
   private socket?: QQBotSocketLike;
   private abort?: AbortController;
+  private loop?: Promise<void>;
   private heartbeat?: ReturnType<typeof setInterval>;
   private token?: { value: string; expiresAt: number };
   private tokenRequest?: Promise<string>;
@@ -154,7 +155,7 @@ export class QQBotChannelAdapter extends BaseChannelAdapter {
         markStarted();
       }
     };
-    void this.runGateway(signal, ready);
+    this.loop = this.runGateway(signal, ready);
     await Promise.race([
       started,
       sleepWithAbort(this.options.startupTimeoutMs ?? 10_000, signal),
@@ -172,6 +173,13 @@ export class QQBotChannelAdapter extends BaseChannelAdapter {
       // A closing socket may reject a second close; shutdown is still complete.
     }
     this.socket = undefined;
+    const loop = this.loop;
+    this.loop = undefined;
+    if (loop) {
+      await loop.catch(() => undefined);
+    }
+    this.token = undefined;
+    this.tokenRequest = undefined;
     this.handler = undefined;
   }
 

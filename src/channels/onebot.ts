@@ -216,6 +216,7 @@ export class OneBotChannelAdapter extends BaseChannelAdapter {
   private readonly pending = new Map<string, PendingAction>();
   private readonly mediaDir: string;
   private abort?: AbortController;
+  private loop?: Promise<void>;
   private socket?: OneBotSocketLike;
   private selfId?: string;
 
@@ -245,6 +246,9 @@ export class OneBotChannelAdapter extends BaseChannelAdapter {
   }
 
   async start(onMessage: InboundHandler): Promise<void> {
+    if (this.abort) {
+      return;
+    }
     const url = this.buildUrl();
     this.handler = onMessage;
     this.abort = new AbortController();
@@ -254,7 +258,7 @@ export class OneBotChannelAdapter extends BaseChannelAdapter {
     const ready = new Promise<void>((resolve) => {
       markReady = resolve;
     });
-    void this.runLoop(url, signal, markReady);
+    this.loop = this.runLoop(url, signal, markReady);
 
     const timeoutMs = this.options.startupTimeoutMs ?? 10_000;
     await Promise.race([ready, sleepWithAbort(timeoutMs, signal)]);
@@ -271,6 +275,11 @@ export class OneBotChannelAdapter extends BaseChannelAdapter {
     }
     this.socket = undefined;
     this.failPending(new Error("OneBot adapter stopped"));
+    const loop = this.loop;
+    this.loop = undefined;
+    if (loop) {
+      await loop.catch(() => undefined);
+    }
     this.handler = undefined;
   }
 

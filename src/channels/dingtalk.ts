@@ -8,6 +8,8 @@ import {
   errorMessage,
   isMentioned,
   MAX_INLINE_MEDIA_BYTES,
+  readResponseWithinLimit,
+  rememberBounded,
   saveInboundMedia,
 } from "./utils.js";
 
@@ -77,6 +79,8 @@ export class DingTalkChannelAdapter extends BaseChannelAdapter {
   private readonly now: () => number;
   private client?: DingTalkClientLike;
   private token?: { value: string; expiresAt: number };
+  private tokenRequest?: Promise<string>;
+  private lifecycle = new AbortController();
 
   constructor(
     private readonly config: GatewayConfig,
@@ -118,12 +122,20 @@ export class DingTalkChannelAdapter extends BaseChannelAdapter {
       return { status: "SUCCESS", message: "OK" };
     });
 
-    await client.connect();
+    this.lifecycle = new AbortController();
+    try {
+      await client.connect();
+    } catch (err) {
+      this.client = undefined;
+      this.handler = undefined;
+      throw err;
+    }
     this.setConnected(true);
   }
 
   async stop(): Promise<void> {
     this.setConnected(false);
+    this.lifecycle.abort();
     try {
       this.client?.disconnect();
     } catch (err) {
@@ -131,6 +143,9 @@ export class DingTalkChannelAdapter extends BaseChannelAdapter {
     }
     this.client = undefined;
     this.handler = undefined;
+    this.token = undefined;
+    this.tokenRequest = undefined;
+    this.chats.clear();
   }
 
   /** Process one robot callback payload (JSON string or object). Exposed for tests. */
@@ -247,15 +262,7 @@ export class DingTalkChannelAdapter extends BaseChannelAdapter {
   }
 
   private rememberChat(chatId: string, meta: ChatMeta): void {
-    this.chats.delete(chatId);
-    this.chats.set(chatId, meta);
-    while (this.chats.size > MAX_CHAT_CACHE) {
-      const oldest = this.chats.keys().next().value;
-      if (oldest === undefined) {
-        break;
-      }
-      this.chats.delete(oldest);
-    }
+    rememberBounded(this.chats, chatId, meta, MAX_CHAT_CACHE);
   }
 
   /** OpenAPI access token (cached until shortly before expiry). */
@@ -267,23 +274,34 @@ export class DingTalkChannelAdapter extends BaseChannelAdapter {
     if (this.token && this.token.expiresAt > this.now() + 60_000) {
       return this.token.value;
     }
-    const res = await this.fetchImpl(`${OPENAPI_BASE}/v1.0/oauth2/accessToken`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ appKey: cfg.clientId, appSecret: cfg.clientSecret }),
-    });
-    if (!res.ok) {
-      throw new Error(`DingTalk access token request failed: HTTP ${res.status}`);
+    if (this.tokenRequest) {
+      return this.tokenRequest;
     }
-    const body = (await res.json()) as { accessToken?: string; expireIn?: number };
-    if (!body.accessToken) {
-      throw new Error("DingTalk access token response had no accessToken");
+    this.tokenRequest = (async () => {
+      const res = await this.fetchImpl(`${OPENAPI_BASE}/v1.0/oauth2/accessToken`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ appKey: cfg.clientId, appSecret: cfg.clientSecret }),
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!res.ok) {
+        throw new Error(`DingTalk access token request failed: HTTP ${res.status}`);
+      }
+      const body = (await res.json()) as { accessToken?: string; expireIn?: number };
+      if (!body.accessToken) {
+        throw new Error("DingTalk access token response had no accessToken");
+      }
+      this.token = {
+        value: body.accessToken,
+        expiresAt: this.now() + (body.expireIn ?? 7200) * 1000,
+      };
+      return this.token.value;
+    })();
+    try {
+      return await this.tokenRequest;
+    } finally {
+      this.tokenRequest = undefined;
     }
-    this.token = {
-      value: body.accessToken,
-      expiresAt: this.now() + (body.expireIn ?? 7200) * 1000,
-    };
-    return this.token.value;
   }
 
   private async openApi(pathname: string, body: unknown): Promise<any> {
@@ -292,6 +310,7 @@ export class DingTalkChannelAdapter extends BaseChannelAdapter {
       method: "POST",
       headers: { "content-type": "application/json", "x-acs-dingtalk-access-token": token },
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(15_000),
     });
     if (!res.ok) {
       const detail = await res.text().catch(() => "");
@@ -309,15 +328,17 @@ export class DingTalkChannelAdapter extends BaseChannelAdapter {
     if (typeof url !== "string" || !url) {
       throw new Error("DingTalk file download returned no downloadUrl");
     }
-    const res = await this.fetchImpl(url);
+    const res = await this.fetchImpl(url, {
+      signal: AbortSignal.any([AbortSignal.timeout(30_000), this.lifecycle.signal]),
+    });
     if (!res.ok) {
       throw new Error(`DingTalk media download failed: HTTP ${res.status}`);
     }
-    const buf = Buffer.from(await res.arrayBuffer());
-    if (buf.byteLength > MAX_INLINE_MEDIA_BYTES) {
+    const declared = Number(res.headers.get("content-length") ?? 0);
+    if (declared > MAX_INLINE_MEDIA_BYTES) {
       throw new Error(`Download exceeds ${MAX_INLINE_MEDIA_BYTES} bytes`);
     }
-    return buf;
+    return readResponseWithinLimit(res, MAX_INLINE_MEDIA_BYTES);
   }
 
   async sendMessage(msg: OutboundMessage): Promise<{ messageId?: string } | void> {
@@ -408,6 +429,7 @@ export class DingTalkChannelAdapter extends BaseChannelAdapter {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(15_000),
     });
     if (!res.ok) {
       throw new Error(`sessionWebhook HTTP ${res.status}`);

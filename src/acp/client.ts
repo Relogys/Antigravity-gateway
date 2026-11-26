@@ -11,6 +11,8 @@ import type {
 } from "../types.js";
 
 const MAX_INLINE_IMAGE_BYTES = 10 * 1024 * 1024; // 10 MiB
+const INIT_TIMEOUT_MS = 30_000;
+const STOP_GRACE_MS = 1500;
 
 export interface AgyAcpClientOptions {
   agyBin: string;
@@ -212,18 +214,37 @@ export class AgyAcpClient {
       (err) => handleDisconnect(err instanceof Error ? err.message : String(err)),
     );
 
-    const initResult = await connection.agent.request(
-      acp.methods.agent.initialize,
-      {
-        protocolVersion: acp.PROTOCOL_VERSION,
-        clientCapabilities: {
-          fs: { readTextFile: false, writeTextFile: false },
-        },
-      },
-    );
-    this.initResult = initResult;
-
-    return connection;
+    let initTimer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const initResult = await Promise.race([
+        connection.agent.request(acp.methods.agent.initialize, {
+          protocolVersion: acp.PROTOCOL_VERSION,
+          clientCapabilities: {
+            fs: { readTextFile: false, writeTextFile: false },
+          },
+        }),
+        new Promise<never>((_resolve, reject) => {
+          initTimer = setTimeout(
+            () => reject(new Error("agy acp initialize timed out")),
+            INIT_TIMEOUT_MS,
+          );
+          initTimer.unref?.();
+        }),
+      ]);
+      this.initResult = initResult;
+      return connection;
+    } catch (err) {
+      handleDisconnect(err instanceof Error ? err.message : String(err));
+      connection.close();
+      if (proc.exitCode === null && !proc.killed) {
+        proc.kill();
+      }
+      throw err;
+    } finally {
+      if (initTimer) {
+        clearTimeout(initTimer);
+      }
+    }
   }
 
   private defaultPermissionOutcome(
@@ -472,6 +493,8 @@ export class AgyAcpClient {
     const proc = this.proc;
     this.connection = null;
     this.proc = null;
+    this.replayingSessions.clear();
+    this.sessionPermissionHandlers.clear();
 
     for (const [sid, turn] of this.activeTurns.entries()) {
       this.activeTurns.delete(sid);
@@ -481,8 +504,34 @@ export class AgyAcpClient {
     if (conn) {
       conn.close();
     }
-    if (proc && proc.exitCode === null && !proc.killed) {
-      proc.kill();
+    if (proc && proc.exitCode === null) {
+      const exited = new Promise<void>((resolve) => {
+        proc.once("exit", () => resolve());
+        proc.once("error", () => resolve());
+      });
+      if (!proc.killed) {
+        proc.kill();
+      }
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        exited,
+        new Promise<void>((resolve) => {
+          timer = setTimeout(() => {
+            if (proc.exitCode === null && process.platform !== "win32") {
+              try {
+                proc.kill("SIGKILL");
+              } catch {
+                // ignore
+              }
+            }
+            resolve();
+          }, STOP_GRACE_MS);
+          timer.unref?.();
+        }),
+      ]);
+      if (timer) {
+        clearTimeout(timer);
+      }
     }
   }
 
@@ -501,7 +550,10 @@ export class AgyAcpClient {
         let buf = att.data;
         if (!buf && att.localPath) {
           try {
-            buf = await fs.readFile(att.localPath);
+            const stat = await fs.stat(att.localPath);
+            if (stat.size <= MAX_INLINE_IMAGE_BYTES) {
+              buf = await fs.readFile(att.localPath);
+            }
           } catch {
             buf = undefined;
           }

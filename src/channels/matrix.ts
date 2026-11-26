@@ -14,6 +14,7 @@ import {
   MAX_INLINE_MEDIA_BYTES,
   chunkText,
   isMentioned,
+  readResponseWithinLimit,
   reconnectDelayMs,
   saveInboundMedia,
   sleepWithAbort,
@@ -85,6 +86,9 @@ export class MatrixChannelAdapter extends BaseChannelAdapter {
   }
 
   async start(onMessage: InboundHandler): Promise<void> {
+    if (this.syncLoop) {
+      return;
+    }
     this.handler = onMessage;
     this.stopped = false;
     this.lifecycle = new AbortController();
@@ -93,14 +97,21 @@ export class MatrixChannelAdapter extends BaseChannelAdapter {
     } catch (err) {
       this.noteError(err);
     }
+    if (this.stopped) {
+      return;
+    }
     this.syncLoop = this.runSyncLoop();
   }
 
   async stop(): Promise<void> {
     this.stopped = true;
     this.lifecycle.abort();
-    void this.syncLoop?.catch(() => undefined);
+    const loop = this.syncLoop;
     this.syncLoop = undefined;
+    if (loop) {
+      await loop.catch(() => undefined);
+    }
+    this.handler = undefined;
     this.setConnected(false);
   }
 
@@ -147,6 +158,7 @@ export class MatrixChannelAdapter extends BaseChannelAdapter {
         method: "PUT",
         headers: this.authHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({ typing: active, timeout: active ? 30_000 : 0 }),
+        signal: AbortSignal.timeout(15_000),
       },
     );
     if (!res.ok) {
@@ -168,6 +180,7 @@ export class MatrixChannelAdapter extends BaseChannelAdapter {
     if (!this.selfUserId) {
       const res = await this.fetchImpl(`${this.hsUrl()}/_matrix/client/v3/account/whoami`, {
         headers: this.authHeaders(),
+        signal: AbortSignal.any([AbortSignal.timeout(15_000), this.lifecycle.signal]),
       });
       if (!res.ok) {
         throw new Error(`Matrix whoami failed with HTTP ${res.status}`);
@@ -188,7 +201,10 @@ export class MatrixChannelAdapter extends BaseChannelAdapter {
     this.accountDataRequested = true;
     const url = `${this.hsUrl()}/_matrix/client/v3/user/${encodeURIComponent(this.selfUserId)}/account_data/m.direct`;
     try {
-      const res = await this.fetchImpl(url, { headers: this.authHeaders() });
+      const res = await this.fetchImpl(url, {
+        headers: this.authHeaders(),
+        signal: AbortSignal.any([AbortSignal.timeout(15_000), this.lifecycle.signal]),
+      });
       if (res.ok) {
         this.replaceDirectRooms(await res.json());
       }
@@ -337,13 +353,15 @@ export class MatrixChannelAdapter extends BaseChannelAdapter {
       rest.slice(slash + 1),
     )}`;
 
+    const signal = AbortSignal.any([AbortSignal.timeout(30_000), this.lifecycle.signal]);
     let res = await this.fetchImpl(
       `${this.hsUrl()}/_matrix/client/v1/media/download/${segments}`,
-      { headers: this.authHeaders() },
+      { headers: this.authHeaders(), signal },
     );
     if (!res.ok) {
       res = await this.fetchImpl(`${this.hsUrl()}/_matrix/media/v3/download/${segments}`, {
         headers: this.authHeaders(),
+        signal,
       });
     }
     if (!res.ok) {
@@ -354,11 +372,7 @@ export class MatrixChannelAdapter extends BaseChannelAdapter {
     if (declared > MAX_INLINE_MEDIA_BYTES) {
       throw new Error(`Matrix media exceeds ${MAX_INLINE_MEDIA_BYTES} bytes`);
     }
-    const data = Buffer.from(await res.arrayBuffer());
-    if (data.byteLength > MAX_INLINE_MEDIA_BYTES) {
-      throw new Error(`Matrix media exceeds ${MAX_INLINE_MEDIA_BYTES} bytes`);
-    }
-    return data;
+    return readResponseWithinLimit(res, MAX_INLINE_MEDIA_BYTES);
   }
 
   private isDirectRoom(roomId: string, room: MatrixJoinedRoom): boolean {
@@ -423,6 +437,7 @@ export class MatrixChannelAdapter extends BaseChannelAdapter {
         method: "PUT",
         headers: this.authHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify(content),
+        signal: AbortSignal.timeout(15_000),
       },
     );
     if (!res.ok) {
@@ -443,6 +458,7 @@ export class MatrixChannelAdapter extends BaseChannelAdapter {
         method: "POST",
         headers: this.authHeaders(attachment.mimeType ? { "Content-Type": attachment.mimeType } : {}),
         body: data,
+        signal: AbortSignal.timeout(30_000),
       },
     );
     if (!res.ok) {
@@ -463,11 +479,15 @@ export class MatrixChannelAdapter extends BaseChannelAdapter {
       return readFile(attachment.path);
     }
     if (attachment.url) {
-      const res = await this.fetchImpl(attachment.url);
+      const res = await this.fetchImpl(attachment.url, { signal: AbortSignal.timeout(30_000) });
       if (!res.ok) {
         throw new Error(`Attachment fetch failed with HTTP ${res.status}`);
       }
-      return Buffer.from(await res.arrayBuffer());
+      const declared = Number(res.headers.get("content-length") ?? 0);
+      if (declared > MAX_INLINE_MEDIA_BYTES) {
+        throw new Error(`Download exceeds ${MAX_INLINE_MEDIA_BYTES} bytes`);
+      }
+      return readResponseWithinLimit(res, MAX_INLINE_MEDIA_BYTES);
     }
     throw new Error("Outbound attachment has no data source");
   }

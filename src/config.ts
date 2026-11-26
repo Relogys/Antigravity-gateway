@@ -125,6 +125,34 @@ export function senderKeyFor(channel: string, rawSenderId: string): string {
   return id ? `${channel.toLowerCase()}:${id}` : "";
 }
 
+const NON_PHOTON_CHANNELS = new Set<string>(
+  CHANNEL_NAMES.filter((name) => name !== "photon"),
+);
+
+/**
+ * Normalize a sender key for `GatewayStore` storage & lookups.
+ * Preserves `<channel>:<id>` prefixes for non-photon channels so a crafted id
+ * containing `;-;` cannot strip its channel prefix and collide with a Photon handle.
+ */
+export function normalizeStoreSenderKey(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return "";
+  }
+  const colonIdx = trimmed.indexOf(":");
+  if (colonIdx > 0) {
+    const prefix = trimmed.slice(0, colonIdx).toLowerCase();
+    if (NON_PHOTON_CHANNELS.has(prefix)) {
+      const rest = normalizeUserId(trimmed.slice(colonIdx + 1));
+      return rest ? `${prefix}:${rest}` : "";
+    }
+    if (prefix === "photon") {
+      return normalizeSenderId(trimmed.slice(colonIdx + 1));
+    }
+  }
+  return normalizeSenderId(trimmed);
+}
+
 function parseBoolEnv(value: string | undefined, defaultValue: boolean): boolean {
   if (value === undefined || value.trim() === "") {
     return defaultValue;

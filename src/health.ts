@@ -25,7 +25,13 @@ export class HealthServer {
         return;
       }
 
-      const urlPath = (req.url ?? "/").split("?")[0];
+      let urlPath: string;
+      try {
+        urlPath = new URL(req.url ?? "/", "http://localhost").pathname;
+      } catch {
+        this.sendJson(res, 400, { error: "Bad Request" });
+        return;
+      }
       const snapshot = this.getSnapshot();
 
       if (urlPath === "/healthz") {
@@ -79,10 +85,15 @@ export class HealthServer {
       this.sendJson(res, 404, { error: "Not Found" });
     });
 
+    server.keepAliveTimeout = 60_000;
+    server.headersTimeout = 65_000;
+    server.requestTimeout = 30_000;
+
     await new Promise<void>((resolve, reject) => {
-      server.once("error", reject);
+      const onError = (err: Error) => reject(err);
+      server.once("error", onError);
       server.listen(this.config.healthPort, this.config.healthHost, () => {
-        server.off("error", reject);
+        server.off("error", onError);
         resolve();
       });
     });
@@ -106,6 +117,7 @@ export class HealthServer {
     this.server = null;
     await new Promise<void>((resolve) => {
       server.close(() => resolve());
+      server.closeAllConnections?.();
     });
   }
 

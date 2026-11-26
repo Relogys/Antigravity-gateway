@@ -1,6 +1,5 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import http from "node:http";
-import type { AddressInfo } from "node:net";
 import path from "node:path";
 import type { GatewayConfig, LineConfig } from "../config.js";
 import type {
@@ -13,8 +12,15 @@ import { BaseChannelAdapter, type InboundHandler } from "./base.js";
 import {
   BoundedDedupeCache,
   chunkText,
+  closeHttpServer,
+  configureHttpServerTimeouts,
   isMentioned,
+  listenHttpServer,
   MAX_INLINE_MEDIA_BYTES,
+  parseRequestUrl,
+  readBoundedHttpBody,
+  readResponseWithinLimit,
+  rememberBounded,
   saveInboundMedia,
 } from "./utils.js";
 
@@ -23,6 +29,7 @@ const CONTENT_BASE = "https://api-data.line.me";
 const MAX_TEXT_CHARS = 4800;
 const MAX_MESSAGES_PER_REQUEST = 5;
 const DEFAULT_REPLY_TOKEN_TTL_MS = 50_000;
+const MAX_REPLY_TOKENS = 2000;
 const DEFAULT_MAX_BODY_BYTES = 2 * 1024 * 1024;
 const MAX_EVENTS_PER_WEBHOOK = 100;
 const DOWNLOAD_TIMEOUT_MS = 30_000;
@@ -112,6 +119,8 @@ export class LineChannelAdapter extends BaseChannelAdapter {
   private readonly replyTokenTtlMs: number;
   private readonly dedupe = new BoundedDedupeCache();
   private readonly replyTokens = new Map<string, ReplyTokenEntry>();
+  private readonly inFlight = new Set<Promise<void>>();
+  private lifecycle = new AbortController();
   private server?: http.Server;
   private boundPort: number | null = null;
   private botUserId?: string;
@@ -140,6 +149,7 @@ export class LineChannelAdapter extends BaseChannelAdapter {
   async start(onMessage: InboundHandler): Promise<void> {
     const cfg = this.lineConfig;
     this.handler = onMessage;
+    this.lifecycle = new AbortController();
 
     const server = http.createServer((req, res) => {
       void this.route(req, res).catch((err) => {
@@ -153,33 +163,30 @@ export class LineChannelAdapter extends BaseChannelAdapter {
         });
       });
     });
+    configureHttpServerTimeouts(server, { requestTimeoutMs: 30_000 });
     this.server = server;
 
-    await new Promise<void>((resolve, reject) => {
-      const onError = (err: Error) => reject(err);
-      server.once("error", onError);
-      server.listen(cfg.port, cfg.host, () => {
-        server.off("error", onError);
-        resolve();
-      });
-    });
-    this.boundPort = (server.address() as AddressInfo).port;
+    try {
+      this.boundPort = await listenHttpServer(server, cfg.port, cfg.host);
+    } catch (err) {
+      this.server = undefined;
+      this.handler = undefined;
+      throw err;
+    }
     this.setConnected(true);
   }
 
   async stop(): Promise<void> {
     this.setConnected(false);
+    this.lifecycle.abort();
     this.replyTokens.clear();
     const server = this.server;
     this.server = undefined;
     this.boundPort = null;
     this.handler = undefined;
-    if (server) {
-      await new Promise<void>((resolve) => {
-        server.close(() => resolve());
-        server.closeAllConnections?.();
-      });
-    }
+    await closeHttpServer(server);
+    await Promise.allSettled(this.inFlight);
+    this.inFlight.clear();
   }
 
   // ------------------------------------------------------------------ HTTP
@@ -192,27 +199,18 @@ export class LineChannelAdapter extends BaseChannelAdapter {
     res.writeHead(status, {
       "content-type": "application/json; charset=utf-8",
       "content-length": Buffer.byteLength(payload),
+      ...(status === 413 ? { connection: "close" } : {}),
     });
     res.end(payload);
   }
 
   private async readBody(req: http.IncomingMessage): Promise<Buffer> {
     const limit = this.options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
-    const chunks: Buffer[] = [];
-    let total = 0;
-    for await (const chunk of req) {
-      const buf = chunk as Buffer;
-      total += buf.byteLength;
-      if (total > limit) {
-        throw new HttpError(413, "request body too large");
-      }
-      chunks.push(buf);
-    }
-    return Buffer.concat(chunks);
+    return readBoundedHttpBody(req, limit, () => new HttpError(413, "request body too large"));
   }
 
   private async route(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-    const url = new URL(req.url ?? "/", "http://localhost");
+    const url = parseRequestUrl(req.url, () => new HttpError(400, "invalid request URL"));
     const method = req.method ?? "GET";
 
     if (url.pathname === "/line/health") {
@@ -252,7 +250,10 @@ export class LineChannelAdapter extends BaseChannelAdapter {
 
     this.json(res, 200, { ok: true });
     if (Array.isArray(body.events)) {
-      void this.handleEvents(body.events);
+      const task = this.handleEvents(body.events).finally(() => {
+        this.inFlight.delete(task);
+      });
+      this.inFlight.add(task);
     }
   }
 
@@ -353,7 +354,10 @@ export class LineChannelAdapter extends BaseChannelAdapter {
     try {
       const res = await this.fetchImpl(url, {
         headers: { Authorization: `Bearer ${this.lineConfig.channelAccessToken}` },
-        signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
+        signal: AbortSignal.any([
+          AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
+          this.lifecycle.signal,
+        ]),
       });
       if (!res.ok) {
         throw new Error(`LINE content download failed with HTTP ${res.status}`);
@@ -362,10 +366,7 @@ export class LineChannelAdapter extends BaseChannelAdapter {
       if (declared > MAX_INLINE_MEDIA_BYTES) {
         throw new Error(`LINE content exceeds ${MAX_INLINE_MEDIA_BYTES} bytes`);
       }
-      const data = Buffer.from(await res.arrayBuffer());
-      if (data.byteLength > MAX_INLINE_MEDIA_BYTES) {
-        throw new Error(`LINE content exceeds ${MAX_INLINE_MEDIA_BYTES} bytes`);
-      }
+      const data = await readResponseWithinLimit(res, MAX_INLINE_MEDIA_BYTES);
       attachment.localPath = await saveInboundMedia(
         this.mediaDir,
         this.name,
@@ -389,7 +390,12 @@ export class LineChannelAdapter extends BaseChannelAdapter {
         this.replyTokens.delete(key);
       }
     }
-    this.replyTokens.set(chatId, { token, expiresAt: now + this.replyTokenTtlMs });
+    rememberBounded(
+      this.replyTokens,
+      chatId,
+      { token, expiresAt: now + this.replyTokenTtlMs },
+      MAX_REPLY_TOKENS,
+    );
   }
 
   /** Take (and consume) a fresh single-use reply token for `chatId`. */

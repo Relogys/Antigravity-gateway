@@ -136,6 +136,7 @@ export class DiscordChannelAdapter extends BaseChannelAdapter {
   private readonly dedupe = new BoundedDedupeCache();
 
   private client?: DiscordClientLike;
+  private cancelReadyWait?: () => void;
 
   constructor(config: GatewayConfig, options: DiscordAdapterOptions = {}) {
     super();
@@ -164,10 +165,15 @@ export class DiscordChannelAdapter extends BaseChannelAdapter {
         if (!done) {
           done = true;
           clearTimeout(timer);
+          if (this.cancelReadyWait === finish) {
+            this.cancelReadyWait = undefined;
+          }
           resolve();
         }
       };
+      this.cancelReadyWait = finish;
       const timer = setTimeout(finish, this.readyTimeoutMs);
+      timer.unref?.();
       client.once("clientReady", () => {
         this.setConnected(true);
         finish();
@@ -185,6 +191,7 @@ export class DiscordChannelAdapter extends BaseChannelAdapter {
     try {
       await client.login(this.token);
     } catch (err) {
+      this.cancelReadyWait?.();
       this.noteError(err);
       this.client = undefined;
       this.handler = undefined;
@@ -195,7 +202,12 @@ export class DiscordChannelAdapter extends BaseChannelAdapter {
       }
       throw err;
     }
+    if (!this.client) {
+      this.cancelReadyWait?.();
+      return;
+    }
     if (client.isReady?.()) {
+      this.cancelReadyWait?.();
       this.setConnected(true);
     } else {
       await ready;
@@ -203,6 +215,7 @@ export class DiscordChannelAdapter extends BaseChannelAdapter {
   }
 
   async stop(): Promise<void> {
+    this.cancelReadyWait?.();
     const client = this.client;
     this.client = undefined;
     this.handler = undefined;

@@ -106,6 +106,9 @@ export class RocketChatChannelAdapter extends BaseChannelAdapter {
   }
 
   async start(onMessage: InboundHandler): Promise<void> {
+    if (this.connectionLoop) {
+      return;
+    }
     this.handler = onMessage;
     this.stopped = false;
     this.lifecycle = new AbortController();
@@ -122,8 +125,11 @@ export class RocketChatChannelAdapter extends BaseChannelAdapter {
     } catch {
       // already closed
     }
-    void this.connectionLoop?.catch(() => undefined);
+    const loop = this.connectionLoop;
     this.connectionLoop = undefined;
+    if (loop) {
+      await loop.catch(() => undefined);
+    }
     this.dedupe.clear();
     this.handler = undefined;
     this.setConnected(false);
@@ -144,6 +150,7 @@ export class RocketChatChannelAdapter extends BaseChannelAdapter {
           "X-Auth-Token": this.cfg.authToken,
         },
         body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(15_000),
       });
       if (!res.ok) {
         throw new Error(`Rocket.Chat send failed with HTTP ${res.status}`);
@@ -200,12 +207,23 @@ export class RocketChatChannelAdapter extends BaseChannelAdapter {
       this.ws = ws;
       let opened = false;
       let settled = false;
+      const signal = this.lifecycle.signal;
       const settle = (): void => {
         if (!settled) {
           settled = true;
+          signal.removeEventListener("abort", onAbort);
           resolve(opened);
         }
       };
+      const onAbort = (): void => {
+        try {
+          ws.close();
+        } catch {
+          // already closed
+        }
+        settle();
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
 
       ws.onopen = () => {
         if (this.stopped) {

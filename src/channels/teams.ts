@@ -1,10 +1,20 @@
 import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import http from "node:http";
-import type { AddressInfo } from "node:net";
 import type { GatewayConfig, TeamsConfig } from "../config.js";
 import type { ChannelAdapter, InboundMessage, OutboundMessage } from "../types.js";
 import { BaseChannelAdapter, type InboundHandler } from "./base.js";
-import { BoundedDedupeCache, chunkText, isMentioned } from "./utils.js";
+import {
+  BoundedDedupeCache,
+  chunkText,
+  closeHttpServer,
+  configureHttpServerTimeouts,
+  isLoopbackHost,
+  isMentioned,
+  listenHttpServer,
+  parseRequestUrl,
+  readBoundedHttpBody,
+  rememberBounded,
+} from "./utils.js";
 
 const LOGIN_BASE = "https://login.microsoftonline.com";
 const BOT_FRAMEWORK_SCOPE = "https://api.botframework.com/.default";
@@ -83,6 +93,7 @@ export class TeamsChannelAdapter extends BaseChannelAdapter {
   private readonly fetchImpl: typeof fetch;
   private readonly dedupe = new BoundedDedupeCache();
   private readonly serviceUrls = new Map<string, string>();
+  private readonly inFlight = new Set<Promise<void>>();
   private server?: http.Server;
   private boundPort: number | null = null;
   private tokenCache?: CachedToken;
@@ -109,6 +120,12 @@ export class TeamsChannelAdapter extends BaseChannelAdapter {
 
   async start(onMessage: InboundHandler): Promise<void> {
     const cfg = this.teamsConfig;
+    const host = cfg.webhookHost || "127.0.0.1";
+    if (!isLoopbackHost(host) && !cfg.webhookSecret) {
+      throw new Error(
+        `Teams refuses to listen on non-loopback host "${host}" without TEAMS_WEBHOOK_SECRET`,
+      );
+    }
     this.handler = onMessage;
 
     const server = http.createServer((req, res) => {
@@ -123,17 +140,16 @@ export class TeamsChannelAdapter extends BaseChannelAdapter {
         });
       });
     });
+    configureHttpServerTimeouts(server, { requestTimeoutMs: 30_000 });
     this.server = server;
 
-    await new Promise<void>((resolve, reject) => {
-      const onError = (err: Error) => reject(err);
-      server.once("error", onError);
-      server.listen(cfg.webhookPort, cfg.webhookHost || "127.0.0.1", () => {
-        server.off("error", onError);
-        resolve();
-      });
-    });
-    this.boundPort = (server.address() as AddressInfo).port;
+    try {
+      this.boundPort = await listenHttpServer(server, cfg.webhookPort, host);
+    } catch (err) {
+      this.server = undefined;
+      this.handler = undefined;
+      throw err;
+    }
     this.setConnected(true);
   }
 
@@ -147,12 +163,9 @@ export class TeamsChannelAdapter extends BaseChannelAdapter {
     this.server = undefined;
     this.boundPort = null;
     this.handler = undefined;
-    if (server) {
-      await new Promise<void>((resolve) => {
-        server.close(() => resolve());
-        server.closeAllConnections?.();
-      });
-    }
+    await closeHttpServer(server);
+    await Promise.allSettled(this.inFlight);
+    this.inFlight.clear();
   }
 
   // ------------------------------------------------------------------ HTTP
@@ -170,27 +183,18 @@ export class TeamsChannelAdapter extends BaseChannelAdapter {
     res.writeHead(status, {
       "content-type": "application/json; charset=utf-8",
       "content-length": Buffer.byteLength(payload),
+      ...(status === 413 ? { connection: "close" } : {}),
     });
     res.end(payload);
   }
 
   private async readBody(req: http.IncomingMessage): Promise<Buffer> {
     const limit = this.options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
-    const chunks: Buffer[] = [];
-    let total = 0;
-    for await (const chunk of req) {
-      const buf = chunk as Buffer;
-      total += buf.byteLength;
-      if (total > limit) {
-        throw new HttpError(413, "request body too large");
-      }
-      chunks.push(buf);
-    }
-    return Buffer.concat(chunks);
+    return readBoundedHttpBody(req, limit, () => new HttpError(413, "request body too large"));
   }
 
   private async route(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-    const url = new URL(req.url ?? "/", "http://localhost");
+    const url = parseRequestUrl(req.url, () => new HttpError(400, "invalid request URL"));
     const method = req.method ?? "GET";
 
     if (url.pathname === "/teams/health") {
@@ -209,12 +213,13 @@ export class TeamsChannelAdapter extends BaseChannelAdapter {
     }
 
     const raw = await this.readBody(req);
-    if (this.teamsConfig.webhookSecret) {
-      const header = req.headers.authorization;
-      const authorization = Array.isArray(header) ? (header[0] ?? "") : (header ?? "");
-      if (!verifyTeamsHmac(this.teamsConfig.webhookSecret, raw, authorization)) {
-        throw new HttpError(401, "invalid HMAC signature");
-      }
+    const header = req.headers.authorization;
+    const authorization = Array.isArray(header) ? (header[0] ?? "") : (header ?? "");
+    if (
+      !this.teamsConfig.webhookSecret ||
+      !verifyTeamsHmac(this.teamsConfig.webhookSecret, raw, authorization)
+    ) {
+      throw new HttpError(401, "invalid HMAC signature");
     }
 
     let activity: TeamsActivity;
@@ -228,7 +233,10 @@ export class TeamsChannelAdapter extends BaseChannelAdapter {
     }
 
     this.json(res, 200, { ok: true });
-    void this.handleActivity(activity);
+    const task = this.handleActivity(activity).finally(() => {
+      this.inFlight.delete(task);
+    });
+    this.inFlight.add(task);
   }
 
   // --------------------------------------------------------------- inbound
@@ -253,10 +261,15 @@ export class TeamsChannelAdapter extends BaseChannelAdapter {
       }
 
       const rawText = typeof activity.text === "string" ? activity.text : "";
+      const recipientId = activity.recipient?.id;
       const hadMentionTag =
         /<at>[\s\S]*?<\/at>/i.test(rawText) ||
         (Array.isArray(activity.entities) &&
-          activity.entities.some((entity) => entity?.type === "mention"));
+          activity.entities.some(
+            (entity) =>
+              entity?.type === "mention" &&
+              (!recipientId || !entity.mentioned?.id || entity.mentioned.id === recipientId),
+          ));
       const text = rawText
         .replace(/<at>[\s\S]*?<\/at>/gi, "")
         .replace(/[ \t]{2,}/g, " ")
@@ -309,15 +322,7 @@ export class TeamsChannelAdapter extends BaseChannelAdapter {
     if (!/^https?:\/\//i.test(normalized)) {
       return;
     }
-    this.serviceUrls.delete(conversationId);
-    this.serviceUrls.set(conversationId, normalized);
-    while (this.serviceUrls.size > MAX_SERVICE_URL_ENTRIES) {
-      const oldest = this.serviceUrls.keys().next().value;
-      if (oldest === undefined) {
-        break;
-      }
-      this.serviceUrls.delete(oldest);
-    }
+    rememberBounded(this.serviceUrls, conversationId, normalized, MAX_SERVICE_URL_ENTRIES);
   }
 
   // ------------------------------------------------------------------ auth

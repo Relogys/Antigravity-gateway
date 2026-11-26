@@ -15,6 +15,7 @@ import {
   MAX_INLINE_MEDIA_BYTES,
   chunkText,
   isMentioned,
+  readResponseWithinLimit,
   reconnectDelayMs,
   saveInboundMedia,
   sleepWithAbort,
@@ -142,6 +143,9 @@ export class MattermostChannelAdapter extends BaseChannelAdapter {
   }
 
   async start(onMessage: InboundHandler): Promise<void> {
+    if (this.connectionLoop) {
+      return;
+    }
     this.handler = onMessage;
     this.stopped = false;
     this.lifecycle = new AbortController();
@@ -149,6 +153,9 @@ export class MattermostChannelAdapter extends BaseChannelAdapter {
       await this.ensureIdentity();
     } catch (err) {
       this.noteError(err);
+    }
+    if (this.stopped) {
+      return;
     }
     this.connectionLoop = this.runConnectionLoop();
   }
@@ -163,8 +170,12 @@ export class MattermostChannelAdapter extends BaseChannelAdapter {
     } catch {
       // already closed
     }
-    void this.connectionLoop?.catch(() => undefined);
+    const loop = this.connectionLoop;
     this.connectionLoop = undefined;
+    if (loop) {
+      await loop.catch(() => undefined);
+    }
+    this.handler = undefined;
     this.setConnected(false);
   }
 
@@ -199,6 +210,7 @@ export class MattermostChannelAdapter extends BaseChannelAdapter {
       method: "POST",
       headers: this.authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ channel_id: chatId }),
+      signal: AbortSignal.timeout(15_000),
     });
     if (!res.ok) {
       throw new Error(`Mattermost typing failed with HTTP ${res.status}`);
@@ -214,6 +226,7 @@ export class MattermostChannelAdapter extends BaseChannelAdapter {
         post_id: messageId,
         emoji_name: emoji.replace(/^:+|:+$/g, ""),
       }),
+      signal: AbortSignal.timeout(15_000),
     });
     if (!res.ok) {
       throw new Error(`Mattermost reaction failed with HTTP ${res.status}`);
@@ -226,6 +239,7 @@ export class MattermostChannelAdapter extends BaseChannelAdapter {
     }
     const res = await this.fetchImpl(`${this.baseUrl()}/api/v4/users/me`, {
       headers: this.authHeaders(),
+      signal: AbortSignal.any([AbortSignal.timeout(15_000), this.lifecycle.signal]),
     });
     if (!res.ok) {
       throw new Error(`Mattermost users/me failed with HTTP ${res.status}`);
@@ -277,12 +291,23 @@ export class MattermostChannelAdapter extends BaseChannelAdapter {
       this.ws = ws;
       let opened = false;
       let settled = false;
+      const signal = this.lifecycle.signal;
       const settle = (): void => {
         if (!settled) {
           settled = true;
+          signal.removeEventListener("abort", onAbort);
           resolve(opened);
         }
       };
+      const onAbort = (): void => {
+        try {
+          ws.close();
+        } catch {
+          // already closed
+        }
+        settle();
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
 
       ws.onopen = () => {
         if (this.stopped) {
@@ -425,7 +450,10 @@ export class MattermostChannelAdapter extends BaseChannelAdapter {
   ): Promise<{ data: Buffer; mimeType?: string; name: string }> {
     const res = await this.fetchImpl(
       `${this.baseUrl()}/api/v4/files/${encodeURIComponent(fileId)}`,
-      { headers: this.authHeaders() },
+      {
+        headers: this.authHeaders(),
+        signal: AbortSignal.any([AbortSignal.timeout(30_000), this.lifecycle.signal]),
+      },
     );
     if (!res.ok) {
       throw new Error(`Mattermost file download failed with HTTP ${res.status}`);
@@ -434,10 +462,7 @@ export class MattermostChannelAdapter extends BaseChannelAdapter {
     if (declared > MAX_INLINE_MEDIA_BYTES) {
       throw new Error(`Mattermost file exceeds ${MAX_INLINE_MEDIA_BYTES} bytes`);
     }
-    const data = Buffer.from(await res.arrayBuffer());
-    if (data.byteLength > MAX_INLINE_MEDIA_BYTES) {
-      throw new Error(`Mattermost file exceeds ${MAX_INLINE_MEDIA_BYTES} bytes`);
-    }
+    const data = await readResponseWithinLimit(res, MAX_INLINE_MEDIA_BYTES);
     return {
       data,
       mimeType: res.headers.get("content-type") ?? undefined,
@@ -465,6 +490,7 @@ export class MattermostChannelAdapter extends BaseChannelAdapter {
       method: "POST",
       headers: this.authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(15_000),
     });
     if (!res.ok) {
       throw new Error(`Mattermost create post failed with HTTP ${res.status}`);
@@ -491,6 +517,7 @@ export class MattermostChannelAdapter extends BaseChannelAdapter {
       method: "POST",
       headers: this.authHeaders(),
       body: form,
+      signal: AbortSignal.timeout(30_000),
     });
     if (!res.ok) {
       throw new Error(`Mattermost file upload failed with HTTP ${res.status}`);
@@ -511,11 +538,15 @@ export class MattermostChannelAdapter extends BaseChannelAdapter {
       return readFile(attachment.path);
     }
     if (attachment.url) {
-      const res = await this.fetchImpl(attachment.url);
+      const res = await this.fetchImpl(attachment.url, { signal: AbortSignal.timeout(30_000) });
       if (!res.ok) {
         throw new Error(`Attachment fetch failed with HTTP ${res.status}`);
       }
-      return Buffer.from(await res.arrayBuffer());
+      const declared = Number(res.headers.get("content-length") ?? 0);
+      if (declared > MAX_INLINE_MEDIA_BYTES) {
+        throw new Error(`Download exceeds ${MAX_INLINE_MEDIA_BYTES} bytes`);
+      }
+      return readResponseWithinLimit(res, MAX_INLINE_MEDIA_BYTES);
     }
     throw new Error("Outbound attachment has no data source");
   }

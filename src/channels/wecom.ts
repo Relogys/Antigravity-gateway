@@ -7,7 +7,6 @@ import {
 } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import http from "node:http";
-import type { AddressInfo } from "node:net";
 import path from "node:path";
 import type { GatewayConfig } from "../config.js";
 import type {
@@ -21,7 +20,14 @@ import { BaseChannelAdapter, type InboundHandler } from "./base.js";
 import {
   BoundedDedupeCache,
   chunkText,
+  closeHttpServer,
+  configureHttpServerTimeouts,
+  isLoopbackHost,
+  listenHttpServer,
   MAX_INLINE_MEDIA_BYTES,
+  parseRequestUrl,
+  readBoundedHttpBody,
+  readResponseWithinLimit,
   saveInboundMedia,
 } from "./utils.js";
 
@@ -150,8 +156,14 @@ function xmlValue(xml: string, tag: string): string {
     .replace(/&gt;/g, ">")
     .replace(/&quot;/g, '"')
     .replace(/&apos;/g, "'")
-    .replace(/&#x([0-9a-f]+);/gi, (_all, hex: string) => String.fromCodePoint(Number.parseInt(hex, 16)))
-    .replace(/&#(\d+);/g, (_all, decimal: string) => String.fromCodePoint(Number.parseInt(decimal, 10)))
+    .replace(/&#x([0-9a-f]+);/gi, (all, hex: string) => {
+      const cp = Number.parseInt(hex, 16);
+      return Number.isInteger(cp) && cp >= 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : all;
+    })
+    .replace(/&#(\d+);/g, (all, decimal: string) => {
+      const cp = Number.parseInt(decimal, 10);
+      return Number.isInteger(cp) && cp >= 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : all;
+    })
     .replace(/&amp;/g, "&");
 }
 
@@ -201,6 +213,7 @@ export class WeComChannelAdapter extends BaseChannelAdapter {
   private boundPort: number | null = null;
   private token?: { value: string; expiresAt: number };
   private tokenRequest?: Promise<string>;
+  private lifecycle = new AbortController();
 
   constructor(
     private readonly config: GatewayConfig,
@@ -224,7 +237,14 @@ export class WeComChannelAdapter extends BaseChannelAdapter {
     if ((cfg.token && !cfg.encodingAesKey) || (!cfg.token && cfg.encodingAesKey)) {
       throw new Error("WECOM_TOKEN and WECOM_ENCODING_AES_KEY must be configured together");
     }
+    const host = cfg.host || "127.0.0.1";
+    if (!isLoopbackHost(host) && (!cfg.token || !cfg.encodingAesKey)) {
+      throw new Error(
+        `WeCom refuses to listen on non-loopback host "${host}" without WECOM_TOKEN and WECOM_ENCODING_AES_KEY`,
+      );
+    }
     this.handler = onMessage;
+    this.lifecycle = new AbortController();
     const server = http.createServer((req, res) => {
       void this.route(req, res).catch((err: unknown) => {
         if (!(err instanceof HttpError)) {
@@ -234,34 +254,28 @@ export class WeComChannelAdapter extends BaseChannelAdapter {
         this.text(res, status, err instanceof HttpError ? err.message : "internal error");
       });
     });
+    configureHttpServerTimeouts(server, { requestTimeoutMs: 30_000 });
     this.server = server;
-    await new Promise<void>((resolve, reject) => {
-      const onError = (err: Error) => reject(err);
-      server.once("error", onError);
-      server.listen(cfg.port, cfg.host, () => {
-        server.off("error", onError);
-        resolve();
-      });
-    }).catch((err: unknown) => {
+    try {
+      this.boundPort = await listenHttpServer(server, cfg.port, host);
+    } catch (err) {
       this.server = undefined;
+      this.handler = undefined;
       throw err;
-    });
-    this.boundPort = (server.address() as AddressInfo).port;
+    }
     this.setConnected(true);
   }
 
   async stop(): Promise<void> {
     this.setConnected(false);
+    this.lifecycle.abort();
+    this.token = undefined;
+    this.tokenRequest = undefined;
     const server = this.server;
     this.server = undefined;
     this.boundPort = null;
     this.handler = undefined;
-    if (server) {
-      await new Promise<void>((resolve) => {
-        server.close(() => resolve());
-        server.closeAllConnections?.();
-      });
-    }
+    await closeHttpServer(server);
   }
 
   private text(res: http.ServerResponse, status: number, body: string): void {
@@ -271,23 +285,19 @@ export class WeComChannelAdapter extends BaseChannelAdapter {
     res.writeHead(status, {
       "content-type": "text/plain; charset=utf-8",
       "content-length": Buffer.byteLength(body),
+      ...(status === 413 ? { connection: "close" } : {}),
     });
     res.end(body);
   }
 
   private async readBody(req: http.IncomingMessage): Promise<string> {
     const limit = this.options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
-    const chunks: Buffer[] = [];
-    let total = 0;
-    for await (const chunk of req) {
-      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array);
-      total += buffer.byteLength;
-      if (total > limit) {
-        throw new HttpError(413, "request body too large");
-      }
-      chunks.push(buffer);
-    }
-    return Buffer.concat(chunks).toString("utf8");
+    const buf = await readBoundedHttpBody(
+      req,
+      limit,
+      () => new HttpError(413, "request body too large"),
+    );
+    return buf.toString("utf8");
   }
 
   private checkSignature(url: URL, encrypted: string): void {
@@ -323,7 +333,7 @@ export class WeComChannelAdapter extends BaseChannelAdapter {
   }
 
   private async route(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-    const url = new URL(req.url ?? "/", "http://localhost");
+    const url = parseRequestUrl(req.url, () => new HttpError(400, "invalid request URL"));
     const method = req.method ?? "GET";
     if (method === "GET") {
       const echo = url.searchParams.get("echostr");
@@ -485,10 +495,7 @@ export class WeComChannelAdapter extends BaseChannelAdapter {
     if (declared > MAX_INLINE_MEDIA_BYTES) {
       throw new Error(`WeCom media download exceeds ${MAX_INLINE_MEDIA_BYTES} bytes`);
     }
-    const data = Buffer.from(await res.arrayBuffer());
-    if (data.byteLength > MAX_INLINE_MEDIA_BYTES) {
-      throw new Error(`WeCom media download exceeds ${MAX_INLINE_MEDIA_BYTES} bytes`);
-    }
+    const data = await readResponseWithinLimit(res, MAX_INLINE_MEDIA_BYTES);
     return { data, mimeType };
   }
 
@@ -544,11 +551,11 @@ export class WeComChannelAdapter extends BaseChannelAdapter {
     if (!res.ok) {
       throw new Error(`WeCom attachment download failed: HTTP ${res.status}`);
     }
-    const data = Buffer.from(await res.arrayBuffer());
-    if (data.byteLength > MAX_INLINE_MEDIA_BYTES) {
+    const declared = Number(res.headers.get("content-length") ?? 0);
+    if (declared > MAX_INLINE_MEDIA_BYTES) {
       throw new Error(`WeCom attachment download exceeds ${MAX_INLINE_MEDIA_BYTES} bytes`);
     }
-    return data;
+    return readResponseWithinLimit(res, MAX_INLINE_MEDIA_BYTES);
   }
 
   private async sendAttachment(chatId: string, att: OutboundAttachment): Promise<WeComApiResponse> {

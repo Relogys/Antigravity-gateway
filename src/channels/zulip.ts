@@ -90,6 +90,9 @@ export class ZulipChannelAdapter extends BaseChannelAdapter {
   }
 
   async start(onMessage: InboundHandler): Promise<void> {
+    if (this.pollLoop) {
+      return;
+    }
     this.handler = onMessage;
     this.stopped = false;
     this.lifecycle = new AbortController();
@@ -98,14 +101,20 @@ export class ZulipChannelAdapter extends BaseChannelAdapter {
     } catch (err) {
       this.noteError(err);
     }
+    if (this.stopped) {
+      return;
+    }
     this.pollLoop = this.runEventLoop();
   }
 
   async stop(): Promise<void> {
     this.stopped = true;
     this.lifecycle.abort();
-    void this.pollLoop?.catch(() => undefined);
+    const loop = this.pollLoop;
     this.pollLoop = undefined;
+    if (loop) {
+      await loop.catch(() => undefined);
+    }
     this.queueId = undefined;
     this.dedupe.clear();
     this.handler = undefined;
@@ -119,6 +128,7 @@ export class ZulipChannelAdapter extends BaseChannelAdapter {
         method: "POST",
         headers: this.authHeaders({ "Content-Type": "application/x-www-form-urlencoded" }),
         body: this.buildSendFields(msg.chatId, chunk),
+        signal: AbortSignal.timeout(15_000),
       });
       if (!res.ok) {
         throw new Error(`Zulip send failed with HTTP ${res.status}`);
@@ -152,6 +162,7 @@ export class ZulipChannelAdapter extends BaseChannelAdapter {
       method: "POST",
       headers: this.authHeaders({ "Content-Type": "application/x-www-form-urlencoded" }),
       body,
+      signal: AbortSignal.any([AbortSignal.timeout(15_000), this.lifecycle.signal]),
     });
     if (!res.ok) {
       throw new Error(`Zulip register failed with HTTP ${res.status}`);
@@ -296,8 +307,19 @@ export class ZulipChannelAdapter extends BaseChannelAdapter {
     if (!text) {
       return false;
     }
-    if (/@\*\*[^*]+\*\*/.test(text)) {
-      return true;
+    const botNames = [
+      this.cfg.botEmail,
+      this.cfg.botEmail.split("@")[0] ?? "",
+      this.botFullName,
+    ]
+      .filter((name) => name.length > 0)
+      .map((name) => name.toLowerCase());
+    const pillRe = /@\*\*([^*]+)\*\*/g;
+    for (let m = pillRe.exec(text); m; m = pillRe.exec(text)) {
+      const target = (m[1]?.split("|")[0] ?? "").trim().toLowerCase();
+      if (botNames.includes(target)) {
+        return true;
+      }
     }
     return isMentioned(text, this.mentionPatterns());
   }

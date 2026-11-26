@@ -490,12 +490,15 @@ export class SignalChannelAdapter extends BaseChannelAdapter {
 
   private async postSend(message: string, recipients: string[]): Promise<Response> {
     let res: Response;
+    const signal = this.abort
+      ? AbortSignal.any([AbortSignal.timeout(15_000), this.abort.signal])
+      : AbortSignal.timeout(15_000);
     try {
       res = await this.fetchImpl(this.sendUrl(), {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ message, number: this.cfg.account, recipients }),
-        ...(this.abort ? { signal: this.abort.signal } : {}),
+        signal,
       });
     } catch (err) {
       this.noteError(err);

@@ -254,7 +254,14 @@ export class FeishuChannelAdapter extends BaseChannelAdapter {
       }
     }
 
-    await this.ws.start({ eventDispatcher: dispatcher });
+    try {
+      await this.ws.start({ eventDispatcher: dispatcher });
+    } catch (err) {
+      this.ws = undefined;
+      this.client = undefined;
+      this.handler = undefined;
+      throw err;
+    }
     this.setConnected(true);
   }
 
@@ -266,6 +273,7 @@ export class FeishuChannelAdapter extends BaseChannelAdapter {
       this.noteError(err);
     }
     this.ws = undefined;
+    this.client = undefined;
     this.handler = undefined;
   }
 

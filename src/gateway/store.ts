@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { normalizeSenderId } from "../config.js";
+import { normalizeStoreSenderKey } from "../config.js";
 import type { LoopJob, SessionInfo } from "../types.js";
 
 const PAIRING_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -65,6 +65,12 @@ function generatePairingCode(): string {
   return code;
 }
 
+function timingSafeCodeMatch(a: string, b: string): boolean {
+  const da = crypto.createHash("sha256").update(a, "utf8").digest();
+  const db = crypto.createHash("sha256").update(b, "utf8").digest();
+  return crypto.timingSafeEqual(da, db);
+}
+
 /**
  * Atomic JSON state store persisted at `<dataDir>/state.json`.
  * Manages chat sessions, pairing allowlist/codes, scheduled loops, and home chat.
@@ -89,7 +95,7 @@ export class GatewayStore {
       const parsed = JSON.parse(raw) as Partial<PersistedState>;
       const approved = new Set<string>();
       for (const sender of parsed.approvedSenders ?? []) {
-        const norm = normalizeSenderId(sender);
+        const norm = normalizeStoreSenderKey(sender);
         if (norm) {
           approved.add(norm);
         }
@@ -149,10 +155,31 @@ export class GatewayStore {
     const tmpPath = path.join(this.dataDir, tmpName);
     try {
       await fs.writeFile(tmpPath, content, { encoding: "utf8", mode: 0o600 });
-      await fs.rename(tmpPath, this.filePath);
+      await this.renameWithRetry(tmpPath, this.filePath);
     } catch (err) {
       await fs.rm(tmpPath, { force: true }).catch(() => {});
       throw err;
+    }
+  }
+
+  private async renameWithRetry(src: string, dest: string): Promise<void> {
+    const delays = [10, 30, 80];
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        await fs.rename(src, dest);
+        return;
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (
+          process.platform === "win32" &&
+          (code === "EPERM" || code === "EBUSY" || code === "EACCES") &&
+          attempt < delays.length
+        ) {
+          await new Promise((resolve) => setTimeout(resolve, delays[attempt]));
+          continue;
+        }
+        throw err;
+      }
     }
   }
 
@@ -182,7 +209,7 @@ export class GatewayStore {
   }
 
   isApprovedSender(senderId: string): boolean {
-    const norm = normalizeSenderId(senderId);
+    const norm = normalizeStoreSenderKey(senderId);
     if (!norm) {
       return false;
     }
@@ -190,7 +217,7 @@ export class GatewayStore {
   }
 
   async addApprovedSender(senderId: string): Promise<boolean> {
-    const norm = normalizeSenderId(senderId);
+    const norm = normalizeStoreSenderKey(senderId);
     if (!norm) {
       return false;
     }
@@ -203,7 +230,7 @@ export class GatewayStore {
   }
 
   async revokeApprovedSender(senderId: string): Promise<boolean> {
-    const norm = normalizeSenderId(senderId);
+    const norm = normalizeStoreSenderKey(senderId);
     if (!norm) {
       return false;
     }
@@ -231,7 +258,7 @@ export class GatewayStore {
   }
 
   async createOrGetPairing(senderId: string): Promise<PairingIssueResult> {
-    const norm = normalizeSenderId(senderId);
+    const norm = normalizeStoreSenderKey(senderId);
     if (!norm) {
       return { shouldNotify: false, reason: "max_pending" };
     }
@@ -320,9 +347,12 @@ export class GatewayStore {
       this.state.pairingFailedAttempts = 0;
     }
 
-    const idx = this.state.pendingPairings.findIndex(
-      (entry) => entry.code === normalizedCode,
-    );
+    let idx = -1;
+    for (let i = 0; i < this.state.pendingPairings.length; i += 1) {
+      if (timingSafeCodeMatch(this.state.pendingPairings[i]!.code, normalizedCode)) {
+        idx = i;
+      }
+    }
 
     if (idx === -1) {
       this.pruneExpiredPairings(now);
@@ -339,7 +369,7 @@ export class GatewayStore {
     this.state.pairingFailedAttempts = 0;
     this.state.pairingLockedUntil = undefined;
 
-    const senderNorm = normalizeSenderId(entry.senderId);
+    const senderNorm = normalizeStoreSenderKey(entry.senderId);
     if (senderNorm && !this.state.approvedSenders.includes(senderNorm)) {
       this.state.approvedSenders.push(senderNorm);
     }

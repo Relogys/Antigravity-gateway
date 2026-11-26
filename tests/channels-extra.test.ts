@@ -1,6 +1,7 @@
 import { createHmac, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -157,18 +158,63 @@ function lineEvent(overrides: Record<string, unknown> = {}): Record<string, any>
   };
 }
 
+interface HttpResult {
+  status: number;
+  text: string;
+  json: () => unknown;
+}
+
+/** Single-shot loopback HTTP request (avoids global undici keep-alive pooling across ephemeral ports). */
+function httpRequest(options: {
+  port: number;
+  path: string;
+  method?: string;
+  headers?: Record<string, string>;
+  body?: string;
+}): Promise<HttpResult> {
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      {
+        host: "127.0.0.1",
+        port: options.port,
+        path: options.path,
+        method: options.method ?? "GET",
+        headers: { connection: "close", ...options.headers },
+        agent: false,
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (chunk) => chunks.push(chunk as Buffer));
+        res.on("end", () => {
+          const text = Buffer.concat(chunks).toString("utf8");
+          resolve({
+            status: res.statusCode ?? 0,
+            text,
+            json: () => JSON.parse(text),
+          });
+        });
+      },
+    );
+    req.on("error", reject);
+    if (options.body !== undefined) {
+      req.write(options.body);
+    }
+    req.end();
+  });
+}
+
 async function postLineWebhook(
   port: number,
   payload: unknown,
   options: { secret?: string | null } = {},
-): Promise<Response> {
+): Promise<HttpResult> {
   const body = typeof payload === "string" ? payload : JSON.stringify(payload);
   const headers: Record<string, string> = { "content-type": "application/json" };
   const secret = options.secret === undefined ? LINE_SECRET : options.secret;
   if (secret !== null) {
     headers["x-line-signature"] = signLine(body, secret);
   }
-  return fetch(`http://127.0.0.1:${port}/line/webhook`, { method: "POST", headers, body });
+  return httpRequest({ port, path: "/line/webhook", method: "POST", headers, body });
 }
 
 async function startLine(
@@ -207,9 +253,9 @@ describe("LINE channel", () => {
     const api = makeLineApi();
     const { port, messages } = await startLine(api);
 
-    const health = await fetch(`http://127.0.0.1:${port}/line/health`);
+    const health = await httpRequest({ port, path: "/line/health" });
     expect(health.status).toBe(200);
-    expect(await health.json()).toMatchObject({ ok: true, channel: "line" });
+    expect(health.json()).toMatchObject({ ok: true, channel: "line" });
 
     const payload = { destination: "Ubot", events: [lineEvent()] };
     const wrongSecret = await postLineWebhook(port, payload, { secret: "wrong-secret" });
