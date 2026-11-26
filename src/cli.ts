@@ -6,7 +6,15 @@ import path from "node:path";
 import { promisify } from "node:util";
 import dotenv from "dotenv";
 import { fetchAgyQuota, formatQuotaSummary } from "./acp/quota.js";
-import { loadConfig } from "./config.js";
+import { MultiChannelHub, qualifyChatId } from "./channels/hub.js";
+import { createEnabledAdapters } from "./channels/registry.js";
+import {
+  CHANNEL_NAMES,
+  getEnabledChannelNames,
+  loadConfig,
+  type ChannelName,
+  type GatewayConfig,
+} from "./config.js";
 import { GatewayStore } from "./gateway/store.js";
 import type { HealthSnapshot } from "./types.js";
 
@@ -22,7 +30,9 @@ Usage:
   pnpm cli pair clear             Clear all pending pairing requests
   pnpm cli status                 Show live health endpoint + local store summary
   pnpm cli usage                  Check Antigravity quota (0 model tokens)
-  pnpm cli doctor                 Run environment & connectivity diagnostics
+  pnpm cli doctor                 Run environment & connectivity diagnostics (lists all channels)
+  pnpm cli send --channel <name> --to <chatId> <text>
+                                  Send a one-off message through a configured channel
 `);
 }
 
@@ -33,7 +43,8 @@ function getSafeEnvPaths(): {
   healthHost: string;
   healthPort: number;
   allowedCount: number;
-  hasSpectrumCreds: boolean;
+  config?: GatewayConfig;
+  enabledChannels: ChannelName[];
 } {
   dotenv.config({ quiet: true });
   try {
@@ -45,9 +56,8 @@ function getSafeEnvPaths(): {
       healthHost: cfg.healthHost,
       healthPort: cfg.healthPort,
       allowedCount: cfg.allowedSenders.size,
-      hasSpectrumCreds:
-        cfg.spectrumProjectId !== "your-spectrum-project-id" &&
-        cfg.spectrumProjectSecret !== "your-spectrum-project-secret",
+      config: cfg,
+      enabledChannels: getEnabledChannelNames(cfg),
     };
   } catch {
     const dataDir = process.env.DATA_DIR
@@ -65,7 +75,7 @@ function getSafeEnvPaths(): {
         .split(",")
         .map((s) => s.trim())
         .filter(Boolean).length,
-      hasSpectrumCreds: false,
+      enabledChannels: [],
     };
   }
 }
@@ -206,6 +216,104 @@ async function runUsageCommand(): Promise<number> {
   return summary.available ? 0 : 1;
 }
 
+const CHANNEL_HINTS: Record<ChannelName, string> = {
+  photon: "set SPECTRUM_PROJECT_ID + SPECTRUM_PROJECT_SECRET",
+  telegram: "set TELEGRAM_BOT_TOKEN",
+  discord: "set DISCORD_BOT_TOKEN",
+  slack: "set SLACK_BOT_TOKEN + SLACK_APP_TOKEN",
+  feishu: "set FEISHU_APP_ID + FEISHU_APP_SECRET",
+  dingtalk: "set DINGTALK_CLIENT_ID + DINGTALK_CLIENT_SECRET",
+  onebot: "set ONEBOT_WS_URL",
+  webhook: "set WEBHOOK_ENABLED=true (+ WEBHOOK_TOKEN or WEBHOOK_SECRET)",
+};
+
+function channelHint(name: ChannelName): string {
+  return `(${CHANNEL_HINTS[name]})`;
+}
+
+/** Non-secret summary of a configured channel (never prints tokens/ids). */
+function describeChannel(name: ChannelName, cfg?: GatewayConfig): string {
+  if (!cfg) return "";
+  switch (name) {
+    case "photon":
+      return `receipts=${cfg.photon?.readReceipts} reactions=${cfg.photon?.reactions}`;
+    case "telegram":
+      return `allowedUsers=${cfg.telegram?.allowedUsers.size} poll=${cfg.telegram?.pollTimeoutSec}s`;
+    case "discord":
+      return `allowedUsers=${cfg.discord?.allowedUsers.size} guilds=${cfg.discord?.allowGuilds}`;
+    case "slack":
+      return `allowedUsers=${cfg.slack?.allowedUsers.size} (socket mode)`;
+    case "feishu":
+      return `domain=${cfg.feishu?.domain} allowedUsers=${cfg.feishu?.allowedUsers.size}`;
+    case "dingtalk":
+      return `allowedUsers=${cfg.dingtalk?.allowedUsers.size} (stream mode)`;
+    case "onebot":
+      return `allowedUsers=${cfg.onebot?.allowedUsers.size} token=${cfg.onebot?.accessToken ? "set" : "none"}`;
+    case "webhook": {
+      const w = cfg.webhook;
+      const auth = w?.token || w?.secret ? "auth=set" : "auth=NONE";
+      return `${w?.host}:${w?.port} ${auth} allowedUsers=${w?.allowedUsers.size}`;
+    }
+  }
+}
+
+async function runSendCommand(args: string[]): Promise<number> {
+  let channel: string | undefined;
+  let to: string | undefined;
+  const textParts: string[] = [];
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i] ?? "";
+    if (arg === "--channel" || arg === "-c") {
+      channel = args[++i];
+    } else if (arg === "--to" || arg === "-t") {
+      to = args[++i];
+    } else {
+      textParts.push(arg);
+    }
+  }
+  const text = textParts.join(" ").trim();
+  if (!channel || !to || !text) {
+    console.error("Usage: pnpm cli send --channel <name> --to <chatId> <text>");
+    console.error(`Channels: ${CHANNEL_NAMES.join(", ")}`);
+    return 1;
+  }
+  if (!(CHANNEL_NAMES as readonly string[]).includes(channel)) {
+    console.error(`Unknown channel "${channel}". Channels: ${CHANNEL_NAMES.join(", ")}`);
+    return 1;
+  }
+
+  const info = getSafeEnvPaths();
+  if (!info.config || !info.enabledChannels.includes(channel as ChannelName)) {
+    console.error(`Channel "${channel}" is not configured/enabled (${CHANNEL_HINTS[channel as ChannelName]}).`);
+    return 1;
+  }
+
+  const { adapters, errors } = await createEnabledAdapters(info.config, [channel]);
+  if (adapters.length === 0) {
+    console.error(`Channel "${channel}" unavailable: ${errors[channel as ChannelName] ?? "unknown error"}`);
+    return 1;
+  }
+
+  const hub = new MultiChannelHub(adapters, { log: (m) => console.error(m) });
+  try {
+    await hub.start(() => {});
+    const deadline = Date.now() + 15_000;
+    while (!hub.isConnected() && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    const target = to.includes("::") ? to : qualifyChatId(channel, to);
+    const result = await hub.sendMessage({ chatId: target, text, markdown: true });
+    const id = result && "messageId" in result ? result.messageId : undefined;
+    console.log(`Sent via ${channel}${id ? ` (message ${id})` : ""}.`);
+    return 0;
+  } catch (err) {
+    console.error(`Send failed: ${err instanceof Error ? err.message : String(err)}`);
+    return 1;
+  } finally {
+    await hub.stop().catch(() => {});
+  }
+}
+
 async function runDoctorCommand(): Promise<number> {
   const info = getSafeEnvPaths();
   let issues = 0;
@@ -221,14 +329,23 @@ async function runDoctorCommand(): Promise<number> {
 
   // 2. .env presence & required keys (no secret values printed!)
   const envExists = fs.existsSync(path.resolve(process.cwd(), ".env"));
-  if (envExists && info.hasSpectrumCreds) {
-    console.log("[OK] .env present with non-placeholder Spectrum credentials");
-  } else if (envExists) {
-    console.log("[WARN] .env present, but SPECTRUM_PROJECT_ID / SPECTRUM_PROJECT_SECRET look incomplete or placeholder");
+  if (!envExists) {
+    console.log("[WARN] .env file missing in workspace root (copy .env.example to .env)");
+  }
+  if (!info.config) {
+    console.log("[FAIL] Configuration failed to load (check .env values)");
     issues++;
+  }
+  if (info.enabledChannels.length > 0) {
+    console.log(`[OK] ${info.enabledChannels.length}/${CHANNEL_NAMES.length} channel(s) configured`);
   } else {
-    console.log("[FAIL] .env file missing in workspace root (copy .env.example to .env)");
+    console.log("[FAIL] No channels configured (set credentials for at least one channel)");
     issues++;
+  }
+  for (const name of CHANNEL_NAMES) {
+    const enabled = info.enabledChannels.includes(name);
+    const detail = enabled ? describeChannel(name, info.config) : channelHint(name);
+    console.log(`  - ${name.padEnd(9)} ${enabled ? "configured" : "disabled  "}  ${detail}`);
   }
 
   // 3. agy --version
@@ -318,6 +435,9 @@ async function main(): Promise<void> {
       break;
     case "doctor":
       exitCode = await runDoctorCommand();
+      break;
+    case "send":
+      exitCode = await runSendCommand(args.slice(1));
       break;
     case "help":
     case "--help":

@@ -2,12 +2,13 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { AgyAgentBackend } from "./acp/sessions.js";
-import { loadConfig } from "./config.js";
+import { MultiChannelHub } from "./channels/hub.js";
+import { createEnabledAdapters } from "./channels/registry.js";
+import { getEnabledChannelNames, loadConfig } from "./config.js";
 import { GatewayRouter } from "./gateway/router.js";
 import { LoopScheduler } from "./gateway/scheduler.js";
 import { GatewayStore } from "./gateway/store.js";
 import { HealthServer } from "./health.js";
-import { PhotonChannelAdapter } from "./photon/adapter.js";
 import type { PendingPermission } from "./types.js";
 
 function isProcessAlive(pid: number): boolean {
@@ -63,7 +64,7 @@ async function main(): Promise<void> {
   let router: GatewayRouter | undefined;
   let healthServer: HealthServer | undefined;
   let scheduler: LoopScheduler | undefined;
-  let channel: PhotonChannelAdapter | undefined;
+  let channel: MultiChannelHub | undefined;
   let backend: AgyAgentBackend | undefined;
   let shuttingDown = false;
 
@@ -92,7 +93,20 @@ async function main(): Promise<void> {
     const store = new GatewayStore(config.dataDir);
     await store.load();
 
-    channel = new PhotonChannelAdapter(config);
+    const { adapters, errors } = await createEnabledAdapters(config);
+    for (const [name, reason] of Object.entries(errors)) {
+      console.error(`[gateway] Channel "${name}" is configured but unavailable: ${reason}`);
+    }
+    if (adapters.length === 0) {
+      throw new Error(
+        `No channels available (configured: ${getEnabledChannelNames(config).join(", ") || "none"}). ` +
+          "Set credentials for at least one channel in .env (see .env.example).",
+      );
+    }
+    channel = new MultiChannelHub(adapters, {
+      // Unqualified legacy chat ids (pre-hub stores) belong to the iMessage channel.
+      defaultChannel: config.photon ? "photon" : undefined,
+    });
     backend = new AgyAgentBackend(config, {
       permissionNotifier: async (chatId: string, perm: PendingPermission) => {
         await router?.notifyPermission(chatId, perm);
@@ -121,7 +135,7 @@ async function main(): Promise<void> {
     router.markReady();
 
     console.log(
-      `[gateway] Antigravity iMessage gateway started (approval=${config.approvalMode}, allowlist=${config.allowedSenders.size}, paired=${store.listApprovedSenders().length})`,
+      `[gateway] Antigravity gateway started (channels=${channel.listChannelNames().join(",")}, approval=${config.approvalMode}, allowlist=${config.allowedSenders.size}, paired=${store.listApprovedSenders().length})`,
     );
   } catch (err) {
     await shutdown("startup-error");

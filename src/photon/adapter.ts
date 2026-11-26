@@ -17,7 +17,7 @@ import {
   effect,
   imessage,
 } from "spectrum-ts/providers/imessage";
-import { normalizeSenderId, type GatewayConfig } from "../config.js";
+import { normalizeSenderId, type GatewayConfig, type PhotonConfig } from "../config.js";
 import type {
   AttachmentKind,
   ChannelAdapter,
@@ -42,6 +42,8 @@ const RICH_LINK_SUPPRESS_WINDOW_MS = 30 * 1000;
 const TYPING_COOLDOWN_MS = 5 * 1000;
 const RECONNECT_INITIAL_MS = 500;
 const RECONNECT_MAX_MS = 30 * 1000;
+const STARTUP_READY_TIMEOUT_MS = 15 * 1000;
+const CONNECT_TIMEOUT_MS = 45 * 1000;
 
 const URL_RE = /https?:\/\/\S+/i;
 
@@ -129,9 +131,13 @@ function resolveEffectId(name: string | undefined): IMessageMessageEffect | unde
 }
 
 export class PhotonChannelAdapter implements ChannelAdapter {
-  readonly name = "photon-imessage";
+  readonly name = "photon";
 
   private readonly config: GatewayConfig;
+  private readonly photon: PhotonConfig;
+  private readonly startupTimeoutMs: number;
+  private readonly connectTimeoutMs: number;
+  private resolveReady?: () => void;
   private readonly mediaDir: string;
 
   private app?: Awaited<ReturnType<typeof Spectrum>>;
@@ -153,8 +159,16 @@ export class PhotonChannelAdapter implements ChannelAdapter {
   private readonly lastUrlAtByChatId = new Map<string, number>();
   private readonly lastTypingAtByChatId = new Map<string, number>();
 
-  constructor(config: GatewayConfig) {
+  constructor(config: GatewayConfig, options: { startupTimeoutMs?: number; connectTimeoutMs?: number } = {}) {
+    if (!config.photon) {
+      throw new Error(
+        "Photon channel requires SPECTRUM_PROJECT_ID and SPECTRUM_PROJECT_SECRET",
+      );
+    }
     this.config = config;
+    this.photon = config.photon;
+    this.startupTimeoutMs = options.startupTimeoutMs ?? STARTUP_READY_TIMEOUT_MS;
+    this.connectTimeoutMs = options.connectTimeoutMs ?? CONNECT_TIMEOUT_MS;
     this.mediaDir = path.join(config.dataDir, "media");
   }
 
@@ -202,12 +216,35 @@ export class PhotonChannelAdapter implements ChannelAdapter {
     });
     this.watchdog.start();
 
+    const ready = new Promise<void>((resolve) => {
+      this.resolveReady = resolve;
+    });
     this.loopPromise = this.runStreamLoop(this.loopAbort.signal);
+
+    // Wait for the first successful Spectrum connection so callers can sendMessage()
+    // right after `await start()`. On timeout we keep the background reconnect loop
+    // running and surface the condition via getStats().lastError (never throws).
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = await Promise.race([
+      ready.then(() => false),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(true), this.startupTimeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+    if (timer) {
+      clearTimeout(timer);
+    }
+    if (timedOut && !this.connected) {
+      this.lastError = `${this.lastError ? `${this.lastError}; ` : ""}Photon not connected after ${Math.round(this.startupTimeoutMs / 1000)}s; retrying in background`;
+    }
   }
 
   async stop(): Promise<void> {
     this.stopping = true;
     this.connected = false;
+    this.resolveReady?.();
+    this.resolveReady = undefined;
 
     this.watchdog?.stop();
     this.watchdog = undefined;
@@ -221,7 +258,14 @@ export class PhotonChannelAdapter implements ChannelAdapter {
     }
 
     if (this.loopPromise) {
-      await this.loopPromise.catch(() => undefined);
+      // Bound shutdown: a hung initial Spectrum() handshake must not block stop().
+      await Promise.race([
+        this.loopPromise.catch(() => undefined),
+        new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, 2000);
+          timer.unref?.();
+        }),
+      ]);
       this.loopPromise = undefined;
     }
 
@@ -230,9 +274,9 @@ export class PhotonChannelAdapter implements ChannelAdapter {
   }
 
   private async createSpectrumApp(): Promise<Awaited<ReturnType<typeof Spectrum>>> {
-    const created = await Spectrum({
-      projectId: this.config.spectrumProjectId,
-      projectSecret: this.config.spectrumProjectSecret,
+    const pending = Spectrum({
+      projectId: this.photon.projectId,
+      projectSecret: this.photon.projectSecret,
       providers: [
         imessage.config({
           onHeartbeat: () => {
@@ -244,7 +288,31 @@ export class PhotonChannelAdapter implements ChannelAdapter {
         logLevel: this.config.logLevel,
       },
     });
-    return created as unknown as Awaited<ReturnType<typeof Spectrum>>;
+
+    // A hung handshake must not wedge the reconnect loop: time out, retry, and make sure
+    // a late-arriving app is closed instead of leaking.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error("Spectrum connection attempt timed out")),
+        this.connectTimeoutMs,
+      );
+      timer.unref?.();
+    });
+    try {
+      const created = await Promise.race([pending, timeout]);
+      return created as unknown as Awaited<ReturnType<typeof Spectrum>>;
+    } catch (error) {
+      void pending.then(
+        (late) => (late as { stop?: () => Promise<void> }).stop?.().catch(() => undefined),
+        () => undefined,
+      );
+      throw error;
+    } finally {
+      if (timer) {
+        clearTimeout(timer);
+      }
+    }
   }
 
   private async runStreamLoop(signal: AbortSignal): Promise<void> {
@@ -257,6 +325,8 @@ export class PhotonChannelAdapter implements ChannelAdapter {
         this.connected = true;
         this.lastError = undefined;
         attempt = 0;
+        this.resolveReady?.();
+        this.resolveReady = undefined;
 
         for await (const [space, message] of currentApp.messages) {
           if (this.stopping || signal.aborted) {
@@ -697,7 +767,7 @@ export class PhotonChannelAdapter implements ChannelAdapter {
   }
 
   async markRead(chatId: string, messageId?: string): Promise<void> {
-    if (!this.config.photonReadReceipts || !messageId) {
+    if (!this.photon.readReceipts || !messageId) {
       return;
     }
     try {
@@ -712,7 +782,7 @@ export class PhotonChannelAdapter implements ChannelAdapter {
   }
 
   async react(chatId: string, messageId: string, emoji: string): Promise<void> {
-    if (!this.config.photonReactions) {
+    if (!this.photon.reactions) {
       return;
     }
     try {

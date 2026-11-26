@@ -3,6 +3,20 @@ import dotenv from "dotenv";
 import { z } from "zod";
 import type { ApprovalMode, LogLevel } from "./types.js";
 
+/** Canonical channel names (also the `channel` field on inbound messages and the chatId prefix). */
+export const CHANNEL_NAMES = [
+  "photon",
+  "telegram",
+  "discord",
+  "slack",
+  "feishu",
+  "dingtalk",
+  "onebot",
+  "webhook",
+] as const;
+
+export type ChannelName = (typeof CHANNEL_NAMES)[number];
+
 /**
  * Normalize an iMessage / Apple sender identifier into canonical form.
  * - Strips Apple/Photon routing prefixes such as `any;-;` or `iMessage;-;`
@@ -55,6 +69,50 @@ export function parseAllowedSenders(raw: string | undefined): Set<string> {
   return allowed;
 }
 
+/**
+ * Normalize a non-iMessage platform user id (Telegram/Discord/Slack/... ids, handles, emails).
+ * Only trims + lowercases; never applies phone-number rewriting (numeric ids stay numeric).
+ */
+export function normalizeUserId(raw: string): string {
+  return raw.trim().toLowerCase();
+}
+
+/**
+ * Parse a comma-separated per-channel allowlist (platform user ids). Values are
+ * compared case-insensitively via `normalizeUserId`.
+ */
+export function parseAllowedUsers(raw: string | undefined): Set<string> {
+  const allowed = new Set<string>();
+  if (!raw) {
+    return allowed;
+  }
+  for (const part of raw.split(",")) {
+    const normalized = normalizeUserId(part);
+    if (normalized) {
+      allowed.add(normalized);
+    }
+  }
+  return allowed;
+}
+
+/** True for the iMessage/Photon channel family (`photon`, legacy `photon-imessage`). */
+export function isPhotonChannel(channel: string): boolean {
+  return channel === "photon" || channel.startsWith("photon-");
+}
+
+/**
+ * Canonical sender key used for allowlist / pairing / store lookups.
+ * - Photon: the normalized phone/email (backwards compatible with existing stores).
+ * - Others: `<channel>:<lowercased platform user id>` so ids never collide across platforms.
+ */
+export function senderKeyFor(channel: string, rawSenderId: string): string {
+  if (isPhotonChannel(channel)) {
+    return normalizeSenderId(rawSenderId);
+  }
+  const id = normalizeUserId(rawSenderId);
+  return id ? `${channel.toLowerCase()}:${id}` : "";
+}
+
 function parseBoolEnv(value: string | undefined, defaultValue: boolean): boolean {
   if (value === undefined || value.trim() === "") {
     return defaultValue;
@@ -79,9 +137,28 @@ function parseListEnv(value: string | undefined, defaults: string[]): string[] {
     .filter(Boolean);
 }
 
+/** Blank values and `your-...` placeholders (copied from old examples) count as "unset". */
+function cleanEnv(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed || /^your-/i.test(trimmed)) {
+    return undefined;
+  }
+  return trimmed;
+}
+
+const optionalString = z.string().optional();
+
+/** Numeric env that treats blank strings as "unset" (so `FOO=` falls back to the default). */
+function numberEnv(min: number, max: number, defaultValue: number) {
+  return z.preprocess(
+    (v) => (typeof v === "string" && v.trim() === "" ? undefined : v),
+    z.coerce.number().int().min(min).max(max).default(defaultValue),
+  );
+}
+
 const envSchema = z.object({
-  SPECTRUM_PROJECT_ID: z.string().trim().min(1, "SPECTRUM_PROJECT_ID is required"),
-  SPECTRUM_PROJECT_SECRET: z.string().trim().min(1, "SPECTRUM_PROJECT_SECRET is required"),
+  SPECTRUM_PROJECT_ID: optionalString,
+  SPECTRUM_PROJECT_SECRET: optionalString,
   ALLOWED_SENDERS: z.string().optional(),
   ALLOW_GROUPS: z.string().optional(),
   GROUP_MENTION_PATTERNS: z.string().optional(),
@@ -99,11 +176,102 @@ const envSchema = z.object({
   QUOTA_WARN_THRESHOLD: z.coerce.number().min(0).max(100).default(15),
   DATA_DIR: z.string().trim().optional(),
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
+
+  TELEGRAM_BOT_TOKEN: optionalString,
+  TELEGRAM_ALLOWED_USERS: optionalString,
+  TELEGRAM_POLL_TIMEOUT_SEC: numberEnv(0, 50, 30),
+
+  DISCORD_BOT_TOKEN: optionalString,
+  DISCORD_ALLOWED_USERS: optionalString,
+  DISCORD_ALLOW_GUILDS: optionalString,
+
+  SLACK_BOT_TOKEN: optionalString,
+  SLACK_APP_TOKEN: optionalString,
+  SLACK_ALLOWED_USERS: optionalString,
+
+  FEISHU_APP_ID: optionalString,
+  FEISHU_APP_SECRET: optionalString,
+  FEISHU_DOMAIN: z.preprocess(
+    (v) => (typeof v === "string" ? v.trim().toLowerCase() || undefined : v),
+    z.enum(["feishu", "lark"]).default("feishu"),
+  ),
+  FEISHU_ALLOWED_USERS: optionalString,
+
+  DINGTALK_CLIENT_ID: optionalString,
+  DINGTALK_CLIENT_SECRET: optionalString,
+  DINGTALK_ALLOWED_USERS: optionalString,
+
+  ONEBOT_WS_URL: optionalString,
+  ONEBOT_ACCESS_TOKEN: optionalString,
+  ONEBOT_SELF_ID: optionalString,
+  ONEBOT_ALLOWED_USERS: optionalString,
+
+  WEBHOOK_ENABLED: optionalString,
+  WEBHOOK_HOST: optionalString,
+  WEBHOOK_PORT: numberEnv(1, 65535, 18791),
+  WEBHOOK_TOKEN: optionalString,
+  WEBHOOK_SECRET: optionalString,
+  WEBHOOK_CALLBACK_URL: optionalString,
+  WEBHOOK_ALLOWED_USERS: optionalString,
 });
 
+export interface PhotonConfig {
+  projectId: string;
+  projectSecret: string;
+  readReceipts: boolean;
+  reactions: boolean;
+}
+
+export interface TelegramConfig {
+  botToken: string;
+  allowedUsers: Set<string>;
+  pollTimeoutSec: number;
+}
+
+export interface DiscordConfig {
+  botToken: string;
+  allowedUsers: Set<string>;
+  allowGuilds: boolean;
+}
+
+export interface SlackConfig {
+  botToken: string;
+  appToken: string;
+  allowedUsers: Set<string>;
+}
+
+export interface FeishuConfig {
+  appId: string;
+  appSecret: string;
+  domain: "feishu" | "lark";
+  allowedUsers: Set<string>;
+}
+
+export interface DingTalkConfig {
+  clientId: string;
+  clientSecret: string;
+  allowedUsers: Set<string>;
+}
+
+export interface OneBotConfig {
+  wsUrl: string;
+  accessToken?: string;
+  selfId?: string;
+  allowedUsers: Set<string>;
+}
+
+export interface WebhookConfig {
+  enabled: boolean;
+  host: string;
+  port: number;
+  token?: string;
+  secret?: string;
+  callbackUrl?: string;
+  allowedUsers: Set<string>;
+}
+
 export interface GatewayConfig {
-  spectrumProjectId: string;
-  spectrumProjectSecret: string;
+  /** Global allowlist: photon phone/email entries, or `<channel>:<userId>` for other channels. */
   allowedSenders: Set<string>;
   allowGroups: boolean;
   groupMentionPatterns: string[];
@@ -116,16 +284,59 @@ export interface GatewayConfig {
   healthEnabled: boolean;
   healthHost: string;
   healthPort: number;
-  photonReadReceipts: boolean;
-  photonReactions: boolean;
   quotaWarnThreshold: number;
   dataDir: string;
   logLevel: LogLevel;
+
+  /** Channel blocks: each present iff that channel's credentials are configured. */
+  photon?: PhotonConfig;
+  telegram?: TelegramConfig;
+  discord?: DiscordConfig;
+  slack?: SlackConfig;
+  feishu?: FeishuConfig;
+  dingtalk?: DingTalkConfig;
+  onebot?: OneBotConfig;
+  webhook?: WebhookConfig;
 }
 
 export interface LoadConfigOptions {
   loadDotenv?: boolean;
   dotenvPath?: string;
+}
+
+/** Channels that are configured AND enabled (webhook additionally needs `enabled`). */
+export function getEnabledChannelNames(config: GatewayConfig): ChannelName[] {
+  return CHANNEL_NAMES.filter((name) => {
+    if (name === "webhook") {
+      return Boolean(config.webhook?.enabled);
+    }
+    return Boolean(config[name]);
+  });
+}
+
+/** Per-channel allowlist (platform user ids, lowercased). Photon has no per-channel list. */
+export function getChannelAllowedUsers(
+  config: GatewayConfig,
+  channel: string,
+): ReadonlySet<string> {
+  switch (channel) {
+    case "telegram":
+      return config.telegram?.allowedUsers ?? new Set();
+    case "discord":
+      return config.discord?.allowedUsers ?? new Set();
+    case "slack":
+      return config.slack?.allowedUsers ?? new Set();
+    case "feishu":
+      return config.feishu?.allowedUsers ?? new Set();
+    case "dingtalk":
+      return config.dingtalk?.allowedUsers ?? new Set();
+    case "onebot":
+      return config.onebot?.allowedUsers ?? new Set();
+    case "webhook":
+      return config.webhook?.allowedUsers ?? new Set();
+    default:
+      return new Set();
+  }
 }
 
 export function loadConfig(
@@ -145,9 +356,41 @@ export function loadConfig(
     ? path.resolve(parsed.DATA_DIR)
     : path.resolve(process.cwd(), "data");
 
+  const spectrumId = cleanEnv(parsed.SPECTRUM_PROJECT_ID);
+  const spectrumSecret = cleanEnv(parsed.SPECTRUM_PROJECT_SECRET);
+  const photon: PhotonConfig | undefined =
+    spectrumId && spectrumSecret
+      ? {
+          projectId: spectrumId,
+          projectSecret: spectrumSecret,
+          readReceipts: parseBoolEnv(parsed.PHOTON_READ_RECEIPTS, true),
+          reactions: parseBoolEnv(parsed.PHOTON_REACTIONS, true),
+        }
+      : undefined;
+
+  const telegramToken = cleanEnv(parsed.TELEGRAM_BOT_TOKEN);
+  const discordToken = cleanEnv(parsed.DISCORD_BOT_TOKEN);
+  const slackBot = cleanEnv(parsed.SLACK_BOT_TOKEN);
+  const slackApp = cleanEnv(parsed.SLACK_APP_TOKEN);
+  const feishuId = cleanEnv(parsed.FEISHU_APP_ID);
+  const feishuSecret = cleanEnv(parsed.FEISHU_APP_SECRET);
+  const dingId = cleanEnv(parsed.DINGTALK_CLIENT_ID);
+  const dingSecret = cleanEnv(parsed.DINGTALK_CLIENT_SECRET);
+  const onebotUrl = cleanEnv(parsed.ONEBOT_WS_URL);
+
+  if (onebotUrl && !/^wss?:\/\//i.test(onebotUrl)) {
+    throw new Error("ONEBOT_WS_URL must start with ws:// or wss://");
+  }
+
+  const webhookTouched = [
+    parsed.WEBHOOK_ENABLED,
+    parsed.WEBHOOK_TOKEN,
+    parsed.WEBHOOK_SECRET,
+    parsed.WEBHOOK_CALLBACK_URL,
+    parsed.WEBHOOK_ALLOWED_USERS,
+  ].some((v) => cleanEnv(v) !== undefined);
+
   return {
-    spectrumProjectId: parsed.SPECTRUM_PROJECT_ID,
-    spectrumProjectSecret: parsed.SPECTRUM_PROJECT_SECRET,
     allowedSenders: parseAllowedSenders(parsed.ALLOWED_SENDERS),
     allowGroups: parseBoolEnv(parsed.ALLOW_GROUPS, false),
     groupMentionPatterns: parseListEnv(parsed.GROUP_MENTION_PATTERNS, [
@@ -163,10 +406,68 @@ export function loadConfig(
     healthEnabled: parseBoolEnv(parsed.HEALTH_ENABLED, false),
     healthHost: parsed.HEALTH_HOST,
     healthPort: parsed.HEALTH_PORT,
-    photonReadReceipts: parseBoolEnv(parsed.PHOTON_READ_RECEIPTS, true),
-    photonReactions: parseBoolEnv(parsed.PHOTON_REACTIONS, true),
     quotaWarnThreshold: parsed.QUOTA_WARN_THRESHOLD,
     dataDir,
     logLevel: parsed.LOG_LEVEL,
+
+    photon,
+    telegram: telegramToken
+      ? {
+          botToken: telegramToken,
+          allowedUsers: parseAllowedUsers(parsed.TELEGRAM_ALLOWED_USERS),
+          pollTimeoutSec: parsed.TELEGRAM_POLL_TIMEOUT_SEC,
+        }
+      : undefined,
+    discord: discordToken
+      ? {
+          botToken: discordToken,
+          allowedUsers: parseAllowedUsers(parsed.DISCORD_ALLOWED_USERS),
+          allowGuilds: parseBoolEnv(parsed.DISCORD_ALLOW_GUILDS, false),
+        }
+      : undefined,
+    slack:
+      slackBot && slackApp
+        ? {
+            botToken: slackBot,
+            appToken: slackApp,
+            allowedUsers: parseAllowedUsers(parsed.SLACK_ALLOWED_USERS),
+          }
+        : undefined,
+    feishu:
+      feishuId && feishuSecret
+        ? {
+            appId: feishuId,
+            appSecret: feishuSecret,
+            domain: parsed.FEISHU_DOMAIN,
+            allowedUsers: parseAllowedUsers(parsed.FEISHU_ALLOWED_USERS),
+          }
+        : undefined,
+    dingtalk:
+      dingId && dingSecret
+        ? {
+            clientId: dingId,
+            clientSecret: dingSecret,
+            allowedUsers: parseAllowedUsers(parsed.DINGTALK_ALLOWED_USERS),
+          }
+        : undefined,
+    onebot: onebotUrl
+      ? {
+          wsUrl: onebotUrl,
+          accessToken: cleanEnv(parsed.ONEBOT_ACCESS_TOKEN),
+          selfId: cleanEnv(parsed.ONEBOT_SELF_ID),
+          allowedUsers: parseAllowedUsers(parsed.ONEBOT_ALLOWED_USERS),
+        }
+      : undefined,
+    webhook: webhookTouched
+      ? {
+          enabled: parseBoolEnv(parsed.WEBHOOK_ENABLED, false),
+          host: cleanEnv(parsed.WEBHOOK_HOST) ?? "127.0.0.1",
+          port: parsed.WEBHOOK_PORT,
+          token: cleanEnv(parsed.WEBHOOK_TOKEN),
+          secret: cleanEnv(parsed.WEBHOOK_SECRET),
+          callbackUrl: cleanEnv(parsed.WEBHOOK_CALLBACK_URL),
+          allowedUsers: parseAllowedUsers(parsed.WEBHOOK_ALLOWED_USERS),
+        }
+      : undefined,
   };
 }

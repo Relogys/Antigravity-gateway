@@ -23,12 +23,10 @@ function loadLocalEnvLiterals(repoRoot) {
     return [];
   }
   const literals = [];
-  const sensitiveKeys = new Set([
-    "SPECTRUM_PROJECT_ID",
-    "SPECTRUM_PROJECT_SECRET",
-    "GEMINI_API_KEY",
-    "ALLOWED_SENDERS",
-  ]);
+  // Any credential-like or identity-like key in the local .env is scanned for literal leaks.
+  const sensitivePattern =
+    /(TOKEN|SECRET|API_KEY|PASSWORD|CLIENT_ID|APP_ID|PROJECT_ID|SELF_ID|ALLOWED_USERS|ALLOWED_SENDERS|WS_URL|CALLBACK_URL)$/;
+  const listKeys = /(ALLOWED_USERS|ALLOWED_SENDERS)$/;
   const lines = fs.readFileSync(envPath, "utf8").split(/\r?\n/);
   for (const line of lines) {
     const trimmed = line.trim();
@@ -37,8 +35,8 @@ function loadLocalEnvLiterals(repoRoot) {
     if (eqIdx === -1) continue;
     const key = trimmed.slice(0, eqIdx).trim();
     const val = trimmed.slice(eqIdx + 1).trim();
-    if (!sensitiveKeys.has(key) || !val) continue;
-    if (key === "ALLOWED_SENDERS") {
+    if (!sensitivePattern.test(key) || !val) continue;
+    if (listKeys.test(key)) {
       for (const item of val.split(",")) {
         const token = item.trim();
         if (token.length >= 6 && !token.includes("example.com") && token !== "+15550001111") {

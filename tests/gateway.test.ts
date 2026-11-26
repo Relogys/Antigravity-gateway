@@ -50,8 +50,6 @@ function makeConfig(
   overrides: Partial<GatewayConfig> = {},
 ): GatewayConfig {
   return {
-    spectrumProjectId: "test-project-id",
-    spectrumProjectSecret: "super-secret-value-do-not-expose",
     allowedSenders: new Set(["+15550001111"]),
     allowGroups: false,
     groupMentionPatterns: ["@agy", "@antigravity"],
@@ -64,8 +62,12 @@ function makeConfig(
     healthEnabled: false,
     healthHost: "127.0.0.1",
     healthPort: 0,
-    photonReadReceipts: true,
-    photonReactions: true,
+    photon: {
+      projectId: "test-project-id",
+      projectSecret: "test-project-secret",
+      readReceipts: true,
+      reactions: true,
+    },
     quotaWarnThreshold: 15,
     dataDir,
     logLevel: "info",
@@ -76,7 +78,7 @@ function makeConfig(
 function makeInbound(overrides: Partial<InboundMessage> = {}): InboundMessage {
   return {
     id: `msg-${Math.random().toString(36).slice(2, 8)}`,
-    channel: "photon-imessage",
+    channel: "photon",
     chatId: "+15550001111",
     senderId: "+15550001111",
     isGroup: false,
@@ -90,7 +92,7 @@ function makeInbound(overrides: Partial<InboundMessage> = {}): InboundMessage {
 }
 
 class MockChannel implements ExtendedChannelAdapter {
-  readonly name = "photon-imessage";
+  readonly name = "photon";
   connected = true;
   sent: OutboundMessage[] = [];
   reactions: Array<{ chatId: string; messageId: string; emoji: string }> = [];

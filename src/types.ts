@@ -61,6 +61,16 @@ export interface ChannelAdapter {
   react?(chatId: string, messageId: string, emoji: string): Promise<void>;
   editMessage?(chatId: string, messageId: string, text: string): Promise<void>;
   isConnected(): boolean;
+  /** Optional per-channel counters surfaced by `/channels`, health, and the hub. */
+  getStats?(): { lastInboundAt?: number; lastOutboundAt?: number; lastError?: string };
+}
+
+export interface ChannelHealthStatus {
+  name: string;
+  connected: boolean;
+  lastInboundAt?: number;
+  lastOutboundAt?: number;
+  lastError?: string;
 }
 
 export interface SessionInfo {
@@ -202,4 +212,6 @@ export interface HealthSnapshot {
   lastInboundAt?: number;
   lastOutboundAt?: number;
   lastError?: string;
+  /** Per-channel connection state keyed by channel name (multi-channel hub). */
+  channels?: Record<string, ChannelHealthStatus>;
 }

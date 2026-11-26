@@ -19,8 +19,6 @@ import type {
 
 function makeTestConfig(overrides: Partial<GatewayConfig> = {}): GatewayConfig {
   return {
-    spectrumProjectId: "test-project-id",
-    spectrumProjectSecret: "test-project-secret",
     allowedSenders: new Set(["+15550001111"]),
     allowGroups: false,
     groupMentionPatterns: ["@agy", "@antigravity"],
@@ -30,8 +28,12 @@ function makeTestConfig(overrides: Partial<GatewayConfig> = {}): GatewayConfig {
     healthEnabled: false,
     healthHost: "127.0.0.1",
     healthPort: 18790,
-    photonReadReceipts: true,
-    photonReactions: true,
+    photon: {
+      projectId: "test-project-id",
+      projectSecret: "test-project-secret",
+      readReceipts: true,
+      reactions: true,
+    },
     quotaWarnThreshold: 15,
     dataDir: "/tmp/data",
     logLevel: "info",

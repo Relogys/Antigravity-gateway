@@ -35,6 +35,11 @@ export class HealthServer {
           status: snapshot.status,
           uptimeMs: snapshot.uptimeMs,
           channelConnected: snapshot.channelConnected,
+          channels: snapshot.channels
+            ? Object.fromEntries(
+                Object.entries(snapshot.channels).map(([key, c]) => [key, c.connected]),
+              )
+            : undefined,
         });
         return;
       }
@@ -52,6 +57,20 @@ export class HealthServer {
           lastInboundAt: snapshot.lastInboundAt,
           lastOutboundAt: snapshot.lastOutboundAt,
           lastError: snapshot.lastError,
+          channels: snapshot.channels
+            ? Object.fromEntries(
+                Object.entries(snapshot.channels).map(([key, c]) => [
+                  key,
+                  {
+                    name: c.name,
+                    connected: c.connected,
+                    lastInboundAt: c.lastInboundAt,
+                    lastOutboundAt: c.lastOutboundAt,
+                    lastError: c.lastError,
+                  },
+                ]),
+              )
+            : undefined,
         };
         this.sendJson(res, 200, sanitized);
         return;

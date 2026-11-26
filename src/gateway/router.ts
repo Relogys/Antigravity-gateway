@@ -1,7 +1,14 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fetchAgyQuota, formatQuotaSummary } from "../acp/quota.js";
-import { normalizeSenderId, type GatewayConfig } from "../config.js";
+import { splitQualifiedChatId } from "../channels/hub.js";
+import {
+  getChannelAllowedUsers,
+  isPhotonChannel,
+  normalizeUserId,
+  senderKeyFor,
+  type GatewayConfig,
+} from "../config.js";
 import { extractOutboundMedia } from "../photon/format.js";
 import type {
   AcpSessionSummary,
@@ -9,6 +16,7 @@ import type {
   ApprovalMode,
   BusyMode,
   ChannelAdapter,
+  ChannelHealthStatus,
   HealthSnapshot,
   InboundAttachment,
   InboundMessage,
@@ -60,11 +68,8 @@ export interface ExtendedAgentBackend extends AgentBackend {
 }
 
 export interface ExtendedChannelAdapter extends ChannelAdapter {
-  getStats?(): {
-    lastInboundAt?: number;
-    lastOutboundAt?: number;
-    lastError?: string;
-  };
+  /** Implemented by MultiChannelHub: per-channel health keyed by channel name. */
+  getChannelSnapshots?(): Record<string, ChannelHealthStatus>;
 }
 
 export interface GatewayRouterDeps {
@@ -93,6 +98,7 @@ const ALWAYS_DISPATCHABLE_COMMANDS = new Set([
   "deny",
   "yolo",
   "whoami",
+  "channels",
   "help",
   "commands",
   "version",
@@ -111,6 +117,7 @@ const HELP_TEXT = [
   "• /busy [queue|interrupt|steer] — Set busy-turn policy",
   "• /approve [once|session|always] | /deny — Resolve tool permission",
   "• /yolo — Toggle auto-approval mode",
+  "• /channels — Show active channels & connection state",
   "• /whoami | /version | /help",
   "",
   "Session & Config (when idle):",
@@ -224,14 +231,17 @@ export class GatewayRouter {
   async handleInbound(msg: InboundMessage): Promise<void> {
     this.lastInboundAt = Date.now();
 
-    const senderId = normalizeSenderId(msg.senderId || msg.rawSenderId || "");
-    const authorized =
-      senderId.length > 0 &&
-      (this.config.allowedSenders.has(senderId) ||
-        this.store.isApprovedSender(senderId));
+    const channel = msg.channel || this.channel.name;
+    const rawSender = msg.senderId || msg.rawSenderId || "";
+    const senderId = senderKeyFor(channel, rawSender);
+    const authSource = this.resolveAuthSource(channel, rawSender, senderId);
+    const authorized = senderId.length > 0 && authSource !== undefined;
+    const groupsAllowed =
+      this.config.allowGroups ||
+      (channel === "discord" && Boolean(this.config.discord?.allowGuilds));
 
     if (msg.isGroup) {
-      if (!authorized || !this.config.allowGroups || !msg.mentionsBot) {
+      if (!authorized || !groupsAllowed || !msg.mentionsBot) {
         return;
       }
     } else if (!authorized) {
@@ -248,7 +258,7 @@ export class GatewayRouter {
       return;
     }
 
-    if (this.config.photonReadReceipts && this.channel.markRead) {
+    if (this.readReceiptsEnabled(channel) && this.channel.markRead) {
       this.channel.markRead(msg.chatId, msg.id).catch(() => {});
     }
 
@@ -279,7 +289,7 @@ export class GatewayRouter {
   async runLoopPrompt(job: LoopJob): Promise<void> {
     const syntheticMsg: InboundMessage = {
       id: `loop-${job.id}-${Date.now()}`,
-      channel: this.channel.name,
+      channel: splitQualifiedChatId(job.chatId).channel ?? this.channel.name,
       chatId: job.chatId,
       senderId: "scheduler",
       isGroup: false,
@@ -300,14 +310,23 @@ export class GatewayRouter {
   }
 
   getHealthSnapshot(): HealthSnapshot {
-    const channelConnected = this.channel.isConnected();
+    const channels = this.getChannelStatuses();
+    const channelList = Object.values(channels);
+    const channelConnected =
+      channelList.length > 0
+        ? channelList.some((c) => c.connected)
+        : this.channel.isConnected();
+    const allChannelsConnected =
+      channelList.length > 0
+        ? channelList.every((c) => c.connected)
+        : channelConnected;
     const backendStats = this.backend.getStats?.();
     const channelStats = this.channel.getStats?.();
     const activeSessions =
       backendStats?.activeSessions ??
       this.store.listSessions().filter((s) => Boolean(s.sessionId)).length;
 
-    const status = channelConnected
+    const status = allChannelsConnected
       ? "ok"
       : this.ready
         ? "degraded"
@@ -325,7 +344,81 @@ export class GatewayRouter {
       lastInboundAt: channelStats?.lastInboundAt ?? this.lastInboundAt,
       lastOutboundAt: channelStats?.lastOutboundAt ?? this.lastOutboundAt,
       lastError: channelStats?.lastError ?? this.lastError,
+      channels,
     };
+  }
+
+  private getChannelStatuses(): Record<string, ChannelHealthStatus> {
+    const fromHub = this.channel.getChannelSnapshots?.();
+    if (fromHub) {
+      return fromHub;
+    }
+    const stats = this.channel.getStats?.() ?? {};
+    return {
+      [this.channel.name]: {
+        name: this.channel.name,
+        connected: this.channel.isConnected(),
+        ...stats,
+      },
+    };
+  }
+
+  /**
+   * Fail-closed sender authorization shared by every channel. Sources (unioned):
+   * - per-channel `<CHANNEL>_ALLOWED_USERS` (platform ids)
+   * - global `ALLOWED_SENDERS` (photon: phone/email; others: `<channel>:<id>` entries)
+   * - paired senders in the store (`senderKey` is channel-namespaced for non-photon)
+   */
+  private resolveAuthSource(
+    channel: string,
+    rawSender: string,
+    senderKey: string,
+  ): "channel allowlist" | "env allowlist" | "paired allowlist" | undefined {
+    if (!senderKey) {
+      return undefined;
+    }
+    if (
+      !isPhotonChannel(channel) &&
+      getChannelAllowedUsers(this.config, channel).has(normalizeUserId(rawSender))
+    ) {
+      return "channel allowlist";
+    }
+    if (this.config.allowedSenders.has(senderKey)) {
+      return "env allowlist";
+    }
+    if (this.store.isApprovedSender(senderKey)) {
+      return "paired allowlist";
+    }
+    return undefined;
+  }
+
+  private readReceiptsEnabled(channel: string): boolean {
+    return isPhotonChannel(channel) ? (this.config.photon?.readReceipts ?? true) : true;
+  }
+
+  private reactionsEnabled(channel: string): boolean {
+    return isPhotonChannel(channel) ? (this.config.photon?.reactions ?? true) : true;
+  }
+
+  private formatChannelsReport(currentChannel: string): string {
+    const entries = Object.values(this.getChannelStatuses());
+    if (entries.length === 0) {
+      return "No channels registered.";
+    }
+    const now = Date.now();
+    const ago = (ts?: number) => (ts ? `${formatUptime(now - ts)} ago` : "never");
+    const lines = entries.map((c) => {
+      const parts = [
+        `${c.connected ? "✅" : "❌"} ${c.name}${c.name === currentChannel ? " (this chat)" : ""} — ${c.connected ? "connected" : "disconnected"}`,
+        `in ${ago(c.lastInboundAt)}`,
+        `out ${ago(c.lastOutboundAt)}`,
+      ];
+      if (c.lastError && !c.connected) {
+        parts.push(`error: ${c.lastError.slice(0, 100)}`);
+      }
+      return `• ${parts.join(" | ")}`;
+    });
+    return `Channels (${entries.length}):\n${lines.join("\n")}`;
   }
 
   private stripGroupMention(text: string, isGroup: boolean): string {
@@ -503,6 +596,10 @@ export class GatewayRouter {
         await this.sendReply(chatId, HELP_TEXT, msg.id);
         return;
 
+      case "channels":
+        await this.sendReply(chatId, this.formatChannelsReport(msg.channel), msg.id);
+        return;
+
       case "version":
       case "v":
         await this.sendReply(
@@ -513,13 +610,14 @@ export class GatewayRouter {
         return;
 
       case "whoami": {
-        const source = this.config.allowedSenders.has(senderId)
-          ? "env allowlist"
-          : "paired allowlist";
+        const source =
+          this.resolveAuthSource(msg.channel, msg.senderId || msg.rawSenderId || "", senderId) ??
+          "unknown";
         await this.sendReply(
           chatId,
           [
             `Sender: ${senderId}`,
+            `Channel: ${msg.channel}`,
             `Chat: ${chatId} (${msg.isGroup ? "group" : "dm"})`,
             `Service: ${msg.service ?? "unknown"}`,
             `Auth: ${source}`,
@@ -1229,7 +1327,7 @@ export class GatewayRouter {
   ): Promise<void> {
     const { chatId } = msg;
 
-    if (this.config.photonReactions && this.channel.react && !options.isLoop) {
+    if (this.reactionsEnabled(msg.channel) && this.channel.react && !options.isLoop) {
       this.channel.react(chatId, msg.id, "👀").catch(() => {});
     }
 
@@ -1293,7 +1391,7 @@ export class GatewayRouter {
         );
       }
 
-      if (this.config.photonReactions && this.channel.react && !options.isLoop) {
+      if (this.reactionsEnabled(msg.channel) && this.channel.react && !options.isLoop) {
         this.channel.react(chatId, msg.id, "👍").catch(() => {});
       }
     } catch (err) {
@@ -1305,7 +1403,7 @@ export class GatewayRouter {
       if (!wasResetDuringTurn && !wasUserCancelled) {
         const message = err instanceof Error ? err.message : String(err);
         this.lastError = message;
-        if (this.config.photonReactions && this.channel.react && !options.isLoop) {
+        if (this.reactionsEnabled(msg.channel) && this.channel.react && !options.isLoop) {
           this.channel.react(chatId, msg.id, "👎").catch(() => {});
         }
         await this.sendReply(

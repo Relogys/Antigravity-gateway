@@ -2,25 +2,26 @@
 
 # 🪐 Antigravity Gateway
 
-**Universal, Extensible Multi-Channel Messaging Gateway for Google Antigravity (`agy acp`)**
+**Universal 8-Platform Multi-Channel Messaging Gateway for Google Antigravity (`agy acp`)**
 
-*通用可扩展的 Google Antigravity 多通道消息网关 — 让你的 Antigravity Agent 随时随地通过 iMessage 与各类 IM 端远程协同工作*
+*通用 8 平台多通道 Google Antigravity 消息网关 — 无需公网域名与内网穿透，随时随地通过 iMessage / Telegram / Discord / Slack / 飞书 / 钉钉 / QQ / Webhook 远程驱动你的本地 Antigravity Agent*
 
 <p>
   <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/Node.js-22%2B%20%7C%2024%2B-339933?style=for-the-badge&logo=nodedotjs&logoColor=white" alt="Node.js 22+ / 24+" /></a>
   <a href="https://www.typescriptlang.org/"><img src="https://img.shields.io/badge/TypeScript-5.8%2B%20ESM-3178C6?style=for-the-badge&logo=typescript&logoColor=white" alt="TypeScript" /></a>
   <a href="https://agentclientprotocol.com/"><img src="https://img.shields.io/badge/ACP-v1%20(%40agentclientprotocol%2Fsdk)-6E56CF?style=for-the-badge" alt="ACP v1" /></a>
-  <a href="https://docs.photon.codes/"><img src="https://img.shields.io/badge/Flagship%20Adapter-Photon%20iMessage-0A84FF?style=for-the-badge&logo=apple&logoColor=white" alt="Photon Spectrum iMessage" /></a>
-  <a href="#zero-token-quota--slash-commands"><img src="https://img.shields.io/badge/Quota%20Check-0%20Tokens-F59E0B?style=for-the-badge" alt="Zero-Token Quota" /></a>
+  <a href="#supported-channels--支持通道一览"><img src="https://img.shields.io/badge/Built--in%20Channels-8%20Platforms-0A84FF?style=for-the-badge" alt="8 Built-in Channels" /></a>
+  <a href="#slash-commands--斜杠命令"><img src="https://img.shields.io/badge/Quota%20Check-0%20Tokens-F59E0B?style=for-the-badge" alt="Zero-Token Quota" /></a>
   <a href="#license"><img src="https://img.shields.io/badge/License-MIT-10B981?style=for-the-badge" alt="MIT License" /></a>
 </p>
 
 <p>
   <a href="#architecture--架构设计">Architecture</a> •
-  <a href="#features--核心能力">Features</a> •
+  <a href="#supported-channels--支持通道一览">8 Channels</a> •
   <a href="#quick-start--快速开始">Quick Start</a> •
+  <a href="#channel-configuration--各平台环境变量">Env Vars</a> •
+  <a href="#cli--health-endpoint--命令行与健康检查">CLI &amp; Health</a> •
   <a href="#slash-commands--斜杠命令">Slash Commands</a> •
-  <a href="#build-a-custom-channeladapter--扩展新通道">Extend ChannelAdapter</a> •
   <a href="#security--compliance--安全与合规">Security</a>
 </p>
 
@@ -30,12 +31,11 @@
 
 ## Overview / 项目定位
 
-**Antigravity Gateway** turns local **Google Antigravity CLI (`agy acp`)** into an always-on, mobile-reachable personal engineering assistant across messaging platforms.
+**Antigravity Gateway** turns local **Google Antigravity CLI (`agy acp`)** into an always-on, multi-platform engineering assistant. Enable any combination of the **8 built-in adapters** simultaneously via [`MultiChannelHub`](src/channels/hub.ts) — every platform runs behind NAT with **zero public domain or reverse-proxy setup required**.
 
-Rather than hardcoding a single chat vendor, the gateway separates **Channel Adapters (`ChannelAdapter`)**, **Routing & Policy (`GatewayRouter`, `GatewayStore`, `LoopScheduler`)**, and **Agent Execution (`AgentBackend` / `AgyAgentBackend`)**:
-
-- **Photon Spectrum iMessage (`PhotonChannelAdapter`)** ships out-of-the-box as the flagship first-class adapter — delivering native Apple iMessage / SMS / RCS messaging over outbound TLS gRPC with **zero public webhook URLs**.
-- **Pluggable Multi-Channel Core**: Implement the minimal `ChannelAdapter` interface (~30 lines) to connect **Telegram, Discord, Slack, Feishu/Lark, WeChat, or custom Webhooks** while reusing session persistence, fail-closed pairing, tool approval forwarding, media guards, and scheduled loops automatically.
+- **Concurrent Multi-Channel Hub (`MultiChannelHub`)**: Runs up to all 8 channels side by side in one process, namespacing conversations as `<channel>::<rawChatId>` with per-channel health tracking and non-blocking inbound dispatch (a failing channel never crashes healthy ones).
+- **Unified Gateway Core**: Every adapter shares fail-closed auth (`ALLOWED_SENDERS` + per-channel `*_ALLOWED_USERS` + 8-char DM pairing), interactive tool approval forwarding, busy turn control (`queue` / `interrupt` / `steer`), media/secret guards, zero-token `/usage`, and persistent `/loop` & `/remind` schedules.
+- **Extensible by Design**: Drop in a new `src/channels/<name>.ts` exporting `createAdapter(config)` against [`ChannelAdapter`](src/types.ts) to add any custom platform.
 
 ---
 
@@ -43,48 +43,58 @@ Rather than hardcoding a single chat vendor, the gateway separates **Channel Ada
 
 ```mermaid
 flowchart LR
-    subgraph Channels["Multi-Channel Adapters (ChannelAdapter)"]
-        IM["📱 Photon iMessage ✅<br/>(Flagship Built-in)"]
-        TG["✈️ Telegram / Discord / Slack 🔌<br/>(Pluggable Adapter)"]
-        WX["💬 WeChat / Feishu / Webhook 🔌<br/>(Pluggable Adapter)"]
+    subgraph Channels["8 Built-in Channel Adapters (Zero Public Domain / NAT-Friendly)"]
+        PH["📱 Photon iMessage (photon)<br/>Spectrum Outbound TLS gRPC"]
+        TG["✈️ Telegram (telegram)<br/>Native Bot API Long Polling (0 extra deps)"]
+        DC["🎮 Discord (discord)<br/>discord.js Gateway WebSocket"]
+        SL["💼 Slack (slack)<br/>@slack/bolt Socket Mode"]
+        FS["🪶 Feishu / Lark 飞书 (feishu)<br/>Official WSClient Long Connection"]
+        DT["🔔 DingTalk 钉钉 (dingtalk)<br/>Official dingtalk-stream Mode"]
+        QQ["🐧 QQ / OneBot v11 (onebot)<br/>Forward WS: NapCat/LLOneBot/Lagrange (0 deps)"]
+        WH["🔗 Generic Webhook (webhook)<br/>POST /v1/messages + wait:true + SSE /v1/events"]
+    end
+
+    subgraph Hub["MultiChannelHub (Concurrent Dispatch & Health)"]
+        HB["🔀 Channel Namespace Router<br/>&lt;channel&gt;::&lt;rawChatId&gt; • Fault Isolation"]
     end
 
     subgraph Core["Gateway Core (Node.js / TypeScript)"]
-        RT["🛡️ GatewayRouter<br/>• Fail-closed Auth & 8-Char Pairing<br/>• Busy Queue / Steer / Interrupt<br/>• Slash Commands & Media Guard"]
+        RT["🛡️ GatewayRouter<br/>• Fail-closed Auth & 8-Char Pairing<br/>• Busy Queue / Steer / Interrupt<br/>• /channels, Slash Commands & Media Guard"]
         ST["💾 GatewayStore<br/>Atomic JSON state.json"]
         SC["⏰ LoopScheduler<br/>Loops & 0-Token Reminders"]
-        HL["🩺 HealthServer<br/>127.0.0.1:18790 (Read-Only)"]
+        HL["🩺 HealthServer<br/>127.0.0.1:18790 (/healthz, /status)"]
     end
 
     subgraph Agent["AgentBackend (agy acp)"]
-        ACP["🤖 AgyAgentBackend<br/>• @agentclientprotocol/sdk (stdio)<br/>• Interactive / Sandbox / Auto Approvals<br/>• Multimodal Images & Session Resume"]
+        ACP["🤖 AgyAgentBackend<br/>• @agentclientprotocol/sdk (stdio)<br/>• Interactive / Sandbox / Auto Approvals<br/>• Multimodal Media & Session Resume"]
         QU["📊 Zero-Token Quota<br/>agy -p '/usage' --output-format json"]
     end
 
-    IM <-->|gRPC Cloud| RT
-    TG <-.->|ChannelAdapter| RT
-    WX <-.->|ChannelAdapter| RT
+    PH & TG & DC & SL & FS & DT & QQ & WH <--> HB
+    HB <-->|Unified ChannelAdapter| RT
     RT <--> ST
     RT <--> SC
-    HL -.->|HealthSnapshot| RT
+    HL -.->|HealthSnapshot + channels| RT
     RT <-->|AgentTurnInput / Result| ACP
     RT -.->|5h / Weekly Quota| QU
 ```
 
 ---
 
-## Features / 核心能力
+## Supported Channels / 支持通道一览
 
-| Capability | Description | 中文说明 |
-| :--- | :--- | :--- |
-| **Native ACP v1 Engine** | Speaks official JSON-RPC 2.0 `agy acp` over `stdio` (`session/new`, `load`, `resume`, `list`, `cancel`, `set_config_option`) | 基于官方 `agy acp` 协议，支持会话恢复、取消、模型/思考强度切换 |
-| **Flagship iMessage Channel** | Built-in `PhotonChannelAdapter` (`spectrum-ts`): 48h dedup, zombie-stream probe, `any;-;+E164` normalization, rich-link preview filter, 7500-char chunking | 原生 Photon iMessage 通道：去重、断流自愈、长消息智能分片、已读与表情反馈 |
-| **Fail-Closed Auth & Pairing** | Default-deny access; 8-char unambiguous DM pairing codes (`1h` TTL, `10m` rate limit, max 3 pending, 5-attempt lockout) | 默认拒绝未授权访问；支持 8 位防混淆配对码审批、防爆破锁定与群聊 `@` 门控 |
-| **Interactive Tool Approvals** | Forward ACP tool permission prompts directly to chat (`/approve [once\|session\|always]` or `/deny`), plus `sandbox` & `auto` modes | 远程审批工具权限（单次/会话/永久允许或拒绝），支持沙箱与自动模式 |
-| **Busy-Turn Control** | Queue, interrupt, or steer running turns mid-flight without dropping messages (`/stop`, `/queue`, `/steer`, `/busy`) | 任务运行中随时插话引导、排队或中止，不丢消息、不阻塞状态查询 |
-| **Zero-Token Quota & Alerts** | `/usage` queries `agy -p "/usage" --output-format json` burning **0 tokens**, and attaches subtle low-quota notices (`<= QUOTA_WARN_THRESHOLD`) | `/usage` 零 Token 消耗查询 5 小时/周额度，并在低配额时自动提示 |
-| **Media & Secret Guard** | Inbound images/files forwarded to ACP; outbound `MEDIA:<path>` blocks `.env*`, `.ssh`, private keys, and paths outside `cwd` | 双向媒体附件支持，出站文件严格拦截密钥、环境变量与越界路径 |
-| **Loops & Reminders** | `/loop` for recurring agent tasks and `/remind` for zero-token one-way notification pushes, persisted across restarts | 持久化定时 Prompt 循环与零消耗单向提醒推送 |
+Every channel is **optional** and automatically enabled when its credentials are configured in `.env`. Multiple channels run concurrently in `MultiChannelHub`.
+
+| Channel | Name | Transport / SDK | Highlights &amp; NAT Traversal |
+| :--- | :--- | :--- | :--- |
+| **Photon iMessage** | `photon` | `spectrum-ts` Outbound TLS gRPC | Flagship iMessage / SMS / RCS adapter; 48h dedupe, zombie-stream probe, read receipts &amp; reactions |
+| **Telegram** | `telegram` | Native Bot API `getUpdates` Long Polling (**0 extra deps**) | Node 24 built-in `fetch`; group `@bot` / reply gating, photo/doc/voice/audio download, multipart uploads, typing &amp; reactions |
+| **Discord** | `discord` | `discord.js` Gateway WebSocket | DM + guild mention gating (`DISCORD_ALLOW_GUILDS`), attachment download/upload, reply references, typing, reactions &amp; edits |
+| **Slack** | `slack` | `@slack/bolt` Socket Mode (`xoxb-` + `xapp-`) | Zero public URL; `app_mention` &amp; DM support, `thread_ts` continuity, Bearer file downloads, `filesUploadV2`, emoji reactions |
+| **Feishu / Lark 飞书** | `feishu` | Official `@larksuiteoapi/node-sdk` `WSClient` | Feishu (`feishu`) &amp; Lark (`lark`) domains; long connection behind NAT, resource downloads, image/file uploads &amp; reactions |
+| **DingTalk 钉钉** | `dingtalk` | Official `dingtalk-stream` Mode | Stream WebSocket robot callback (`TOPIC_ROBOT`); `sessionWebhook` reply caching, `@mention` detection, Markdown replies |
+| **QQ / OneBot v11** | `onebot` | Forward WebSocket (**0 extra deps**) | Built-in Node 24 `WebSocket` for NapCat / LLOneBot / Lagrange; full string CQ-code &amp; segment array parsing, auto-reconnect |
+| **Generic Webhook / HTTP** | `webhook` | Built-in Node `http` (`127.0.0.1:18791`) | `POST /v1/messages` (Bearer + HMAC-SHA256 + synchronous `wait: true` mode), `callbackUrl` webhooks &amp; `GET /v1/events` SSE stream for Siri Shortcuts, WeCom bridges, or custom apps |
 
 ---
 
@@ -94,7 +104,7 @@ flowchart LR
 
 - **Node.js `>= 22`** (tested on Node `24`) and **`pnpm`**
 - **Google Antigravity CLI (`agy`)** installed on `PATH` and signed in (`agy --version`)
-- **Photon Spectrum Project** credentials (`SPECTRUM_PROJECT_ID` and `SPECTRUM_PROJECT_SECRET`) for the built-in iMessage adapter
+- Credentials for **at least one** of the 8 supported channels
 
 ### 2. Install & Configure / 安装与配置
 
@@ -105,30 +115,7 @@ pnpm install
 Copy-Item .env.example .env
 ```
 
-Edit `.env` (never commit `.env`):
-
-```env
-SPECTRUM_PROJECT_ID=your-spectrum-project-id
-SPECTRUM_PROJECT_SECRET=your-spectrum-project-secret
-
-# Optional static allowlist (comma-separated E.164 phones or Apple ID emails).
-# Leave empty to require explicit CLI pairing approval for every DM sender.
-ALLOWED_SENDERS=+15550001111,user@example.com
-
-AGY_BIN=agy
-DEFAULT_CWD=.
-APPROVAL_MODE=interactive
-QUOTA_WARN_THRESHOLD=15
-```
-
-### 3. Photon Dashboard Setup & Inbound-First Rule / Photon 后台配置与先发规则
-
-1. In your **Photon Dashboard -> Users** (or Photon CLI), register the exact Apple Messages handle you send from (E.164 phone number or Apple ID email).
-   - Need to confirm your exact Apple Messages identifier? Check `https://debug.photon.codes`.
-2. **Inbound-First Rule / 首条消息规则**: On Photon shared iMessage pools, **send the first message from your Apple device to your project's assigned number** before the gateway sends outbound replies (`Target not allowed for this project` otherwise).
-3. **Side-by-Side Coexistence**: Running multiple Photon bots on one machine? Use a separate Photon project per bot so each gets an isolated iMessage thread, gRPC stream, and API quota with zero local port conflicts.
-
-### 4. Diagnostics, Build & Start / 诊断、构建与启动
+Edit `.env` (never commit `.env`), configure any channels you want to enable, then validate and start:
 
 ```powershell
 pnpm cli doctor
@@ -144,26 +131,99 @@ pnpm dev
 
 ---
 
-## DM Pairing Workflow / 配对审批流程
+## Channel Configuration / 各平台环境变量
 
-When `ALLOWED_SENDERS` does not list an incoming DM sender:
+Every variable below matches [`.env.example`](.env.example). Empty everywhere = deny all (DMs receive an 8-character pairing code instead).
 
-1. The gateway replies once (10-minute cooldown) with an **8-character code** (valid for 1 hour, max 3 pending requests globally, 5-attempt brute-force lockout).
-2. The host operator inspects and approves the request locally:
+### Per-Channel Credentials &amp; Allowlists / 各平台配置
 
-```powershell
-pnpm cli pair list
-pnpm cli pair approve ABCD2345
+| Channel | Required Env Vars | Optional Env Vars |
+| :--- | :--- | :--- |
+| **Photon iMessage** | `SPECTRUM_PROJECT_ID`, `SPECTRUM_PROJECT_SECRET` | `PHOTON_READ_RECEIPTS=true`, `PHOTON_REACTIONS=true` |
+| **Telegram** | `TELEGRAM_BOT_TOKEN` | `TELEGRAM_ALLOWED_USERS`, `TELEGRAM_POLL_TIMEOUT_SEC=30` |
+| **Discord** | `DISCORD_BOT_TOKEN` | `DISCORD_ALLOWED_USERS`, `DISCORD_ALLOW_GUILDS=false` |
+| **Slack** | `SLACK_BOT_TOKEN` (`xoxb-...`), `SLACK_APP_TOKEN` (`xapp-...`) | `SLACK_ALLOWED_USERS` |
+| **Feishu / Lark 飞书** | `FEISHU_APP_ID`, `FEISHU_APP_SECRET` | `FEISHU_DOMAIN=feishu` (`feishu` \| `lark`), `FEISHU_ALLOWED_USERS` |
+| **DingTalk 钉钉** | `DINGTALK_CLIENT_ID`, `DINGTALK_CLIENT_SECRET` | `DINGTALK_ALLOWED_USERS` |
+| **QQ / OneBot v11** | `ONEBOT_WS_URL` (`ws://` or `wss://`) | `ONEBOT_ACCESS_TOKEN`, `ONEBOT_SELF_ID`, `ONEBOT_ALLOWED_USERS` |
+| **Webhook / HTTP** | `WEBHOOK_ENABLED=true` | `WEBHOOK_HOST=127.0.0.1`, `WEBHOOK_PORT=18791`, `WEBHOOK_TOKEN`, `WEBHOOK_SECRET`, `WEBHOOK_CALLBACK_URL`, `WEBHOOK_ALLOWED_USERS` |
+
+> [!IMPORTANT]
+> **Webhook Security Guard**: `webhook` refuses to bind to a non-loopback `WEBHOOK_HOST` unless `WEBHOOK_TOKEN` or `WEBHOOK_SECRET` is configured. For `POST /v1/messages`, pass `Authorization: Bearer <token>` and/or `X-Webhook-Signature: sha256=<hmac-hex>`. Set `"wait": true` in the request body to receive `{ "ok": true, "messageId": "...", "replies": [...] }` synchronously, or subscribe to `GET /v1/events` (SSE) / `WEBHOOK_CALLBACK_URL`.
+
+### Global Access Control &amp; Core Settings / 全局访问控制与核心配置
+
+```env
+# Global allowlist: Photon entries are E.164 phones or Apple ID emails.
+# Non-Photon entries use "<channel>:<userId>" (e.g. telegram:123456789, discord:987654321).
+# Unioned with per-channel *_ALLOWED_USERS and CLI-paired senders.
+ALLOWED_SENDERS=+15550001111,user@example.com
+ALLOW_GROUPS=false
+GROUP_MENTION_PATTERNS=@agy,@antigravity
+
+# Antigravity CLI (`agy`) backend
+AGY_BIN=agy
+DEFAULT_CWD=.
+APPROVAL_MODE=interactive
+DEFAULT_MODEL=
+DEFAULT_EFFORT=
+GEMINI_API_KEY=
+
+# Optional local health endpoint (disabled by default; strictly localhost)
+HEALTH_ENABLED=false
+HEALTH_HOST=127.0.0.1
+HEALTH_PORT=18790
+QUOTA_WARN_THRESHOLD=15
+
+DATA_DIR=./data
+LOG_LEVEL=info
 ```
 
-Manage paired senders or live status anytime:
+### Photon Dashboard &amp; Inbound-First Note / Photon 后台与首条消息规则
+
+1. In **Photon Dashboard -> Users**, register the Apple Messages handle you send from (E.164 phone number or Apple ID email; verify your exact identifier at `https://debug.photon.codes`).
+2. **Inbound-First Rule**: On Photon shared iMessage pools, **send the first message from your Apple device to your project's assigned number** before the gateway sends outbound replies (`Target not allowed for this project` otherwise).
+
+---
+
+## CLI &amp; Health Endpoint / 命令行与健康检查
+
+### Admin CLI (`pnpm cli ...`)
 
 ```powershell
-pnpm cli pair revoke +15550001111
-pnpm cli pair clear
-pnpm cli status
-pnpm cli usage
+pnpm cli doctor                                      # Check Node, agy, and status of all 8 channels
+pnpm cli send --channel telegram --to 123456789 "Hi" # Send a one-off message through any configured channel
+pnpm cli status                                      # Query live health endpoint + local store summary
+pnpm cli usage                                       # Zero-token Antigravity quota check
+pnpm cli pair list                                   # List pending pairing codes & approved senders
+pnpm cli pair approve ABCD2345                       # Approve an 8-character DM pairing code
+pnpm cli pair revoke telegram:123456789              # Revoke an approved sender
+pnpm cli pair clear                                  # Clear all pending pairing requests
 ```
+
+### `GET /status` &amp; `GET /healthz` Per-Channel Health Output
+
+When `HEALTH_ENABLED=true`, [`HealthServer`](src/health.ts) serves read-only JSON on `127.0.0.1:18790` with per-channel connectivity and timestamps (no secrets or PII):
+
+```json
+{
+  "status": "ok",
+  "startedAt": 1700000000000,
+  "uptimeMs": 42500,
+  "channelConnected": true,
+  "activeSessions": 2,
+  "activeTurns": 0,
+  "pendingPermissions": 0,
+  "activeLoops": 1,
+  "channels": {
+    "photon": { "name": "photon", "connected": true, "lastInboundAt": 1700000030000, "lastOutboundAt": 1700000032000 },
+    "telegram": { "name": "telegram", "connected": true, "lastInboundAt": 1700000040000 }
+  }
+}
+```
+
+- `GET /healthz` returns HTTP `200` (`ok: true`) when `status === "ok"` (or `503` otherwise) with a compact `{ channels: { "<name>": boolean } }` map.
+- From any chat, run `/channels` to print the live connection status, last inbound/outbound ages, and any per-channel errors.
 
 ---
 
@@ -176,7 +236,8 @@ pnpm cli usage
 | `/stop` | `/cancel` | Cancel the active turn immediately |
 | `/new` | `/reset` | Cancel active turn, clear queue, and start a fresh ACP session |
 | `/status` | — | Show gateway health, uptime, active session, model, effort, mode, CWD, queue, loops |
-| `/usage` | — | Run zero-token Antigravity 5h & weekly quota check |
+| `/channels` | — | Show all registered channels, connection state, and last inbound/outbound timing |
+| `/usage` | — | Run zero-token Antigravity 5h &amp; weekly quota check |
 | `/queue [prompt\|list\|clear]` | `/q` | Enqueue a follow-up prompt, inspect queue, or clear queued prompts |
 | `/steer <prompt>` | `/s` | Cancel active turn and redirect immediately with `<prompt>` |
 | `/busy [queue\|interrupt\|steer]` | — | Choose how messages arriving mid-turn are handled |
@@ -187,7 +248,7 @@ pnpm cli usage
 | `/help` | `/commands` | Display command reference |
 | `/version` | `/v` | Display gateway and Node.js versions |
 
-### Session, Config & Automation (When Idle) / 会话配置与定时任务
+### Session, Config &amp; Automation (When Idle) / 会话配置与定时任务
 
 | Command | Aliases | Purpose |
 | :--- | :--- | :--- |
@@ -208,33 +269,34 @@ pnpm cli usage
 
 ## Build a Custom `ChannelAdapter` / 扩展新通道
 
-Want to plug in **Telegram, Discord, Slack, Feishu, WeChat, or a Webhook**? Implement `ChannelAdapter` from [`src/types.ts`](src/types.ts) (~30 lines) and pass it to `GatewayRouter`:
+Add a new module `src/channels/<name>.ts` exporting `createAdapter(config: GatewayConfig): ChannelAdapter` (extend [`BaseChannelAdapter`](src/channels/base.ts) for built-in stats and error isolation), and register its config block in [`src/config.ts`](src/config.ts):
 
 ```ts
-import type { ChannelAdapter, InboundMessage, OutboundMessage } from "./types.js";
+import type { GatewayConfig } from "../config.js";
+import { BaseChannelAdapter, type InboundHandler } from "./base.js";
+import type { ChannelAdapter, OutboundMessage } from "../types.js";
 
-export class MyChatAdapter implements ChannelAdapter {
+export class MyChatAdapter extends BaseChannelAdapter {
   readonly name = "my-chat";
-  private connected = false;
 
-  async start(onMessage: (msg: InboundMessage) => Promise<void> | void): Promise<void> {
-    this.connected = true;
-    // Subscribe to your platform SDK and normalize events into InboundMessage:
-    // await onMessage({ id, channel: this.name, chatId, senderId, isGroup, text, attachments, timestamp });
+  async start(onMessage: InboundHandler): Promise<void> {
+    this.handler = onMessage;
+    this.setConnected(true);
+    // Emit raw chatId & senderId via `await this.emit({ ... })`; MultiChannelHub namespaces chatId.
   }
 
   async stop(): Promise<void> {
-    this.connected = false;
+    this.setConnected(false);
   }
 
   async sendMessage(msg: OutboundMessage): Promise<{ messageId?: string } | void> {
-    // Deliver msg.text and msg.attachments to msg.chatId via your platform SDK
+    this.noteOutbound();
     return { messageId: "outbound-id" };
   }
+}
 
-  isConnected(): boolean {
-    return this.connected;
-  }
+export function createAdapter(config: GatewayConfig): ChannelAdapter {
+  return new MyChatAdapter();
 }
 ```
 
@@ -253,21 +315,17 @@ Portable PowerShell scripts in [`scripts/`](scripts/) resolve paths dynamically 
 | [`scripts/uninstall-task.ps1`](scripts/uninstall-task.ps1) | Stops and unregisters `AntigravityGateway` |
 
 ```powershell
-# Install Windows logon task (run when ready)
 powershell -ExecutionPolicy Bypass -File .\scripts\install-task.ps1
-
-# Uninstall Windows logon task
 powershell -ExecutionPolicy Bypass -File .\scripts\uninstall-task.ps1
 ```
 
 ---
 
-## Security & Compliance / 安全与合规
+## Security &amp; Compliance / 安全与合规
 
-- **Official Protocol & Auth Compliance**: Connects strictly through official `agy acp` using your local cached `agy` session or `GEMINI_API_KEY`. Never extracts or reverse-proxies OAuth tokens. (Note: `GEMINI_API_KEY` mode disables `/usage` quota reporting inside `agy`.)
-- **Zero Public Listening Ports**: Photon Spectrum uses outbound TLS gRPC; the optional localhost health endpoint (`HEALTH_ENABLED=false` by default) binds strictly to `127.0.0.1:18790` and omits secrets/PII.
-- **Single-Instance Lock**: Prevents duplicate gateway processes via `<dataDir>/gateway.pid` with stale-PID cleanup.
-- **Secret Audit**: Run `pnpm audit:secrets` before any commit or push to verify zero personal paths, credentials, or `.env` files are tracked.
+- **Official Protocol &amp; Auth Compliance**: Connects strictly through official `agy acp` using your local cached `agy` session or `GEMINI_API_KEY`. Never extracts or reverse-proxies OAuth tokens. (Note: `GEMINI_API_KEY` mode disables `/usage` quota reporting inside `agy`.)
+- **Zero Public Listening Ports by Default**: Outbound transports (`photon`, `telegram`, `discord`, `slack`, `feishu`, `dingtalk`, `onebot`) require zero inbound ports; `HealthServer` (`127.0.0.1:18790`) and `webhook` (`127.0.0.1:18791`) are disabled by default, bind to loopback, and `webhook` blocks non-loopback hosts without `WEBHOOK_TOKEN`/`WEBHOOK_SECRET`.
+- **Fail-Closed Auth &amp; Secret Audit**: Default-deny DM pairing (8-char unambiguous code, 1h TTL, 5-attempt lockout), outbound `MEDIA:<path>` guard against `.env*`/`.ssh`/private keys, single-instance lock (`<dataDir>/gateway.pid`), and `pnpm audit:secrets` before commits.
 
 ---
 
