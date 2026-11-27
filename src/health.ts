@@ -1,16 +1,33 @@
+import crypto from "node:crypto";
 import http from "node:http";
+import { isLoopbackHost } from "./channels/utils.js";
 import type { GatewayConfig } from "./config.js";
+import { redactSecrets } from "./logger.js";
 import type { HealthSnapshot } from "./types.js";
 
+function verifyBearerToken(req: http.IncomingMessage, expectedToken: string): boolean {
+  const raw = req.headers.authorization;
+  const header = Array.isArray(raw) ? (raw[0] ?? "") : (raw ?? "");
+  const match = /^Bearer\s+(.+)$/i.exec(header.trim());
+  if (!match) {
+    return false;
+  }
+  const provided = match[1].trim();
+  const a = crypto.createHash("sha256").update(provided).digest();
+  const b = crypto.createHash("sha256").update(expectedToken).digest();
+  return crypto.timingSafeEqual(a, b);
+}
+
 /**
- * Read-only localhost health & status HTTP server (`GET /healthz`, `GET /status`).
- * Never exposes secrets or personal sender identifiers.
+ * Read-only health & status HTTP server (`GET /healthz`, `GET /readyz`, `GET /status`).
+ * Never exposes secrets or personal sender identifiers; redacts error strings and
+ * optionally protects `/status` with `HEALTH_TOKEN` Bearer auth.
  */
 export class HealthServer {
   private server: http.Server | null = null;
 
   constructor(
-    private readonly config: Pick<GatewayConfig, "healthHost" | "healthPort">,
+    private readonly config: Pick<GatewayConfig, "healthHost" | "healthPort" | "healthToken">,
     private readonly getSnapshot: () => HealthSnapshot,
   ) {}
 
@@ -73,6 +90,28 @@ export class HealthServer {
       }
 
       if (urlPath === "/status") {
+        const expectedToken = this.config.healthToken?.trim();
+        if (expectedToken && !verifyBearerToken(req, expectedToken)) {
+          this.sendJson(
+            res,
+            401,
+            { error: "Unauthorized" },
+            { "WWW-Authenticate": "Bearer" },
+          );
+          return;
+        }
+
+        // Only expose redacted diagnostic error strings to authenticated callers or
+        // loopback listeners; unauthenticated non-loopback requests receive counts/states only.
+        const includeErrorDetails =
+          Boolean(expectedToken) || isLoopbackHost(this.config.healthHost);
+        const sanitizeError = (raw?: string): string | undefined => {
+          if (!raw || !includeErrorDetails) {
+            return undefined;
+          }
+          return redactSecrets(raw);
+        };
+
         const sanitized: HealthSnapshot = {
           status: snapshot.status,
           startedAt: snapshot.startedAt,
@@ -84,7 +123,7 @@ export class HealthServer {
           activeLoops: snapshot.activeLoops,
           lastInboundAt: snapshot.lastInboundAt,
           lastOutboundAt: snapshot.lastOutboundAt,
-          lastError: snapshot.lastError,
+          lastError: sanitizeError(snapshot.lastError),
           channels: snapshot.channels
             ? Object.fromEntries(
                 Object.entries(snapshot.channels).map(([key, c]) => [
@@ -97,7 +136,7 @@ export class HealthServer {
                     lastHeartbeatAt: c.lastHeartbeatAt,
                     heartbeatStream: c.heartbeatStream,
                     heartbeatLineId: c.heartbeatLineId,
-                    lastError: c.lastError,
+                    lastError: sanitizeError(c.lastError),
                   },
                 ]),
               )
@@ -150,12 +189,14 @@ export class HealthServer {
     res: http.ServerResponse,
     statusCode: number,
     payload: unknown,
+    extraHeaders?: Record<string, string>,
   ): void {
     const body = JSON.stringify(payload);
     res.writeHead(statusCode, {
       "Content-Type": "application/json; charset=utf-8",
       "Cache-Control": "no-store",
       "Content-Length": Buffer.byteLength(body),
+      ...extraHeaders,
     });
     res.end(body);
   }

@@ -11,39 +11,39 @@ import { LoopScheduler } from "./gateway/scheduler.js";
 import { GatewayStore } from "./gateway/store.js";
 import { HealthServer } from "./health.js";
 import { redactSecrets } from "./logger.js";
+import {
+  formatPidPayload,
+  isGatewayProcess,
+  parsePidContent,
+  readPidFile,
+} from "./pid.js";
 import type { PendingPermission } from "./types.js";
 
 const CLEAN_SHUTDOWN_SENTINEL = ".clean_shutdown";
-
-function isProcessAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) {
-    return false;
-  }
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    return code === "EPERM";
-  }
-}
 
 async function acquirePidLock(dataDir: string): Promise<string> {
   await fsp.mkdir(dataDir, { recursive: true });
   const pidPath = path.join(dataDir, "gateway.pid");
 
   if (fs.existsSync(pidPath)) {
-    const raw = (await fsp.readFile(pidPath, "utf8").catch(() => "")).trim();
-    const existingPid = Number.parseInt(raw, 10);
-    if (existingPid && existingPid !== process.pid && isProcessAlive(existingPid)) {
+    const raw = await fsp.readFile(pidPath, "utf8").catch(() => "");
+    const existing = parsePidContent(raw);
+    if (
+      existing &&
+      existing.pid !== process.pid &&
+      (await isGatewayProcess(existing))
+    ) {
       throw new Error(
-        `Antigravity gateway is already running (PID ${existingPid}). Lock: ${pidPath}`,
+        `Antigravity gateway is already running (PID ${existing.pid}). Lock: ${pidPath}`,
       );
     }
     await fsp.rm(pidPath, { force: true }).catch(() => {});
   }
 
-  await fsp.writeFile(pidPath, `${process.pid}\n`, { encoding: "utf8", flag: "wx" });
+  await fsp.writeFile(pidPath, formatPidPayload(process.pid, process.argv[1]), {
+    encoding: "utf8",
+    flag: "wx",
+  });
   return pidPath;
 }
 
@@ -52,8 +52,7 @@ async function releasePidLock(pidPath: string | null): Promise<void> {
     return;
   }
   try {
-    const raw = (await fsp.readFile(pidPath, "utf8")).trim();
-    if (Number.parseInt(raw, 10) === process.pid) {
+    if (readPidFile(pidPath) === process.pid) {
       await fsp.rm(pidPath, { force: true });
     }
   } catch {

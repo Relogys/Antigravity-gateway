@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## [0.3.0] - 2026-11-26
+
+### Cross-Platform Support (macOS / Linux / Windows)
+
+- **macOS (`launchd`) & Apple Silicon first-class support**: Added native `launchd` LaunchAgent generation (`~/Library/LaunchAgents/com.antigravity.gateway.plist`) with Homebrew `/opt/homebrew/bin` + `/usr/local/bin` PATH wiring, crash-only `KeepAlive`, and `scripts/install-launchd.sh` / `scripts/uninstall-launchd.sh`.
+- **Linux (`systemd --user`) support**: Added user-unit generation (`~/.config/systemd/user/antigravity-gateway.service`) with `Restart=on-failure`, `NoNewPrivileges=true`, and `scripts/install-systemd.sh` / `scripts/uninstall-systemd.sh`.
+- **Portable POSIX supervisor (`scripts/start-gateway.sh`)**: Bash crash-backoff supervisor (`2s`→`60s` exponential delay, 5 MB log rotation, `--one-shot` flag) mirroring `scripts/start-gateway.ps1` for macOS and Linux.
+- **Unified native service CLI (`pnpm cli service`)**: Added `pnpm cli service [install|uninstall|status|print]` (with `--platform darwin|linux` preview) dispatching to `launchd` on macOS, `systemd --user` on Linux, and Task Scheduler on Windows.
+- **macOS CI matrix & LF hygiene**: Added `verify-macos` (`macos-latest` Apple Silicon, Node 24) to `.github/workflows/ci.yml`, added `.gitattributes` to enforce LF line endings on scripts/source and CRLF on `.ps1`, fixed Windows CRLF shebang parsing in `.github/actions/notify/send.mjs`, and upgraded CodeQL to `v4`.
+
+### Security & Operational Hardening
+
+- **Non-loopback Webhook anti-replay by default**: `WEBHOOK_REQUIRE_TIMESTAMP` now defaults to `true` whenever `WEBHOOK_HOST` binds beyond loopback (still `false` on `127.0.0.1`/`localhost`/`::1` and explicitly overridable).
+- **Hardened `HealthServer` (`/status`)**: All `lastError` diagnostic strings are passed through `redactSecrets()`, optional `HEALTH_TOKEN` enforces timing-safe Bearer auth on `GET /status` (keeping `/healthz` and `/readyz` open for probes), and unauthenticated non-loopback `/status` responses omit raw `lastError` details.
+- **PID identity verification**: `data/gateway.pid` now writes structured JSON (`{ pid, startedAt, entry }`, backward-compatible with legacy integer PID files) and verifies the target process command line before signaling in `pnpm cli stop` so OS-recycled PIDs are never killed; startup now exits non-zero with log tail if the PID file fails to appear.
+- **Global-install safe log directory**: Added `LOG_DIR` override and automatic fallback to `<DATA_DIR>/logs/gateway.log` when installed inside read-only `node_modules`.
+
 ## [0.2.0] - 2026-11-26
 
 ### Security & Reliability

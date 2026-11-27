@@ -213,6 +213,7 @@ const envSchema = z.object({
   HEALTH_ENABLED: z.string().optional(),
   HEALTH_HOST: z.string().trim().min(1).default("127.0.0.1"),
   HEALTH_PORT: z.coerce.number().int().min(1).max(65535).default(18790),
+  HEALTH_TOKEN: optionalString,
   PHOTON_READ_RECEIPTS: z.string().optional(),
   PHOTON_REACTIONS: z.string().optional(),
   PHOTON_MAX_CHUNK_CHARS: numberEnv(400, 7500, 1600),
@@ -229,6 +230,7 @@ const envSchema = z.object({
   INGRESS_DEBOUNCE_MS: numberEnv(0, 10_000, 350),
   AUTO_BOOTSTRAP_CHANNEL_SESSION: optionalString,
   DATA_DIR: z.string().trim().optional(),
+  LOG_DIR: z.string().trim().optional(),
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
 
   TELEGRAM_BOT_TOKEN: optionalString,
@@ -560,6 +562,8 @@ export interface GatewayConfig {
   healthEnabled: boolean;
   healthHost: string;
   healthPort: number;
+  /** Optional Bearer token protecting `/status` diagnostics (recommended when binding beyond loopback). */
+  healthToken?: string;
   quotaWarnThreshold: number;
   progressSilenceMs: number;
   sessionStallTimeoutMs: number;
@@ -573,6 +577,8 @@ export interface GatewayConfig {
   ingressDebounceMs: number;
   autoBootstrapChannelSession: boolean;
   dataDir: string;
+  /** Optional override directory for rotating gateway logs (defaults to user-writable path for global installs). */
+  logDir?: string;
   logLevel: LogLevel;
 
   /** Channel blocks: each present iff that channel's credentials are configured. */
@@ -781,6 +787,7 @@ export function loadConfig(
     healthEnabled: parseBoolEnv(parsed.HEALTH_ENABLED, false),
     healthHost: parsed.HEALTH_HOST,
     healthPort: parsed.HEALTH_PORT,
+    healthToken: cleanEnv(parsed.HEALTH_TOKEN),
     quotaWarnThreshold: parsed.QUOTA_WARN_THRESHOLD,
     progressSilenceMs: parsed.PROGRESS_SILENCE_MS,
     sessionStallTimeoutMs: parsed.SESSION_STALL_TIMEOUT_MS,
@@ -794,6 +801,7 @@ export function loadConfig(
       true,
     ),
     dataDir,
+    logDir: cleanEnv(parsed.LOG_DIR) ? path.resolve(cleanEnv(parsed.LOG_DIR)!) : undefined,
     logLevel: parsed.LOG_LEVEL,
 
     photon,
@@ -845,18 +853,28 @@ export function loadConfig(
         }
       : undefined,
     webhook: webhookTouched
-      ? {
-          enabled: parseBoolEnv(parsed.WEBHOOK_ENABLED, false),
-          host: cleanEnv(parsed.WEBHOOK_HOST) ?? "127.0.0.1",
-          port: parsed.WEBHOOK_PORT,
-          token: cleanEnv(parsed.WEBHOOK_TOKEN),
-          secret: cleanEnv(parsed.WEBHOOK_SECRET),
-          callbackUrl: cleanEnv(parsed.WEBHOOK_CALLBACK_URL),
-          fixedSenderId: cleanEnv(parsed.WEBHOOK_FIXED_SENDER),
-          requireTimestamp: parseBoolEnv(parsed.WEBHOOK_REQUIRE_TIMESTAMP, false),
-          replayWindowSec: parsed.WEBHOOK_REPLAY_WINDOW_SEC,
-          allowedUsers: parseAllowedUsers(parsed.WEBHOOK_ALLOWED_USERS),
-        }
+      ? (() => {
+          const webhookHost = cleanEnv(parsed.WEBHOOK_HOST) ?? "127.0.0.1";
+          const normalizedHost = webhookHost.trim().toLowerCase().replace(/^\[|\]$/g, "");
+          const isLoopback =
+            normalizedHost === "localhost" ||
+            normalizedHost === "::1" ||
+            /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(normalizedHost);
+          return {
+            enabled: parseBoolEnv(parsed.WEBHOOK_ENABLED, false),
+            host: webhookHost,
+            port: parsed.WEBHOOK_PORT,
+            token: cleanEnv(parsed.WEBHOOK_TOKEN),
+            secret: cleanEnv(parsed.WEBHOOK_SECRET),
+            callbackUrl: cleanEnv(parsed.WEBHOOK_CALLBACK_URL),
+            fixedSenderId: cleanEnv(parsed.WEBHOOK_FIXED_SENDER),
+            // Enforce signed timestamp + delivery-id anti-replay by default whenever
+            // the webhook listener is exposed beyond loopback.
+            requireTimestamp: parseBoolEnv(parsed.WEBHOOK_REQUIRE_TIMESTAMP, !isLoopback),
+            replayWindowSec: parsed.WEBHOOK_REPLAY_WINDOW_SEC,
+            allowedUsers: parseAllowedUsers(parsed.WEBHOOK_ALLOWED_USERS),
+          };
+        })()
       : undefined,
     wecom:
       wecomCorpId && parsed.WECOM_AGENT_ID !== undefined && wecomSecret

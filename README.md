@@ -8,6 +8,7 @@
 
 <p>
   <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/Node.js-22%2B%20%7C%2024%2B-339933?style=for-the-badge&logo=nodedotjs&logoColor=white" alt="Node.js 22+ / 24+" /></a>
+  <a href="#autostart--service-scripts--开机自启与后台服务"><img src="https://img.shields.io/badge/OS-macOS%20%7C%20Linux%20%7C%20Windows-111827?style=for-the-badge&logo=apple&logoColor=white" alt="macOS | Linux | Windows" /></a>
   <a href="https://www.typescriptlang.org/"><img src="https://img.shields.io/badge/TypeScript-5.8%2B%20ESM-3178C6?style=for-the-badge&logo=typescript&logoColor=white" alt="TypeScript" /></a>
   <a href="https://agentclientprotocol.com/"><img src="https://img.shields.io/badge/ACP-v1%20(%40agentclientprotocol%2Fsdk)-6E56CF?style=for-the-badge" alt="ACP v1" /></a>
   <a href="#supported-channels--支持通道一览"><img src="https://img.shields.io/badge/Built--in%20Channels-20%20Platforms-0A84FF?style=for-the-badge" alt="20 Built-in Channels" /></a>
@@ -32,6 +33,14 @@
 ---
 
 ## Overview / 项目定位
+
+> [!IMPORTANT]
+> **Compliance &amp; Positioning Notice / 合规与定位声明**
+>
+> - **Strictly Compliant — Zero Reverse Proxy**: This project **does NOT provide any reverse proxy, OAuth token extraction/forwarding, account sharing, quota bypass, or any functionality that violates Google's Terms of Service**. Every request runs locally against your own officially installed and authenticated Google Antigravity CLI (`agy acp`) over the official Agent Client Protocol (ACP v1), or your own `GEMINI_API_KEY`.
+> - **Companion Agent Harness**: This is strictly an open-source client-side **harness companion tool** built to bridge everyday usability gaps in the native Antigravity CLI (multi-platform messaging, mobile tool-approval workflows, session persistence, and scheduled automations) so it feels as capable and ergonomic as modern agent workflows.
+>
+> **合规声明**：本项目**不提供任何反向代理、OAuth 凭据提取/中转、账号共享、额度绕过或任何违反 Google 服务政策的能力**。所有交互均在本地通过官方 `agy acp` 协议直连你本人合法登录的 Google Antigravity CLI（或你自己的 `GEMINI_API_KEY`）。本项目的唯一目标是作为开源客户端 **Agent Harness 增强工具**，弥补 Antigravity 原生 CLI 在多平台消息接入、远程交互与日常自动化方面的体验短板。
 
 **Antigravity Gateway** turns local **Google Antigravity CLI (`agy acp`)** into an always-on, multi-platform engineering assistant. Enable any combination of the **20 built-in adapters** simultaneously via [`MultiChannelHub`](src/channels/hub.ts) — every platform runs behind NAT with **zero public domain or reverse-proxy setup required**.
 
@@ -437,9 +446,13 @@ GEMINI_API_KEY=
 HEALTH_ENABLED=false
 HEALTH_HOST=127.0.0.1
 HEALTH_PORT=18790
+# Optional Bearer token protecting GET /status diagnostics (recommended if binding beyond loopback)
+HEALTH_TOKEN=
 QUOTA_WARN_THRESHOLD=15
 
 DATA_DIR=./data
+# Optional rotating log directory override (auto-falls back to <DATA_DIR>/logs for global npm installs)
+LOG_DIR=
 LOG_LEVEL=info
 ```
 
@@ -482,15 +495,19 @@ TOOL_PROGRESS_EDIT_INTERVAL_MS=1500
 
 ### Admin CLI (`pnpm cli ...`)
 
-```powershell
+```bash
 pnpm cli start                                         # Start the gateway as a background daemon (logs/gateway.log)
 pnpm cli start --foreground                            # Run in the foreground instead
-pnpm cli stop                                          # Graceful stop (SIGTERM; taskkill fallback on Windows)
+pnpm cli stop                                          # Graceful stop with PID identity check (SIGTERM; taskkill fallback on Windows)
 pnpm cli restart                                       # Stop + start
 pnpm cli logs -n 200                                   # Tail the rotating log file
+pnpm cli service install                               # Install native autostart (macOS launchd / Linux systemd --user / Windows Task)
+pnpm cli service uninstall                             # Stop and remove the native autostart service
+pnpm cli service status                                # Check native autostart service state
+pnpm cli service print --platform darwin               # Preview generated launchd plist (or --platform linux for systemd unit)
 pnpm cli doctor                                        # Check Node, agy, and status of all 20 channels
 pnpm cli send --channel telegram --to <userId> "Hi"    # Send a one-off message through any configured channel
-pnpm cli status                                        # Query live health endpoint + local store summary
+pnpm cli status                                        # Query live health endpoint (supports HEALTH_TOKEN) + local store summary
 pnpm cli usage                                         # Zero-token Antigravity quota check
 pnpm cli pair list                                     # List pending pairing codes & approved senders
 pnpm cli pair approve ABCD2345                         # Approve an 8-character DM pairing code
@@ -498,9 +515,9 @@ pnpm cli pair revoke telegram:<userId>                  # Revoke an approved sen
 pnpm cli pair clear                                    # Clear all pending pairing requests
 ```
 
-### `GET /status` &amp; `GET /healthz` Per-Channel Health Output
+### `GET /status`, `GET /healthz` &amp; `GET /readyz` Per-Channel Health Output
 
-When `HEALTH_ENABLED=true`, [`HealthServer`](src/health.ts) serves read-only JSON on `127.0.0.1:18790` with per-channel connectivity and timestamps (no secrets or PII):
+When `HEALTH_ENABLED=true`, [`HealthServer`](src/health.ts) serves read-only JSON on `127.0.0.1:18790` with per-channel connectivity and timestamps (all error strings are redacted through `redactSecrets()`, and `/status` supports optional `Authorization: Bearer <HEALTH_TOKEN>` authentication):
 
 ```json
 {
@@ -522,7 +539,9 @@ When `HEALTH_ENABLED=true`, [`HealthServer`](src/health.ts) serves read-only JSO
 }
 ```
 
-- `GET /healthz` returns HTTP `200` (`ok: true`) when `status === "ok"` (or `503` otherwise) with a compact `{ channels: { "<name>": boolean } }` map.
+- `GET /healthz` (liveness) returns HTTP `200` (`ok: true`) while the gateway is ready and at least one channel is connected (`503` on total outage), preventing single-channel flaps from crash-looping containers.
+- `GET /readyz` (readiness) strictly returns `200` only when all configured channels are connected (`status === "ok"`).
+- `GET /status` returns full sanitized diagnostics; set `HEALTH_TOKEN` to require `Authorization: Bearer <token>` (unauthenticated non-loopback requests automatically strip `lastError` details).
 - From any chat, run `/channels` to print the live connection status, last inbound/outbound ages, and any per-channel errors for **all 20 adapters**.
 
 ---
@@ -616,30 +635,37 @@ Optional hooks (`sendTyping`, `markRead`, `react`, `editMessage`, `deleteMessage
 
 ---
 
-## Windows Autostart Scripts / Windows 开机自启脚本
+## Autostart &amp; Service Scripts / 开机自启与后台服务
 
-Portable PowerShell scripts in [`scripts/`](scripts/) resolve paths dynamically via `$PSScriptRoot` (no hardcoded user directories):
+First-class native service management on **macOS (Apple Silicon &amp; Intel `launchd`)**, **Linux (`systemd --user`)**, and **Windows (Task Scheduler)** via one command:
 
-| Script | Purpose |
-| :--- | :--- |
-| [`scripts/start-gateway.ps1`](scripts/start-gateway.ps1) | Builds `dist/index.js` if missing, then supervises the gateway with crash backoff (2s→60s) and 5 MB log rotation |
-| [`scripts/install-task.ps1`](scripts/install-task.ps1) | Registers Windows Scheduled Task `AntigravityGateway` (`AtLogOn`, hidden window, restart on failure) |
-| [`scripts/uninstall-task.ps1`](scripts/uninstall-task.ps1) | Stops and unregisters `AntigravityGateway` |
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\install-task.ps1
-powershell -ExecutionPolicy Bypass -File .\scripts\uninstall-task.ps1
+```bash
+pnpm build
+pnpm cli service install     # macOS launchd / Linux systemd --user / Windows Task Scheduler
+pnpm cli service status      # Check service status
+pnpm cli service uninstall   # Stop & remove service
 ```
+
+Or use the portable scripts in [`scripts/`](scripts/) directly (all paths resolved dynamically — zero hardcoded directories):
+
+| Platform | Script | Purpose |
+| :--- | :--- | :--- |
+| **macOS** | [`scripts/install-launchd.sh`](scripts/install-launchd.sh) / [`uninstall-launchd.sh`](scripts/uninstall-launchd.sh) | Installs/removes `~/Library/LaunchAgents/com.antigravity.gateway.plist` with Homebrew `/opt/homebrew/bin` PATH &amp; crash-only `KeepAlive` |
+| **Linux** | [`scripts/install-systemd.sh`](scripts/install-systemd.sh) / [`uninstall-systemd.sh`](scripts/uninstall-systemd.sh) | Installs/removes `~/.config/systemd/user/antigravity-gateway.service` (`Restart=on-failure`, `NoNewPrivileges=true`) |
+| **macOS &amp; Linux** | [`scripts/start-gateway.sh`](scripts/start-gateway.sh) | Bash crash-backoff supervisor (`2s`→`60s`, 5 MB log rotation, `--one-shot`) |
+| **Windows** | [`scripts/install-task.ps1`](scripts/install-task.ps1) / [`uninstall-task.ps1`](scripts/uninstall-task.ps1) | Registers/unregisters Windows Scheduled Task `AntigravityGateway` (`AtLogOn`, hidden window) |
+| **Windows** | [`scripts/start-gateway.ps1`](scripts/start-gateway.ps1) | PowerShell crash-backoff supervisor (`2s`→`60s`, 5 MB log rotation, `-OneShot`) |
 
 ---
 
 ## GitHub Actions &amp; Releases / CI 集成与发版产物
 
+- **Cross-OS CI Matrix**: Every push and pull request is verified on **Ubuntu (Node 22 &amp; 24)**, **macOS Apple Silicon (Node 24)**, **Windows (Node 24)**, **Docker build**, and **CodeQL v4 + Secret Audit**.
 - **Pre-built Container Images (GHCR)**: Every tagged release publishes a multi-architecture (`linux/amd64`, `linux/arm64`) image to `ghcr.io/relogys/antigravity-gateway:latest` (and `:vX.Y.Z`), plus precompiled npm tarballs + `SHA256SUMS.txt` on GitHub Releases.
 - **Reusable Notify Action (`.github/actions/notify`)**: Send HMAC-signed, anti-replay (`X-Webhook-Timestamp` + `X-Webhook-Id`) notifications or Agent prompts from any GitHub Actions workflow directly into your gateway's Webhook channel:
 
 ```yaml
-- uses: Relogys/Antigravity-gateway/.github/actions/notify@v0.2.0
+- uses: Relogys/Antigravity-gateway/.github/actions/notify@v0.3.0
   with:
     url: ${{ secrets.GATEWAY_WEBHOOK_URL }}
     chat-id: ops-alerts

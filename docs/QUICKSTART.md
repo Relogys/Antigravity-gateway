@@ -294,7 +294,9 @@ TOOL_PROGRESS_EDIT_INTERVAL_MS=1500       # throttle between in-place edits
 | `pnpm cli stop` | Graceful shutdown (`SIGTERM`, then `taskkill` fallback on Windows); cleans stale PID files. |
 | `pnpm cli restart` | Stop + start. |
 | `pnpm cli logs -n 200` | Print the last 200 lines of the rotating log file. |
-| `pnpm cli status` | Query the live health endpoint (`/status`) and persisted store summary. |
+| `pnpm cli service install` | Install & start the native OS autostart service (`launchd` on macOS, `systemd --user` on Linux, Task Scheduler on Windows). |
+| `pnpm cli service status` | Check native OS autostart service status (`uninstall` removes it; `print` previews templates). |
+| `pnpm cli status` | Query the live health endpoint (`/status`, supports `HEALTH_TOKEN`) and persisted store summary. |
 | `pnpm cli doctor` | Full environment / channel / allowlist / port diagnostics. |
 | `pnpm cli pair list` | List pending pairing codes and approved senders. |
 | `pnpm cli pair approve <CODE>` | Approve an 8-character pairing code. |
@@ -304,24 +306,43 @@ TOOL_PROGRESS_EDIT_INTERVAL_MS=1500       # throttle between in-place edits
 
 > 中文提示：`pnpm cli logs` 只打印日志末尾；它不是 `-f` 跟随模式。持续观察请重复执行或使用 `Get-Content -Wait` / `tail -f`。
 
-### Windows autostart / 开机自启
+### Autostart services (macOS / Linux / Windows) / 跨平台开机自启
+
+The easiest cross-platform method works identically on **macOS (Apple Silicon / Intel)**, **Linux**, and **Windows**:
+
+```bash
+pnpm build
+pnpm cli service install     # Registers launchd / systemd --user / Windows Task
+pnpm cli service status      # Inspect service status
+pnpm cli service uninstall   # Stop & remove
+```
+
+Direct OS scripts are also included:
+
+```bash
+# macOS (launchd LaunchAgent in ~/Library/LaunchAgents/com.antigravity.gateway.plist)
+bash ./scripts/install-launchd.sh
+bash ./scripts/uninstall-launchd.sh
+
+# Linux (systemd user unit in ~/.config/systemd/user/antigravity-gateway.service)
+bash ./scripts/install-systemd.sh
+bash ./scripts/uninstall-systemd.sh
+```
 
 ```powershell
-# Register a Scheduled Task ("AntigravityGateway", AtLogOn, hidden window)
+# Windows (Scheduled Task "AntigravityGateway", AtLogOn, hidden window)
 powershell -ExecutionPolicy Bypass -File .\scripts\install-task.ps1
-
-# Remove it
 powershell -ExecutionPolicy Bypass -File .\scripts\uninstall-task.ps1
 ```
 
 ### Crash-backoff supervisor / 崩溃自动重启
 
-`scripts/start-gateway.ps1` builds `dist/index.js` if missing, then supervises the gateway:
+`scripts/start-gateway.sh` (macOS &amp; Linux) and `scripts/start-gateway.ps1` (Windows) build `dist/index.js` if missing, then supervise the gateway:
 
 - Restarts on crash with **exponential backoff** (2s → 60s, capped at 60s).
 - Resets the delay after 60s of healthy runtime.
 - Rotates `logs/gateway.log` at **5 MB** (keeps `.1`–`.3`).
-- Use `-OneShot` to exit on first crash instead of restarting.
+- Use `--one-shot` (POSIX) or `-OneShot` (PowerShell) to exit on first crash instead of restarting.
 
 ---
 

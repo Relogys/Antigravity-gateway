@@ -1,5 +1,5 @@
-#!/usr/bin/env node
 // Zero-dependency sender for the "Antigravity Gateway Notify" composite action.
+// Invoked via `node send.mjs` (no shebang so Windows/macOS/Linux ESM imports stay uniform).
 //
 // Mirrors the gateway's inbound webhook auth (src/channels/webhook.ts): every
 // request carries X-Webhook-Timestamp (Unix seconds) and X-Webhook-Id, and when

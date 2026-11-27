@@ -18,44 +18,38 @@ import {
 } from "./config.js";
 import { GatewayStore } from "./gateway/store.js";
 import { tailLogFile } from "./logger.js";
+import {
+  formatPidPayload,
+  isGatewayProcess,
+  isPidAlive,
+  parsePidContent,
+  readPidFile,
+  readPidMetadata,
+  type PidMetadata,
+} from "./pid.js";
+import { runServiceCommand } from "./service.js";
 import type { HealthSnapshot } from "./types.js";
 import { runSetupWizard } from "./wizard.js";
+
+export {
+  formatPidPayload,
+  isGatewayProcess,
+  isPidAlive,
+  parsePidContent,
+  readPidFile,
+  readPidMetadata,
+  type PidMetadata,
+};
 
 const execFileAsync = promisify(execFile);
 
 /** Repo root works for both `tsx src/cli.ts` and `node dist/cli.js`. */
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
-const STARTUP_PID_TIMEOUT_MS = 3_000;
+const STARTUP_PID_TIMEOUT_MS = 5_000;
 const STOP_GRACEFUL_TIMEOUT_MS = 5_000;
 const STOP_FORCE_TIMEOUT_MS = 3_000;
 const CLI_DEFAULT_TAIL_LINES = 80;
-
-export function readPidFile(pidFile: string): number | null {
-  try {
-    const raw = fs.readFileSync(pidFile, "utf8").trim();
-    if (!/^\d+$/.test(raw)) {
-      return null;
-    }
-    const pid = Number.parseInt(raw, 10);
-    return pid > 0 ? pid : null;
-  } catch {
-    return null;
-  }
-}
-
-export function isPidAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) {
-    return false;
-  }
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    // EPERM means the process exists but belongs to another user.
-    return (err as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -72,15 +66,45 @@ async function waitForProcessExit(pid: number, timeoutMs: number): Promise<boole
   return !isPidAlive(pid);
 }
 
-function resolveDaemonPaths(dataDir: string): {
+function isDirWritable(dir: string): boolean {
+  try {
+    fs.accessSync(dir, fs.constants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export interface ResolveDaemonPathsOptions {
+  logDir?: string;
+  repoRoot?: string;
+  isWritable?: (dir: string) => boolean;
+}
+
+export function resolveDaemonPaths(
+  dataDir: string,
+  options: ResolveDaemonPathsOptions = {},
+): {
   pidFile: string;
   logFile: string;
   distEntry: string;
 } {
+  const repoRoot = options.repoRoot ? path.resolve(options.repoRoot) : REPO_ROOT;
+  const checkWritable = options.isWritable ?? isDirWritable;
+
+  let logDir: string;
+  if (options.logDir?.trim()) {
+    logDir = path.resolve(options.logDir.trim());
+  } else {
+    const insideNodeModules = /(^|[\\/])node_modules([\\/]|$)/i.test(repoRoot);
+    const repoWritable = !insideNodeModules && checkWritable(repoRoot);
+    logDir = repoWritable ? path.join(repoRoot, "logs") : path.join(dataDir, "logs");
+  }
+
   return {
     pidFile: path.join(dataDir, "gateway.pid"),
-    logFile: path.join(REPO_ROOT, "logs", "gateway.log"),
-    distEntry: path.join(REPO_ROOT, "dist", "index.js"),
+    logFile: path.join(logDir, "gateway.log"),
+    distEntry: path.join(repoRoot, "dist", "index.js"),
   };
 }
 
@@ -106,7 +130,9 @@ Usage:
   pnpm cli start [--foreground]   Start the gateway (detached unless --foreground)
   pnpm cli stop                   Stop the running gateway (data/gateway.pid)
   pnpm cli restart                Restart the gateway (stop + start)
-  pnpm cli logs [-n <lines>]      Tail logs/gateway.log (default ${CLI_DEFAULT_TAIL_LINES} lines)
+  pnpm cli logs [-n <lines>]      Tail gateway.log (default ${CLI_DEFAULT_TAIL_LINES} lines)
+  pnpm cli service [install|uninstall|status|print]
+                                  Manage native OS autostart (macOS launchd / Linux systemd / Windows Task)
   pnpm cli status                 Show live health endpoint + local store summary
   pnpm cli doctor                 Run environment & connectivity diagnostics (lists all channels)
   pnpm cli usage                  Check Antigravity quota (0 model tokens)
@@ -121,10 +147,12 @@ Usage:
 
 function getSafeEnvPaths(): {
   dataDir: string;
+  logDir?: string;
   agyBin: string;
   healthEnabled: boolean;
   healthHost: string;
   healthPort: number;
+  healthToken?: string;
   allowedCount: number;
   config?: GatewayConfig;
   enabledChannels: ChannelName[];
@@ -134,10 +162,12 @@ function getSafeEnvPaths(): {
     const cfg = loadConfig(process.env, { loadDotenv: false });
     return {
       dataDir: cfg.dataDir,
+      logDir: cfg.logDir,
       agyBin: cfg.agyBin,
       healthEnabled: cfg.healthEnabled,
       healthHost: cfg.healthHost,
       healthPort: cfg.healthPort,
+      healthToken: cfg.healthToken,
       allowedCount: cfg.allowedSenders.size,
       config: cfg,
       enabledChannels: getEnabledChannelNames(cfg),
@@ -146,14 +176,18 @@ function getSafeEnvPaths(): {
     const dataDir = process.env.DATA_DIR
       ? path.resolve(process.env.DATA_DIR)
       : path.resolve(process.cwd(), "data");
+    const rawLogDir = process.env.LOG_DIR?.trim();
+    const rawHealthToken = process.env.HEALTH_TOKEN?.trim();
     return {
       dataDir,
+      logDir: rawLogDir ? path.resolve(rawLogDir) : undefined,
       agyBin: process.env.AGY_BIN?.trim() || "agy",
       healthEnabled: ["1", "true", "yes", "on"].includes(
         (process.env.HEALTH_ENABLED ?? "").trim().toLowerCase(),
       ),
       healthHost: process.env.HEALTH_HOST?.trim() || "127.0.0.1",
       healthPort: Number.parseInt(process.env.HEALTH_PORT ?? "18790", 10) || 18790,
+      healthToken: rawHealthToken || undefined,
       allowedCount: (process.env.ALLOWED_SENDERS ?? "")
         .split(",")
         .map((s) => s.trim())
@@ -166,11 +200,18 @@ function getSafeEnvPaths(): {
 async function fetchLiveStatus(
   host: string,
   port: number,
+  token?: string,
 ): Promise<HealthSnapshot | null> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 1500);
+  const probeHost = host === "0.0.0.0" || host === "::" ? "127.0.0.1" : host;
   try {
-    const res = await fetch(`http://${host}:${port}/status`, {
+    const headers: Record<string, string> = {};
+    if (token?.trim()) {
+      headers.Authorization = `Bearer ${token.trim()}`;
+    }
+    const res = await fetch(`http://${probeHost}:${port}/status`, {
+      headers,
       signal: controller.signal,
     });
     if (!res.ok) return null;
@@ -272,7 +313,7 @@ async function runStatusCommand(): Promise<number> {
   const store = new GatewayStore(info.dataDir);
   await store.load();
 
-  const live = await fetchLiveStatus(info.healthHost, info.healthPort);
+  const live = await fetchLiveStatus(info.healthHost, info.healthPort, info.healthToken);
   if (live) {
     console.log("Live Gateway Status:");
     console.log(JSON.stringify(live, null, 2));
@@ -646,17 +687,21 @@ async function runDoctorCommand(): Promise<number> {
   return issues === 0 ? 0 : 1;
 }
 
-async function runStartCommand(rest: string[], dataDir: string): Promise<number> {
+async function runStartCommand(
+  rest: string[],
+  dataDir: string,
+  logDir?: string,
+): Promise<number> {
   const foreground = rest.includes("--foreground") || rest.includes("-f");
-  const paths = resolveDaemonPaths(dataDir);
+  const paths = resolveDaemonPaths(dataDir, { logDir });
 
-  const existingPid = readPidFile(paths.pidFile);
-  if (existingPid !== null && isPidAlive(existingPid)) {
-    console.log(`Gateway is already running (PID ${existingPid}).`);
+  const existingMeta = readPidMetadata(paths.pidFile);
+  if (existingMeta !== null && (await isGatewayProcess(existingMeta))) {
+    console.log(`Gateway is already running (PID ${existingMeta.pid}).`);
     console.log(`Log file: ${paths.logFile}`);
     return 0;
   }
-  if (existingPid !== null || fs.existsSync(paths.pidFile)) {
+  if (existingMeta !== null || fs.existsSync(paths.pidFile)) {
     fs.rmSync(paths.pidFile, { force: true });
   }
 
@@ -754,18 +799,23 @@ async function runStartCommand(rest: string[], dataDir: string): Promise<number>
     }
     return 1;
   }
-  console.log(
-    `Gateway process launched (PID ${child.pid ?? "unknown"}) but data/gateway.pid did not appear within ${STARTUP_PID_TIMEOUT_MS / 1000}s.`,
+  console.error(
+    `Gateway process launched (PID ${child.pid ?? "unknown"}) but ${paths.pidFile} did not appear within ${STARTUP_PID_TIMEOUT_MS / 1000}s.`,
   );
-  console.log(`Log file: ${paths.logFile}`);
-  return 0;
+  const tail = tailLogFile(paths.logFile, 20);
+  if (tail) {
+    console.error(`--- ${paths.logFile} (tail) ---`);
+    console.error(tail);
+  }
+  console.error(`Log file: ${paths.logFile}`);
+  return 1;
 }
 
-async function runStopCommand(dataDir: string): Promise<number> {
-  const paths = resolveDaemonPaths(dataDir);
-  const pid = readPidFile(paths.pidFile);
+async function runStopCommand(dataDir: string, logDir?: string): Promise<number> {
+  const paths = resolveDaemonPaths(dataDir, { logDir });
+  const meta = readPidMetadata(paths.pidFile);
 
-  if (pid === null) {
+  if (meta === null) {
     if (fs.existsSync(paths.pidFile)) {
       fs.rmSync(paths.pidFile, { force: true });
       console.log("Removed invalid gateway.pid; gateway is not running.");
@@ -775,9 +825,19 @@ async function runStopCommand(dataDir: string): Promise<number> {
     return 0;
   }
 
+  const { pid } = meta;
+
   if (!isPidAlive(pid)) {
     fs.rmSync(paths.pidFile, { force: true });
     console.log(`Removed stale PID file (PID ${pid} is not running). Gateway is stopped.`);
+    return 0;
+  }
+
+  if (!(await isGatewayProcess(meta))) {
+    fs.rmSync(paths.pidFile, { force: true });
+    console.log(
+      `Removed stale PID file (PID ${pid} belongs to an unrelated process; refused to signal it).`,
+    );
     return 0;
   }
 
@@ -809,17 +869,35 @@ async function runStopCommand(dataDir: string): Promise<number> {
     return 1;
   }
 
+  // On Windows, `process.kill(pid, "SIGTERM")` terminates immediately without running
+  // JS SIGTERM handlers, so write `.clean_shutdown` here to avoid a false crash notice.
+  if (process.platform === "win32") {
+    try {
+      fs.writeFileSync(
+        path.join(dataDir, ".clean_shutdown"),
+        `${new Date().toISOString()}\n`,
+        "utf8",
+      );
+    } catch {
+      // Best-effort sentinel write.
+    }
+  }
+
   fs.rmSync(paths.pidFile, { force: true });
   console.log(`Gateway stopped (PID ${pid}).`);
   return 0;
 }
 
-async function runRestartCommand(rest: string[], dataDir: string): Promise<number> {
-  const stopCode = await runStopCommand(dataDir);
+async function runRestartCommand(
+  rest: string[],
+  dataDir: string,
+  logDir?: string,
+): Promise<number> {
+  const stopCode = await runStopCommand(dataDir, logDir);
   if (stopCode !== 0) {
     return stopCode;
   }
-  return await runStartCommand(rest, dataDir);
+  return await runStartCommand(rest, dataDir, logDir);
 }
 
 function parseTailLines(args: string[]): number {
@@ -842,8 +920,8 @@ function parseTailLines(args: string[]): number {
   return CLI_DEFAULT_TAIL_LINES;
 }
 
-function runLogsCommand(args: string[], dataDir: string): number {
-  const paths = resolveDaemonPaths(dataDir);
+function runLogsCommand(args: string[], dataDir: string, logDir?: string): number {
+  const paths = resolveDaemonPaths(dataDir, { logDir });
   const content = tailLogFile(paths.logFile, parseTailLines(args));
   if (!content) {
     console.log(`No log output at ${paths.logFile} yet.`);
@@ -880,17 +958,28 @@ async function main(): Promise<void> {
       exitCode = await runSendCommand(args.slice(1));
       break;
     case "start":
-      exitCode = await runStartCommand(args.slice(1), info.dataDir);
+      exitCode = await runStartCommand(args.slice(1), info.dataDir, info.logDir);
       break;
     case "stop":
-      exitCode = await runStopCommand(info.dataDir);
+      exitCode = await runStopCommand(info.dataDir, info.logDir);
       break;
     case "restart":
-      exitCode = await runRestartCommand(args.slice(1), info.dataDir);
+      exitCode = await runRestartCommand(args.slice(1), info.dataDir, info.logDir);
       break;
     case "logs":
-      exitCode = runLogsCommand(args.slice(1), info.dataDir);
+      exitCode = runLogsCommand(args.slice(1), info.dataDir, info.logDir);
       break;
+    case "service": {
+      const paths = resolveDaemonPaths(info.dataDir, { logDir: info.logDir });
+      exitCode = await runServiceCommand(args.slice(1), {
+        repoRoot: REPO_ROOT,
+        distEntry: paths.distEntry,
+        dataDir: info.dataDir,
+        logFile: paths.logFile,
+        logDir: info.logDir,
+      });
+      break;
+    }
     case "help":
     case "--help":
     case "-h":
