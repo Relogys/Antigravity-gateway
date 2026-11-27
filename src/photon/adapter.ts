@@ -45,8 +45,17 @@ const RECONNECT_INITIAL_MS = 500;
 const RECONNECT_MAX_MS = 30 * 1000;
 const STARTUP_READY_TIMEOUT_MS = 15 * 1000;
 const CONNECT_TIMEOUT_MS = 45 * 1000;
+const DEFAULT_HEARTBEAT_TIMEOUT_MS = 180 * 1000;
 
 const URL_RE = /https?:\/\/\S+/i;
+
+function parsePositiveIntEnv(raw: string | undefined): number | undefined {
+  if (!raw) {
+    return undefined;
+  }
+  const value = Number(raw.trim());
+  return Number.isInteger(value) && value > 0 ? value : undefined;
+}
 
 const IGNORED_CONTENT_TYPES = new Set<string>([
   "read",
@@ -138,6 +147,8 @@ export class PhotonChannelAdapter implements ChannelAdapter {
   private readonly photon: PhotonConfig;
   private readonly startupTimeoutMs: number;
   private readonly connectTimeoutMs: number;
+  private readonly heartbeatTimeoutMs: number;
+  private initialProbeSpaceId?: string;
   private resolveReady?: () => void;
   private readonly mediaDir: string;
 
@@ -151,6 +162,7 @@ export class PhotonChannelAdapter implements ChannelAdapter {
   private stopping = false;
   private lastInboundAt?: number;
   private lastOutboundAt?: number;
+  private lastHeartbeatAt?: number;
   private lastError?: string;
 
   private readonly seenIds = new Map<string, number>();
@@ -160,7 +172,15 @@ export class PhotonChannelAdapter implements ChannelAdapter {
   private readonly lastUrlAtByChatId = new Map<string, number>();
   private readonly lastTypingAtByChatId = new Map<string, number>();
 
-  constructor(config: GatewayConfig, options: { startupTimeoutMs?: number; connectTimeoutMs?: number } = {}) {
+  constructor(
+    config: GatewayConfig,
+    options: {
+      startupTimeoutMs?: number;
+      connectTimeoutMs?: number;
+      heartbeatTimeoutMs?: number;
+      initialProbeSpaceId?: string;
+    } = {},
+  ) {
     if (!config.photon) {
       throw new Error(
         "Photon channel requires SPECTRUM_PROJECT_ID and SPECTRUM_PROJECT_SECRET",
@@ -170,6 +190,14 @@ export class PhotonChannelAdapter implements ChannelAdapter {
     this.photon = config.photon;
     this.startupTimeoutMs = options.startupTimeoutMs ?? STARTUP_READY_TIMEOUT_MS;
     this.connectTimeoutMs = options.connectTimeoutMs ?? CONNECT_TIMEOUT_MS;
+    this.heartbeatTimeoutMs =
+      options.heartbeatTimeoutMs ??
+      parsePositiveIntEnv(process.env.PHOTON_HEARTBEAT_TIMEOUT_MS) ??
+      DEFAULT_HEARTBEAT_TIMEOUT_MS;
+    const seededSpace =
+      options.initialProbeSpaceId ?? process.env.PHOTON_PROBE_SPACE_ID;
+    this.initialProbeSpaceId = seededSpace?.trim() || undefined;
+    this.lastHeartbeatAt = Date.now();
     this.mediaDir = path.join(config.dataDir, "media");
   }
 
@@ -177,10 +205,26 @@ export class PhotonChannelAdapter implements ChannelAdapter {
     return this.connected;
   }
 
-  getStats(): { lastInboundAt?: number; lastOutboundAt?: number; lastError?: string } {
+  /** Seeds the inbound-probe space from a persisted home chat so staleness detection arms on startup. */
+  seedProbeSpaceId(spaceId: string): void {
+    const trimmed = spaceId.trim();
+    if (!trimmed) {
+      return;
+    }
+    this.initialProbeSpaceId = trimmed;
+    this.watchdog?.setProbeSpaceId(trimmed);
+  }
+
+  getStats(): {
+    lastInboundAt?: number;
+    lastOutboundAt?: number;
+    lastHeartbeatAt?: number;
+    lastError?: string;
+  } {
     return {
       lastInboundAt: this.lastInboundAt,
       lastOutboundAt: this.lastOutboundAt,
+      lastHeartbeatAt: this.lastHeartbeatAt,
       lastError: this.lastError,
     };
   }
@@ -197,6 +241,8 @@ export class PhotonChannelAdapter implements ChannelAdapter {
     await mkdir(this.mediaDir, { recursive: true });
 
     this.watchdog = new StreamStalenessWatchdog({
+      probeSpaceId: this.initialProbeSpaceId,
+      heartbeatTimeoutMs: this.heartbeatTimeoutMs,
       probeFn: async (spaceId, probeMessageId) => {
         if (!this.app) {
           throw new Error("Spectrum app is not initialized");
@@ -206,13 +252,14 @@ export class PhotonChannelAdapter implements ChannelAdapter {
         return await space.getMessage(probeMessageId);
       },
       onZombieDetected: async ({ silentMs }) => {
-        this.lastError = `Zombie gRPC stream suspected after ${Math.round(silentMs / 1000)}s silence; reconnecting`;
-        this.connected = false;
-        const currentApp = this.app;
-        this.app = undefined;
-        if (currentApp) {
-          await currentApp.stop().catch(() => undefined);
-        }
+        await this.resetConnection(
+          `Zombie gRPC stream suspected after ${Math.round(silentMs / 1000)}s silence; reconnecting`,
+        );
+      },
+      onHeartbeatTimeout: async ({ silentHeartbeatMs }) => {
+        await this.resetConnection(
+          `Transport heartbeat missing for ${Math.round(silentHeartbeatMs / 1000)}s; reconnecting`,
+        );
       },
     });
     this.watchdog.start();
@@ -277,6 +324,20 @@ export class PhotonChannelAdapter implements ChannelAdapter {
     this.lastTypingAtByChatId.clear();
   }
 
+  /**
+   * Tears down the current Spectrum app so the background loop reconnects.
+   * Used by both zombie-inbound and heartbeat-timeout detection.
+   */
+  private async resetConnection(reason: string): Promise<void> {
+    this.lastError = reason;
+    this.connected = false;
+    const currentApp = this.app;
+    this.app = undefined;
+    if (currentApp) {
+      await currentApp.stop().catch(() => undefined);
+    }
+  }
+
   private async createSpectrumApp(): Promise<Awaited<ReturnType<typeof Spectrum>>> {
     const pending = Spectrum({
       projectId: this.photon.projectId,
@@ -284,7 +345,9 @@ export class PhotonChannelAdapter implements ChannelAdapter {
       providers: [
         imessage.config({
           onHeartbeat: () => {
-            // Keep track of healthy transport pulses without resetting inbound-silence detection
+            const heartbeatAt = Date.now();
+            this.lastHeartbeatAt = heartbeatAt;
+            this.watchdog?.recordHeartbeat(heartbeatAt);
           },
         }),
       ],
@@ -332,6 +395,8 @@ export class PhotonChannelAdapter implements ChannelAdapter {
         this.app = currentApp;
         this.connected = true;
         this.lastError = undefined;
+        this.lastHeartbeatAt = Date.now();
+        this.watchdog?.recordHeartbeat(this.lastHeartbeatAt);
         attempt = 0;
         this.resolveReady?.();
         this.resolveReady = undefined;

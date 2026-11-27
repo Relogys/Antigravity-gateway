@@ -10,13 +10,18 @@ import type {
 } from "../types.js";
 import { BaseChannelAdapter, type InboundHandler } from "./base.js";
 import {
+  MAX_INBOUND_MEDIA_BYTES,
+  downloadInboundMedia,
+  type DownloadInboundMediaResult,
+} from "./media.js";
+import {
   BoundedDedupeCache,
   MAX_INLINE_MEDIA_BYTES,
   chunkText,
+  errorMessage,
   isMentioned,
   readResponseWithinLimit,
   reconnectDelayMs,
-  saveInboundMedia,
   sleepWithAbort,
 } from "./utils.js";
 
@@ -295,7 +300,7 @@ export class MatrixChannelAdapter extends BaseChannelAdapter {
     const text = content.body ?? content.filename ?? "";
     const attachments: InboundAttachment[] = [];
     if (isMedia) {
-      attachments.push(await this.buildAttachment(event.event_id, msgtype, content));
+      attachments.push(await this.buildAttachment(msgtype, content));
     }
 
     const msg: InboundMessage = {
@@ -315,11 +320,10 @@ export class MatrixChannelAdapter extends BaseChannelAdapter {
   }
 
   private async buildAttachment(
-    msgId: string,
     msgtype: string,
     content: MatrixMessageContent,
   ): Promise<InboundAttachment> {
-    const attachment: InboundAttachment = {
+    const attachment: InboundAttachment & { kind?: string } = {
       type: msgtype === "m.image" ? "image" : msgtype === "m.audio" ? "audio" : "file",
       mimeType: content.info?.mimetype,
       name: content.filename ?? content.body,
@@ -328,14 +332,16 @@ export class MatrixChannelAdapter extends BaseChannelAdapter {
     };
     if (content.url?.startsWith("mxc://")) {
       try {
-        const data = await this.downloadMxc(content.url);
-        attachment.localPath = await saveInboundMedia(
-          this.mediaDir,
-          this.name,
-          msgId,
-          attachment.name,
-          data,
+        const media = await this.downloadMxc(
+          content.url,
+          content.filename ?? content.body,
+          content.info?.mimetype,
         );
+        attachment.localPath = media.localPath;
+        attachment.mimeType = attachment.mimeType ?? media.mimeType;
+        attachment.sizeBytes = media.sizeBytes;
+        attachment.name = attachment.name ?? media.name;
+        attachment.kind = attachment.type;
       } catch (err) {
         this.noteError(err);
       }
@@ -343,7 +349,11 @@ export class MatrixChannelAdapter extends BaseChannelAdapter {
     return attachment;
   }
 
-  private async downloadMxc(mxcUrl: string): Promise<Buffer> {
+  private async downloadMxc(
+    mxcUrl: string,
+    filenameHint?: string,
+    mimeTypeHint?: string,
+  ): Promise<DownloadInboundMediaResult> {
     const rest = mxcUrl.slice("mxc://".length);
     const slash = rest.indexOf("/");
     if (slash <= 0 || slash === rest.length - 1) {
@@ -352,27 +362,30 @@ export class MatrixChannelAdapter extends BaseChannelAdapter {
     const segments = `${encodeURIComponent(rest.slice(0, slash))}/${encodeURIComponent(
       rest.slice(slash + 1),
     )}`;
-
-    const signal = AbortSignal.any([AbortSignal.timeout(30_000), this.lifecycle.signal]);
-    let res = await this.fetchImpl(
-      `${this.hsUrl()}/_matrix/client/v1/media/download/${segments}`,
-      { headers: this.authHeaders(), signal },
-    );
-    if (!res.ok) {
-      res = await this.fetchImpl(`${this.hsUrl()}/_matrix/media/v3/download/${segments}`, {
-        headers: this.authHeaders(),
-        signal,
+    const options = {
+      mediaDir: this.mediaDir,
+      headers: this.authHeaders(),
+      filenameHint,
+      mimeTypeHint,
+      maxBytes: MAX_INBOUND_MEDIA_BYTES,
+      fetchImpl: this.fetchImpl,
+      signal: this.lifecycle.signal,
+    };
+    try {
+      return await downloadInboundMedia({
+        url: `${this.hsUrl()}/_matrix/client/v1/media/download/${segments}`,
+        ...options,
+      });
+    } catch (err) {
+      if (!/HTTP 404\b/.test(errorMessage(err))) {
+        throw err;
+      }
+      // Older homeservers may not expose the authenticated v1 media endpoint yet.
+      return await downloadInboundMedia({
+        url: `${this.hsUrl()}/_matrix/media/v3/download/${segments}`,
+        ...options,
       });
     }
-    if (!res.ok) {
-      throw new Error(`Matrix media download failed with HTTP ${res.status}`);
-    }
-
-    const declared = Number(res.headers.get("content-length") ?? 0);
-    if (declared > MAX_INLINE_MEDIA_BYTES) {
-      throw new Error(`Matrix media exceeds ${MAX_INLINE_MEDIA_BYTES} bytes`);
-    }
-    return readResponseWithinLimit(res, MAX_INLINE_MEDIA_BYTES);
   }
 
   private isDirectRoom(roomId: string, room: MatrixJoinedRoom): boolean {

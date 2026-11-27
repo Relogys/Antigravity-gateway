@@ -3,19 +3,30 @@ import { randomUUID } from "node:crypto";
 const DEFAULT_SILENCE_THRESHOLD_MS = 10 * 60 * 1000;
 const DEFAULT_PROBE_INTERVAL_MS = 60 * 1000;
 const DEFAULT_PROBE_COOLDOWN_MS = 5 * 60 * 1000;
+const DEFAULT_HEARTBEAT_TIMEOUT_MS = 180 * 1000;
 
-export type ProbeOutcome = "ok" | "skipped" | "zombie" | "offline";
+export type ProbeOutcome =
+  | "ok"
+  | "skipped"
+  | "zombie"
+  | "offline"
+  | "heartbeat_timeout";
 
 export interface StreamStalenessWatchdogOptions {
   silenceThresholdMs?: number;
   probeIntervalMs?: number;
   probeCooldownMs?: number;
   probeSpaceId?: string;
+  /** Transport heartbeat timeout in ms (default 180_000; 0 disables the probe). */
+  heartbeatTimeoutMs?: number;
   probeFn: (spaceId: string, probeMessageId: string) => Promise<unknown>;
   onZombieDetected: (info: {
     silentMs: number;
     probeMessageId: string;
     spaceId: string;
+  }) => void | Promise<void>;
+  onHeartbeatTimeout?: (info: {
+    silentHeartbeatMs: number;
   }) => void | Promise<void>;
   nowFn?: () => number;
 }
@@ -77,12 +88,16 @@ export class StreamStalenessWatchdog {
   private readonly silenceThresholdMs: number;
   private readonly probeIntervalMs: number;
   private readonly probeCooldownMs: number;
+  private readonly heartbeatTimeoutMs: number;
   private readonly probeFn: StreamStalenessWatchdogOptions["probeFn"];
   private readonly onZombieDetected: StreamStalenessWatchdogOptions["onZombieDetected"];
+  private readonly onHeartbeatTimeout?: StreamStalenessWatchdogOptions["onHeartbeatTimeout"];
   private readonly nowFn: () => number;
 
   private probeSpaceId?: string;
   private lastInboundAt: number;
+  private lastHeartbeatAt: number;
+  private lastHeartbeatTimeoutAt?: number;
   private lastProbeAt?: number;
   private timer?: ReturnType<typeof setInterval>;
   private running = false;
@@ -93,15 +108,28 @@ export class StreamStalenessWatchdog {
       options.silenceThresholdMs ?? DEFAULT_SILENCE_THRESHOLD_MS;
     this.probeIntervalMs = options.probeIntervalMs ?? DEFAULT_PROBE_INTERVAL_MS;
     this.probeCooldownMs = options.probeCooldownMs ?? DEFAULT_PROBE_COOLDOWN_MS;
+    this.heartbeatTimeoutMs =
+      options.heartbeatTimeoutMs ?? DEFAULT_HEARTBEAT_TIMEOUT_MS;
     this.probeSpaceId = options.probeSpaceId;
     this.probeFn = options.probeFn;
     this.onZombieDetected = options.onZombieDetected;
+    this.onHeartbeatTimeout = options.onHeartbeatTimeout;
     this.nowFn = options.nowFn ?? Date.now;
     this.lastInboundAt = this.nowFn();
+    this.lastHeartbeatAt = this.nowFn();
   }
 
   recordInbound(at?: number): void {
     this.lastInboundAt = at ?? this.nowFn();
+  }
+
+  /**
+   * Records a transport heartbeat. This intentionally does NOT touch
+   * `lastInboundAt`: a half-open stream can keep pulsing heartbeats while
+   * dropping inbound messages, so inbound-silence detection must stay armed.
+   */
+  recordHeartbeat(at?: number): void {
+    this.lastHeartbeatAt = at ?? this.nowFn();
   }
 
   setProbeSpaceId(spaceId: string): void {
@@ -112,12 +140,14 @@ export class StreamStalenessWatchdog {
 
   getState(): {
     lastInboundAt: number;
+    lastHeartbeatAt: number;
     lastProbeAt?: number;
     probeSpaceId?: string;
     running: boolean;
   } {
     return {
       lastInboundAt: this.lastInboundAt,
+      lastHeartbeatAt: this.lastHeartbeatAt,
       lastProbeAt: this.lastProbeAt,
       probeSpaceId: this.probeSpaceId,
       running: this.running,
@@ -130,6 +160,7 @@ export class StreamStalenessWatchdog {
     }
     this.running = true;
     this.lastInboundAt = this.nowFn();
+    this.lastHeartbeatAt = this.nowFn();
     this.timer = setInterval(() => {
       void this.checkOnce();
     }, this.probeIntervalMs);
@@ -149,12 +180,39 @@ export class StreamStalenessWatchdog {
       return "skipped";
     }
 
+    const now = this.nowFn();
+
+    // Cold-start & transport protection: fire even before probeSpaceId is known,
+    // since a gateway that never received an inbound message still needs to
+    // notice a dead heartbeat stream.
+    if (this.heartbeatTimeoutMs > 0) {
+      const silentHeartbeatMs = now - this.lastHeartbeatAt;
+      if (silentHeartbeatMs >= this.heartbeatTimeoutMs) {
+        if (
+          this.lastHeartbeatTimeoutAt !== undefined &&
+          now - this.lastHeartbeatTimeoutAt < this.probeCooldownMs
+        ) {
+          return "skipped";
+        }
+        this.lastHeartbeatTimeoutAt = now;
+        if (this.onHeartbeatTimeout) {
+          await this.onHeartbeatTimeout({ silentHeartbeatMs });
+        } else {
+          await this.onZombieDetected({
+            silentMs: silentHeartbeatMs,
+            probeMessageId: `heartbeat-${randomUUID()}`,
+            spaceId: this.probeSpaceId ?? "",
+          });
+        }
+        return "heartbeat_timeout";
+      }
+    }
+
     const spaceId = this.probeSpaceId;
     if (!spaceId) {
       return "skipped";
     }
 
-    const now = this.nowFn();
     const silentMs = now - this.lastInboundAt;
     if (silentMs < this.silenceThresholdMs) {
       return "ok";

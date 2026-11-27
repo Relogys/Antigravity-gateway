@@ -32,7 +32,7 @@ import {
 } from "./scheduler.js";
 import type { GatewayStore } from "./store.js";
 
-const TYPING_KEEPALIVE_MS = 4000;
+const DEFAULT_TYPING_INTERVAL_MS = 5000;
 const QUOTA_CHECK_INTERVAL_MS = 5 * 60 * 1000;
 const GATEWAY_VERSION = "0.1.0";
 const MAX_SESSION_LIST_CACHE = 500;
@@ -81,6 +81,8 @@ export interface GatewayRouterDeps {
   scheduler: LoopScheduler;
   quotaFetcher?: () => Promise<QuotaSummary>;
   version?: string;
+  /** Typing refresh cadence during long ACP turns (default 5000ms; 0 disables). */
+  typingIntervalMs?: number;
 }
 
 const ALWAYS_DISPATCHABLE_COMMANDS = new Set([
@@ -168,6 +170,7 @@ export class GatewayRouter {
   private readonly scheduler: LoopScheduler;
   private readonly quotaFetcher: () => Promise<QuotaSummary>;
   private readonly version: string;
+  private readonly typingIntervalMs: number;
 
   private readonly startedAt = Date.now();
   private ready = false;
@@ -193,6 +196,8 @@ export class GatewayRouter {
     this.store = deps.store;
     this.scheduler = deps.scheduler;
     this.version = deps.version ?? GATEWAY_VERSION;
+    this.typingIntervalMs =
+      deps.typingIntervalMs ?? DEFAULT_TYPING_INTERVAL_MS;
     this.quotaFetcher =
       deps.quotaFetcher ??
       (() =>
@@ -1364,9 +1369,12 @@ export class GatewayRouter {
     let typingTimer: ReturnType<typeof setInterval> | undefined;
     if (this.channel.sendTyping) {
       this.channel.sendTyping(chatId, true).catch(() => {});
-      typingTimer = setInterval(() => {
-        this.channel.sendTyping?.(chatId, true).catch(() => {});
-      }, TYPING_KEEPALIVE_MS);
+      if (this.typingIntervalMs > 0) {
+        typingTimer = setInterval(() => {
+          void this.channel.sendTyping?.(chatId, true).catch(() => {});
+        }, this.typingIntervalMs);
+        typingTimer.unref?.();
+      }
     }
 
     const stored = this.store.getSession(chatId);

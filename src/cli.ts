@@ -1,8 +1,9 @@
 #!/usr/bin/env node
-import { execFile } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import dotenv from "dotenv";
 import { fetchAgyQuota, formatQuotaSummary } from "./acp/quota.js";
@@ -16,9 +17,83 @@ import {
   type GatewayConfig,
 } from "./config.js";
 import { GatewayStore } from "./gateway/store.js";
+import { tailLogFile } from "./logger.js";
 import type { HealthSnapshot } from "./types.js";
 
 const execFileAsync = promisify(execFile);
+
+/** Repo root works for both `tsx src/cli.ts` and `node dist/cli.js`. */
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+const STARTUP_PID_TIMEOUT_MS = 3_000;
+const STOP_GRACEFUL_TIMEOUT_MS = 5_000;
+const STOP_FORCE_TIMEOUT_MS = 3_000;
+const CLI_DEFAULT_TAIL_LINES = 80;
+
+export function readPidFile(pidFile: string): number | null {
+  try {
+    const raw = fs.readFileSync(pidFile, "utf8").trim();
+    if (!/^\d+$/.test(raw)) {
+      return null;
+    }
+    const pid = Number.parseInt(raw, 10);
+    return pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+export function isPidAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    // EPERM means the process exists but belongs to another user.
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForProcessExit(pid: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!isPidAlive(pid)) {
+      return true;
+    }
+    await delay(100);
+  }
+  return !isPidAlive(pid);
+}
+
+function resolveDaemonPaths(dataDir: string): {
+  pidFile: string;
+  logFile: string;
+  distEntry: string;
+} {
+  return {
+    pidFile: path.join(dataDir, "gateway.pid"),
+    logFile: path.join(REPO_ROOT, "logs", "gateway.log"),
+    distEntry: path.join(REPO_ROOT, "dist", "index.js"),
+  };
+}
+
+function isMainModule(): boolean {
+  const entry = process.argv[1];
+  if (!entry) {
+    return false;
+  }
+  try {
+    return fs.realpathSync(entry) === fs.realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
 
 function printUsage(): void {
   console.log(`Antigravity Gateway Admin CLI
@@ -33,6 +108,10 @@ Usage:
   pnpm cli doctor                 Run environment & connectivity diagnostics (lists all channels)
   pnpm cli send --channel <name> --to <chatId> <text>
                                   Send a one-off message through a configured channel
+  pnpm cli start [--foreground]   Start the gateway (detached unless --foreground)
+  pnpm cli stop                   Stop the running gateway (data/gateway.pid)
+  pnpm cli restart                Restart the gateway (stop + start)
+  pnpm cli logs [-n <lines>]      Tail logs/gateway.log (default ${CLI_DEFAULT_TAIL_LINES} lines)
 `);
 }
 
@@ -453,6 +532,213 @@ async function runDoctorCommand(): Promise<number> {
   return issues === 0 ? 0 : 1;
 }
 
+async function runStartCommand(rest: string[], dataDir: string): Promise<number> {
+  const foreground = rest.includes("--foreground") || rest.includes("-f");
+  const paths = resolveDaemonPaths(dataDir);
+
+  const existingPid = readPidFile(paths.pidFile);
+  if (existingPid !== null && isPidAlive(existingPid)) {
+    console.log(`Gateway is already running (PID ${existingPid}).`);
+    console.log(`Log file: ${paths.logFile}`);
+    return 0;
+  }
+  if (existingPid !== null || fs.existsSync(paths.pidFile)) {
+    fs.rmSync(paths.pidFile, { force: true });
+  }
+
+  if (!fs.existsSync(paths.distEntry)) {
+    console.error(`Built entry point not found: ${paths.distEntry}`);
+    console.error("Build the gateway first: pnpm build");
+    return 1;
+  }
+
+  if (foreground) {
+    console.log(`Starting gateway in foreground (${paths.distEntry}). Press Ctrl+C to stop.`);
+    return await new Promise<number>((resolve) => {
+      const child = spawn(process.execPath, [paths.distEntry], {
+        cwd: REPO_ROOT,
+        stdio: "inherit",
+      });
+      child.on("error", (err) => {
+        console.error(`Failed to launch gateway: ${err.message}`);
+        resolve(1);
+      });
+      child.on("exit", (code, signal) => {
+        if (signal) {
+          console.log(`Gateway exited after signal ${signal}.`);
+        }
+        resolve(code ?? 1);
+      });
+    });
+  }
+
+  fs.mkdirSync(path.dirname(paths.logFile), { recursive: true });
+  fs.appendFileSync(
+    paths.logFile,
+    `${new Date().toISOString()} [cli] starting gateway in background\n`,
+    "utf8",
+  );
+
+  const logFd = fs.openSync(paths.logFile, "a");
+  let child: ChildProcess;
+  try {
+    child = spawn(process.execPath, [paths.distEntry], {
+      cwd: REPO_ROOT,
+      detached: true,
+      windowsHide: true,
+      stdio: ["ignore", logFd, logFd],
+    });
+  } finally {
+    fs.closeSync(logFd);
+  }
+
+  const state: {
+    error: Error | null;
+    exit: { code: number | null; signal: NodeJS.Signals | null } | null;
+  } = { error: null, exit: null };
+  child.on("error", (err) => {
+    state.error = err;
+  });
+  child.on("exit", (code, signal) => {
+    state.exit = { code, signal };
+  });
+  child.unref();
+
+  const deadline = Date.now() + STARTUP_PID_TIMEOUT_MS;
+  let runningPid: number | null = null;
+  while (Date.now() < deadline) {
+    if (state.error !== null || state.exit !== null) {
+      break;
+    }
+    const pidFromFile = readPidFile(paths.pidFile);
+    if (pidFromFile !== null && isPidAlive(pidFromFile)) {
+      runningPid = pidFromFile;
+      break;
+    }
+    await delay(100);
+  }
+
+  if (runningPid !== null) {
+    console.log(`Gateway started in background (PID ${runningPid}).`);
+    console.log(`Log file: ${paths.logFile}`);
+    console.log("Stop with: pnpm cli stop");
+    return 0;
+  }
+  if (state.error !== null) {
+    console.error(`Failed to launch gateway: ${state.error.message}`);
+    return 1;
+  }
+  if (state.exit !== null) {
+    const { code, signal } = state.exit;
+    console.error(
+      `Gateway exited during startup (code=${code === null ? "null" : code}${signal ? `, signal=${signal}` : ""}).`,
+    );
+    const tail = tailLogFile(paths.logFile, 20);
+    if (tail) {
+      console.error(`--- ${paths.logFile} (tail) ---`);
+      console.error(tail);
+    }
+    return 1;
+  }
+  console.log(
+    `Gateway process launched (PID ${child.pid ?? "unknown"}) but data/gateway.pid did not appear within ${STARTUP_PID_TIMEOUT_MS / 1000}s.`,
+  );
+  console.log(`Log file: ${paths.logFile}`);
+  return 0;
+}
+
+async function runStopCommand(dataDir: string): Promise<number> {
+  const paths = resolveDaemonPaths(dataDir);
+  const pid = readPidFile(paths.pidFile);
+
+  if (pid === null) {
+    if (fs.existsSync(paths.pidFile)) {
+      fs.rmSync(paths.pidFile, { force: true });
+      console.log("Removed invalid gateway.pid; gateway is not running.");
+    } else {
+      console.log("Gateway is not running (no PID file).");
+    }
+    return 0;
+  }
+
+  if (!isPidAlive(pid)) {
+    fs.rmSync(paths.pidFile, { force: true });
+    console.log(`Removed stale PID file (PID ${pid} is not running). Gateway is stopped.`);
+    return 0;
+  }
+
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ESRCH") {
+      console.error(
+        `Failed to signal PID ${pid}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return 1;
+    }
+  }
+
+  let exited = await waitForProcessExit(pid, STOP_GRACEFUL_TIMEOUT_MS);
+  if (!exited && process.platform === "win32") {
+    try {
+      await execFileAsync("taskkill", ["/PID", String(pid), "/T", "/F"], {
+        windowsHide: true,
+      });
+    } catch {
+      // taskkill reports failure if the process already exited; the wait decides.
+    }
+    exited = await waitForProcessExit(pid, STOP_FORCE_TIMEOUT_MS);
+  }
+
+  if (!exited) {
+    console.error(`Gateway (PID ${pid}) did not exit; leaving ${paths.pidFile} in place.`);
+    return 1;
+  }
+
+  fs.rmSync(paths.pidFile, { force: true });
+  console.log(`Gateway stopped (PID ${pid}).`);
+  return 0;
+}
+
+async function runRestartCommand(rest: string[], dataDir: string): Promise<number> {
+  const stopCode = await runStopCommand(dataDir);
+  if (stopCode !== 0) {
+    return stopCode;
+  }
+  return await runStartCommand(rest, dataDir);
+}
+
+function parseTailLines(args: string[]): number {
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i] ?? "";
+    const value =
+      arg === "-n" || arg === "--lines" || arg === "--tail"
+        ? args[i + 1]
+        : arg.startsWith("-n=")
+          ? arg.slice(3)
+          : undefined;
+    if (value === undefined) {
+      continue;
+    }
+    const parsed = Number.parseInt(value, 10);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  return CLI_DEFAULT_TAIL_LINES;
+}
+
+function runLogsCommand(args: string[], dataDir: string): number {
+  const paths = resolveDaemonPaths(dataDir);
+  const content = tailLogFile(paths.logFile, parseTailLines(args));
+  if (!content) {
+    console.log(`No log output at ${paths.logFile} yet.`);
+    return 0;
+  }
+  console.log(content);
+  return 0;
+}
+
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const cmd = (args[0] ?? "help").toLowerCase();
@@ -475,6 +761,18 @@ async function main(): Promise<void> {
     case "send":
       exitCode = await runSendCommand(args.slice(1));
       break;
+    case "start":
+      exitCode = await runStartCommand(args.slice(1), info.dataDir);
+      break;
+    case "stop":
+      exitCode = await runStopCommand(info.dataDir);
+      break;
+    case "restart":
+      exitCode = await runRestartCommand(args.slice(1), info.dataDir);
+      break;
+    case "logs":
+      exitCode = runLogsCommand(args.slice(1), info.dataDir);
+      break;
     case "help":
     case "--help":
     case "-h":
@@ -490,7 +788,9 @@ async function main(): Promise<void> {
   process.exitCode = exitCode;
 }
 
-main().catch((err) => {
-  console.error(err instanceof Error ? err.message : String(err));
-  process.exitCode = 1;
-});
+if (isMainModule()) {
+  main().catch((err) => {
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exitCode = 1;
+  });
+}

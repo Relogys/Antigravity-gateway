@@ -72,6 +72,7 @@ export class HealthServer {
                     connected: c.connected,
                     lastInboundAt: c.lastInboundAt,
                     lastOutboundAt: c.lastOutboundAt,
+                    lastHeartbeatAt: c.lastHeartbeatAt,
                     lastError: c.lastError,
                   },
                 ]),

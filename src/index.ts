@@ -9,6 +9,7 @@ import { GatewayRouter } from "./gateway/router.js";
 import { LoopScheduler } from "./gateway/scheduler.js";
 import { GatewayStore } from "./gateway/store.js";
 import { HealthServer } from "./health.js";
+import { redactSecrets } from "./logger.js";
 import type { PendingPermission } from "./types.js";
 
 function isProcessAlive(pid: number): boolean {
@@ -103,6 +104,19 @@ async function main(): Promise<void> {
           "Set credentials for at least one channel in .env (see .env.example).",
       );
     }
+    const homeChatId = store.getHomeChatId();
+    if (homeChatId) {
+      const photonAdapter = adapters.find((a) => a.name === "photon") as
+        | { seedProbeSpaceId?: (spaceId: string) => void }
+        | undefined;
+      if (photonAdapter?.seedProbeSpaceId) {
+        if (homeChatId.startsWith("photon::")) {
+          photonAdapter.seedProbeSpaceId(homeChatId.slice("photon::".length));
+        } else if (!homeChatId.includes("::")) {
+          photonAdapter.seedProbeSpaceId(homeChatId);
+        }
+      }
+    }
     channel = new MultiChannelHub(adapters, {
       // Unqualified legacy chat ids (pre-hub stores) belong to the iMessage channel.
       defaultChannel: config.photon ? "photon" : undefined,
@@ -144,6 +158,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
-  console.error("[gateway] Fatal error:", err instanceof Error ? err.message : String(err));
+  console.error("[gateway] Fatal error:", redactSecrets(err instanceof Error ? err.message : String(err)));
   process.exit(1);
 });

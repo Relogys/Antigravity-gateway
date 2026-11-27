@@ -8,6 +8,7 @@ import type {
   OutboundMessage,
 } from "../types.js";
 import { BaseChannelAdapter, type InboundHandler } from "./base.js";
+import { MAX_INBOUND_MEDIA_BYTES, downloadInboundMedia } from "./media.js";
 import {
   BoundedDedupeCache,
   MAX_INLINE_MEDIA_BYTES,
@@ -73,6 +74,7 @@ export type DiscordClientFactory = (config: {
 export interface DiscordAdapterOptions {
   clientFactory?: DiscordClientFactory;
   download?: (url: string, options?: DownloadOptions) => Promise<Buffer>;
+  fetchImpl?: typeof fetch;
   mediaDir?: string;
   /** Max wait for the gateway "ready" event after login (ms). */
   readyTimeoutMs?: number;
@@ -124,6 +126,16 @@ function iterateAttachments(
   return [...(source as Iterable<DiscordAttachmentLike>)];
 }
 
+const IMAGE_EXT_RE = /\.(png|jpe?g|webp|gif)$/i;
+
+function isInboundImage(att: DiscordAttachmentLike): boolean {
+  if (att.contentType?.toLowerCase().startsWith("image/")) {
+    return true;
+  }
+  const name = att.name ?? att.url.split("?")[0] ?? "";
+  return IMAGE_EXT_RE.test(name);
+}
+
 export class DiscordChannelAdapter extends BaseChannelAdapter {
   readonly name = "discord";
 
@@ -131,7 +143,9 @@ export class DiscordChannelAdapter extends BaseChannelAdapter {
   private readonly groupMentionPatterns: string[];
   private readonly clientFactory: DiscordClientFactory;
   private readonly download: NonNullable<DiscordAdapterOptions["download"]>;
+  private readonly fetchImpl: typeof fetch;
   private readonly mediaDir: string;
+  private readonly useInboundMediaBridge: boolean;
   private readonly readyTimeoutMs: number;
   private readonly dedupe = new BoundedDedupeCache();
 
@@ -147,7 +161,10 @@ export class DiscordChannelAdapter extends BaseChannelAdapter {
     this.groupMentionPatterns = config.groupMentionPatterns ?? [];
     this.clientFactory = options.clientFactory ?? defaultClientFactory;
     this.download = options.download ?? downloadToBuffer;
+    this.fetchImpl = options.fetchImpl ?? ((input, init) => fetch(input, init));
     this.mediaDir = options.mediaDir ?? path.join(config.dataDir, "media");
+    // An injected downloader is a test seam; production uses the media bridge.
+    this.useInboundMediaBridge = options.download === undefined;
     this.readyTimeoutMs = options.readyTimeoutMs ?? READY_WAIT_MS;
   }
 
@@ -366,6 +383,33 @@ export class DiscordChannelAdapter extends BaseChannelAdapter {
   private async collectAttachments(message: DiscordMessageLike): Promise<InboundAttachment[]> {
     const out: InboundAttachment[] = [];
     for (const att of iterateAttachments(message.attachments)) {
+      if (this.useInboundMediaBridge && isInboundImage(att)) {
+        try {
+          if ((att.size ?? 0) > MAX_INBOUND_MEDIA_BYTES) {
+            throw new Error(`Discord attachment exceeds ${MAX_INBOUND_MEDIA_BYTES} bytes`);
+          }
+          const media = await downloadInboundMedia({
+            url: att.url,
+            mediaDir: this.mediaDir,
+            filenameHint: att.name ?? undefined,
+            mimeTypeHint: att.contentType ?? undefined,
+            fetchImpl: this.fetchImpl,
+          });
+          out.push({
+            type: "image",
+            kind: "image",
+            mimeType: media.mimeType,
+            name: media.name,
+            sizeBytes: media.sizeBytes,
+            localPath: media.localPath,
+            url: att.url,
+          } as InboundAttachment);
+        } catch (err) {
+          this.noteError(err);
+        }
+        continue;
+      }
+
       try {
         if ((att.size ?? 0) > MAX_INLINE_MEDIA_BYTES) {
           throw new Error(`Discord attachment exceeds ${MAX_INLINE_MEDIA_BYTES} bytes`);

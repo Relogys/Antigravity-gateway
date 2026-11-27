@@ -62,7 +62,12 @@ export interface ChannelAdapter {
   editMessage?(chatId: string, messageId: string, text: string): Promise<void>;
   isConnected(): boolean;
   /** Optional per-channel counters surfaced by `/channels`, health, and the hub. */
-  getStats?(): { lastInboundAt?: number; lastOutboundAt?: number; lastError?: string };
+  getStats?(): {
+    lastInboundAt?: number;
+    lastOutboundAt?: number;
+    lastHeartbeatAt?: number;
+    lastError?: string;
+  };
 }
 
 export interface ChannelHealthStatus {
@@ -70,6 +75,7 @@ export interface ChannelHealthStatus {
   connected: boolean;
   lastInboundAt?: number;
   lastOutboundAt?: number;
+  lastHeartbeatAt?: number;
   lastError?: string;
 }
 

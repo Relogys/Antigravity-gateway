@@ -10,6 +10,7 @@ import type {
   OutboundMessage,
 } from "../types.js";
 import { BaseChannelAdapter, type InboundHandler } from "./base.js";
+import { MAX_INBOUND_MEDIA_BYTES, downloadInboundMedia } from "./media.js";
 import {
   BoundedDedupeCache,
   MAX_INLINE_MEDIA_BYTES,
@@ -125,6 +126,7 @@ export class TelegramChannelAdapter extends BaseChannelAdapter {
   private readonly fetchImpl: FetchLike;
   private readonly download: NonNullable<TelegramAdapterOptions["download"]>;
   private readonly mediaDir: string;
+  private readonly useInboundMediaBridge: boolean;
   private readonly apiBase: string;
   private readonly backoff: (attempt: number) => number;
   private readonly dedupe = new BoundedDedupeCache();
@@ -146,6 +148,8 @@ export class TelegramChannelAdapter extends BaseChannelAdapter {
     this.fetchImpl = options.fetchImpl ?? ((input, init) => fetch(input, init));
     this.download = options.download ?? downloadToBuffer;
     this.mediaDir = options.mediaDir ?? path.join(config.dataDir, "media");
+    // An injected downloader is a test seam; production uses the media bridge.
+    this.useInboundMediaBridge = options.download === undefined;
     this.apiBase = options.apiBase ?? TELEGRAM_API;
     this.backoff = options.backoffMs ?? ((attempt) => reconnectDelayMs(attempt));
   }
@@ -421,6 +425,38 @@ export class TelegramChannelAdapter extends BaseChannelAdapter {
 
     const out: InboundAttachment[] = [];
     for (const job of jobs) {
+      if (this.useInboundMediaBridge && job.kind === "image") {
+        try {
+          if ((job.ref.file_size ?? 0) > MAX_INBOUND_MEDIA_BYTES) {
+            throw new Error(`Telegram file ${job.name} exceeds ${MAX_INBOUND_MEDIA_BYTES} bytes`);
+          }
+          const file = await this.call<{ file_path?: string }>("getFile", {
+            file_id: job.ref.file_id,
+          });
+          if (!file.file_path) {
+            throw new Error("Telegram getFile returned no file_path");
+          }
+          const media = await downloadInboundMedia({
+            url: `${this.apiBase}/file/bot${this.token}/${file.file_path}`,
+            mediaDir: this.mediaDir,
+            filenameHint: job.name,
+            mimeTypeHint: job.mime,
+            fetchImpl: this.fetchImpl as unknown as typeof fetch,
+          });
+          out.push({
+            type: "image",
+            kind: "image",
+            mimeType: media.mimeType,
+            name: media.name,
+            sizeBytes: media.sizeBytes,
+            localPath: media.localPath,
+          } as InboundAttachment);
+        } catch (err) {
+          this.noteError(err);
+        }
+        continue;
+      }
+
       try {
         if ((job.ref.file_size ?? 0) > MAX_INLINE_MEDIA_BYTES) {
           throw new Error(`Telegram file ${job.name} exceeds ${MAX_INLINE_MEDIA_BYTES} bytes`);

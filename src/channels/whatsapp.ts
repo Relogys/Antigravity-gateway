@@ -1,6 +1,7 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import http from "node:http";
+import path from "node:path";
 import type { GatewayConfig, WhatsAppConfig } from "../config.js";
 import type {
   AttachmentKind,
@@ -11,6 +12,7 @@ import type {
   OutboundMessage,
 } from "../types.js";
 import { BaseChannelAdapter, type InboundHandler } from "./base.js";
+import { downloadInboundMedia } from "./media.js";
 import {
   BoundedDedupeCache,
   chunkText,
@@ -188,6 +190,7 @@ export class WhatsAppChannelAdapter extends BaseChannelAdapter {
 
   private readonly whatsappConfig: WhatsAppConfig;
   private readonly fetchImpl: typeof fetch;
+  private readonly mediaDir: string;
   private readonly dedupe = new BoundedDedupeCache();
   private readonly inFlight = new Set<Promise<void>>();
   private server?: http.Server;
@@ -206,6 +209,7 @@ export class WhatsAppChannelAdapter extends BaseChannelAdapter {
     }
     this.whatsappConfig = cfg;
     this.fetchImpl = options.fetchImpl ?? ((...args) => fetch(...args));
+    this.mediaDir = path.join(config.dataDir, "media");
   }
 
   getPort(): number | null {
@@ -416,6 +420,7 @@ export class WhatsAppChannelAdapter extends BaseChannelAdapter {
     if (!text.trim() && attachments.length === 0) {
       return;
     }
+    await this.enrichInboundImage(msg, attachments);
 
     const contacts = Array.isArray(value.contacts) ? value.contacts : [];
     const profileName =
@@ -447,6 +452,68 @@ export class WhatsAppChannelAdapter extends BaseChannelAdapter {
       },
     };
     await this.emit(inbound);
+  }
+
+  /**
+   * Best-effort download of inbound images: resolve the short-lived media URL
+   * from the Graph API, then stream the bytes into the media dir. Failures are
+   * logged only so the caption/text message is always still emitted.
+   */
+  private async enrichInboundImage(
+    msg: WhatsAppMessage,
+    attachments: InboundAttachment[],
+  ): Promise<void> {
+    const mediaId = msg.type === "image" ? msg.image?.id : undefined;
+    if (!mediaId) {
+      return;
+    }
+    const headers = { Authorization: `Bearer ${this.whatsappConfig.accessToken}` };
+    const { apiVersion } = this.whatsappConfig;
+    try {
+      const metaRes = await this.fetchImpl(
+        `${GRAPH_BASE}/${encodeURIComponent(apiVersion)}/${encodeURIComponent(mediaId)}`,
+        { headers, signal: AbortSignal.timeout(SEND_TIMEOUT_MS) },
+      );
+      if (!metaRes.ok) {
+        throw new Error(`WhatsApp media metadata failed with HTTP ${metaRes.status}`);
+      }
+      const meta = (await metaRes.json().catch(() => undefined)) as
+        | { url?: unknown; mime_type?: unknown }
+        | undefined;
+      if (typeof meta?.url !== "string" || !meta.url) {
+        throw new Error("WhatsApp media metadata did not include a url");
+      }
+      const media = await downloadInboundMedia({
+        url: meta.url,
+        mediaDir: this.mediaDir,
+        headers,
+        filenameHint: msg.image?.filename ?? `whatsapp-${mediaId}`,
+        mimeTypeHint:
+          typeof meta.mime_type === "string" ? meta.mime_type : msg.image?.mime_type,
+        fetchImpl: this.fetchImpl,
+        signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
+      });
+      const target = attachments.find((att) => att.type === "image") as
+        | (InboundAttachment & { kind?: string })
+        | undefined;
+      if (target) {
+        target.localPath = media.localPath;
+        target.mimeType = target.mimeType ?? media.mimeType;
+        target.sizeBytes = target.sizeBytes ?? media.sizeBytes;
+        target.kind = "image";
+      } else {
+        attachments.push({
+          type: "image",
+          kind: "image",
+          mimeType: media.mimeType,
+          name: media.name,
+          sizeBytes: media.sizeBytes,
+          localPath: media.localPath,
+        } as InboundAttachment);
+      }
+    } catch (err) {
+      this.noteError(err);
+    }
   }
 
   // -------------------------------------------------------------- outbound
