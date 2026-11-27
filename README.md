@@ -38,6 +38,8 @@
 - **Concurrent Multi-Channel Hub (`MultiChannelHub`)**: Runs up to all 20 channels side by side in one process, namespacing conversations as `<channel>::<rawChatId>` with per-channel health tracking and non-blocking inbound dispatch (a failing channel never crashes healthy ones).
 - **14 Outbound-Only + 6 Loopback Receivers**: `photon`, `telegram`, `discord`, `slack`, `feishu`, `dingtalk`, `onebot`, `qqbot`, `matrix`, `mattermost`, `irc`, `zulip`, `rocketchat` and `signal` dial out (long polling / WebSocket / TLS) and need **zero inbound ports**; only `webhook`, `wecom`, `line`, `whatsapp`, `teams` and `googlechat` listen on callbacks, and they bind to `127.0.0.1` by default.
 - **Unified Gateway Core**: Every adapter shares fail-closed auth (`ALLOWED_SENDERS` + per-channel `*_ALLOWED_USERS` + 8-char DM pairing), interactive tool approval forwarding, busy turn control (`queue` / `interrupt` / `steer`), media/secret guards, zero-token `/usage`, and persistent `/loop` & `/remind` schedules.
+- **Native Rendering Everywhere**: iMessage uses UTF-16 Markdown styling (with automatic plain-text fallback), Telegram renders native HTML (`parse_mode: "HTML"`), Discord/Slack/Telegram support `editMessage` &amp; `deleteMessage`, plain-text channels (IRC, LINE, Signal, OneBot) get readable Markdown cleanup, and IDE `file:///` links are stripped on all 20 channels.
+- **Live Tool-Call Progress**: On editable platforms one compact card updates in-place during long turns (throttled, ≤48-char tool titles); `TOOL_PROGRESS_KEEP` decides whether it is deleted or kept as a summary, and `/progress` switches mode at runtime.
 - **Extensible by Design**: Drop in a new `src/channels/<name>.ts` exporting `createAdapter(config)` against [`ChannelAdapter`](src/types.ts) to add any custom platform.
 
 ---
@@ -108,7 +110,7 @@ Every channel is **optional** and automatically enabled when its credentials are
 
 | Channel | Name | Transport / SDK | Highlights &amp; NAT Traversal |
 | :--- | :--- | :--- | :--- |
-| **Photon iMessage** | `photon` | `spectrum-ts` Outbound TLS gRPC | Flagship iMessage / SMS / RCS adapter; Spectrum gRPC behind NAT, 48h dedupe, zombie-stream probe, read receipts &amp; reactions |
+| **Photon iMessage** | `photon` | `spectrum-ts@^12.16.0` Outbound TLS gRPC | Flagship iMessage / SMS / RCS adapter; Spectrum gRPC behind NAT, native Markdown + mobile cards, polls, backgrounds, unsend &amp; contact card, 48h dedupe, zombie-stream probe, read receipts &amp; reactions |
 | **Telegram** | `telegram` | Native Bot API `getUpdates` Long Polling (**0 extra deps**) | Node 24 built-in `fetch`, no inbound port; group `@bot` / reply gating, photo/doc/voice/audio download, multipart uploads, typing &amp; reactions |
 | **Discord** | `discord` | `discord.js` Gateway WebSocket | Outbound gateway socket behind NAT; DM + guild mention gating (`DISCORD_ALLOW_GUILDS`), attachment download/upload, reply references, typing, reactions &amp; edits |
 | **Slack** | `slack` | `@slack/bolt` Socket Mode (`xoxb-` + `xapp-`) | Zero public URL; `app_mention` &amp; DM support, `thread_ts` continuity, Bearer file downloads, `filesUploadV2`, emoji reactions |
@@ -180,6 +182,10 @@ The container runs as the non-root `node` user, reads `./.env` read-only, persis
 - **Read receipts &amp; emoji reaction lifecycle**: an inbound message is marked read (**已读**) → reacts **👀** while `agy` works → **👍** on success / **👎** on error. Typing indicators refresh periodically during long turns.
 - **Photon dual-layer heartbeat**: a transport heartbeat watchdog plus an application-level probe (`PHOTON_HEARTBEAT_TIMEOUT_MS=180000`, `PHOTON_PROBE_SPACE_ID`) detects half-open iMessage streams and reconnects automatically after hours of idle time.
 - **Cross-channel inbound image vision**: photos from Photon, Telegram, Discord, WhatsApp, and Matrix are downloaded, cached, and forwarded to `agy` as native image attachments.
+- **Cross-platform Markdown rendering**: iMessage/Photon applies native UTF-16 styling even when replies contain URLs (automatically falling back to plain text on render errors, with mobile cards for wide tables capped by `PHOTON_MAX_CHUNK_CHARS=1600` so iOS never folds long bubbles); Telegram sends native HTML; Discord/Slack/Telegram delete and edit their own messages; IRC/LINE/Signal/OneBot receive Markdown-to-readable-text cleanup.
+- **Global privacy guard**: `file:///` IDE links are sanitized on every one of the 20 channels, so local workspace paths never leak into chat.
+- **Live tool-call progress &amp; `/progress`**: editable platforms (Telegram, Discord, Slack, …) show a single compact card updated in-place (`TOOL_PROGRESS_EDIT_INTERVAL_MS=1500`); `TOOL_PROGRESS_KEEP=false` deletes it when the final reply lands, `true` keeps a completed summary.
+- **Photon 1.0 native features**: `spectrum-ts@^12.16.0` adds startup cancellation via `Spectrum({ signal })`, heartbeat stream telemetry (`stream` / `lineId`), `senderDeviceId`, inbound polls, Mini App cards and group events — plus native `/poll`, `/bg`, `/unsend`, and `/card` commands.
 - **Daemon CLI**: `pnpm cli start`, `stop`, `restart`, `logs`, and `status` with a PID lock and graceful shutdown — plus the crash-backoff supervisor in [`scripts/start-gateway.ps1`](scripts/start-gateway.ps1).
 - **Docker &amp; Compose**: multi-stage `node:24-slim` image, non-root, built-in `/healthz` `HEALTHCHECK`, loopback-only port publishing.
 
@@ -218,7 +224,7 @@ Every variable below matches [`.env.example`](.env.example). Empty everywhere = 
 
 | Channel | Required Env Vars | Optional Env Vars |
 | :--- | :--- | :--- |
-| **Photon iMessage** | `SPECTRUM_PROJECT_ID`, `SPECTRUM_PROJECT_SECRET` | `PHOTON_READ_RECEIPTS=true`, `PHOTON_REACTIONS=true` |
+| **Photon iMessage** | `SPECTRUM_PROJECT_ID`, `SPECTRUM_PROJECT_SECRET` | `PHOTON_READ_RECEIPTS=true`, `PHOTON_REACTIONS=true`, `PHOTON_MAX_CHUNK_CHARS=1600` |
 | **Telegram** | `TELEGRAM_BOT_TOKEN` | `TELEGRAM_ALLOWED_USERS`, `TELEGRAM_POLL_TIMEOUT_SEC=30` |
 | **Discord** | `DISCORD_BOT_TOKEN` | `DISCORD_ALLOWED_USERS`, `DISCORD_ALLOW_GUILDS=false` |
 | **Slack** | `SLACK_BOT_TOKEN` (`xoxb-...`), `SLACK_APP_TOKEN` (`xapp-...`) | `SLACK_ALLOWED_USERS` |
@@ -247,6 +253,7 @@ SPECTRUM_PROJECT_ID=
 SPECTRUM_PROJECT_SECRET=
 PHOTON_READ_RECEIPTS=true
 PHOTON_REACTIONS=true
+PHOTON_MAX_CHUNK_CHARS=1600
 
 # Telegram (Bot API long polling)
 TELEGRAM_BOT_TOKEN=
@@ -436,6 +443,34 @@ DATA_DIR=./data
 LOG_LEVEL=info
 ```
 
+### Rendering &amp; Live Progress / 渲染与实时进度
+
+Outbound replies are adapted per platform. Markdown is never sent raw to channels that cannot render it, and malformed markup degrades to plain text instead of failing the send.
+
+| Channel group | Rendering behavior |
+| :--- | :--- |
+| **Photon iMessage** | Native UTF-16 Markdown styling survives URLs; falls back to plain text on render errors. Wide tables become mobile-friendly cards; bubbles are capped at `PHOTON_MAX_CHUNK_CHARS` (default `1600`) to avoid iOS fold/collapse. |
+| **Telegram** | Native HTML (`parse_mode: "HTML"`) with automatic plain-text retry on parse errors; supports `editMessage` and `deleteMessage`. |
+| **Discord &amp; Slack** | Native `editMessage` / `deleteMessage`; IDE `file:///` links are removed before delivery. |
+| **IRC, LINE, Signal, OneBot** | Markdown is reduced to readable plain text (tables, emphasis, links). |
+| **All 20 channels** | Global `file:///` sanitization strips local IDE paths so workspace locations never reach chat. |
+
+Live tool-call feedback during long turns:
+
+```env
+# auto | edit | silence | off (auto = in-place edits where supported, silence pulses on iMessage)
+TOOL_PROGRESS_MODE=auto
+# false (default) deletes the temporary progress card on completion; true keeps a compact summary
+TOOL_PROGRESS_KEEP=false
+# Minimum ms between in-place edits (platform rate limits)
+TOOL_PROGRESS_EDIT_INTERVAL_MS=1500
+```
+
+- **`edit`**: one compact card updated in place, with clean ≤48-character tool titles.
+- **`silence`**: short progress pulses only — used on iMessage to avoid Apple's 5-edit limit.
+- **`off`**: no live card (final answer and stall alerts still work).
+- Switch at runtime with `/progress [auto|edit|silence|off|keep|delete]`; `keep`/`delete` toggle the final disposition for the current chat.
+
 ### Photon Dashboard &amp; Inbound-First Note / Photon 后台与首条消息规则
 
 1. In **Photon Dashboard -> Users**, register the Apple Messages handle you send from (E.164 phone number or Apple ID email; verify your exact identifier at `https://debug.photon.codes`).
@@ -506,6 +541,7 @@ When `HEALTH_ENABLED=true`, [`HealthServer`](src/health.ts) serves read-only JSO
 | `/queue [prompt\|list\|clear]` | `/q` | Enqueue a follow-up prompt, inspect queue, or clear queued prompts |
 | `/steer <prompt>` | `/s` | Cancel active turn and redirect immediately with `<prompt>` |
 | `/busy [queue\|interrupt\|steer]` | — | Choose how messages arriving mid-turn are handled |
+| `/progress [auto\|edit\|silence\|off\|keep\|delete]` | — | View or switch live tool-call progress mode and whether the card is kept (`-h` for help) |
 | `/approve [once\|session\|always]` | — | Approve a pending interactive tool permission request |
 | `/deny [reason]` | — | Deny a pending interactive tool permission request |
 | `/yolo` | — | Toggle `auto` approval mode for the current chat |
@@ -529,6 +565,17 @@ When `HEALTH_ENABLED=true`, [`HealthServer`](src/health.ts) serves read-only JSO
 | `/discard` | — | Discard local session state and clear pending queue |
 | `/loop [list\|add <dur> <prompt>\|rm <id>\|pause <id>\|resume <id>]` | — | Manage recurring prompt loops (e.g. `30m`, `2h`, `1d`) |
 | `/remind <dur> <text>` | — | Schedule a one-way reminder push (`0` AI tokens) |
+
+### Photon iMessage Native Commands / iMessage 原生命令
+
+Available on the `photon` channel (`spectrum-ts@^12.16.0`):
+
+| Command | Purpose |
+| :--- | :--- |
+| `/poll <question> \| <opt1> \| <opt2>` | Send a native iMessage poll (at least two options) |
+| `/bg [preset\|clear\|list]` | Apply one of 24 built-in Messages backgrounds, clear it, or list presets |
+| `/unsend` | Unsend the bot's most recent outbound message (~2-minute Apple window) |
+| `/card` | Share the native "Share Name and Photo" contact card |
 
 ---
 
@@ -565,7 +612,7 @@ export function createAdapter(config: GatewayConfig): ChannelAdapter {
 }
 ```
 
-Optional hooks (`sendTyping`, `markRead`, `react`, `editMessage`) are automatically detected and invoked best-effort by `GatewayRouter`.
+Optional hooks (`sendTyping`, `markRead`, `react`, `editMessage`, `deleteMessage`) are automatically detected and invoked best-effort by `GatewayRouter`. `editMessage`/`deleteMessage` enable the in-place live tool-call progress card (see [Rendering &amp; Live Progress](#rendering--live-progress--渲染与实时进度)).
 
 ---
 
@@ -591,7 +638,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\uninstall-task.ps1
 - **Official Protocol &amp; Auth Compliance**: Connects strictly through official `agy acp` using your local cached `agy` session or `GEMINI_API_KEY`. Never extracts or reverse-proxies OAuth tokens. (Note: `GEMINI_API_KEY` mode disables `/usage` quota reporting inside `agy`.)
 - **Zero Public Listening Ports by Default**: The 14 outbound transports (`photon`, `telegram`, `discord`, `slack`, `feishu`, `dingtalk`, `onebot`, `qqbot`, `matrix`, `mattermost`, `irc`, `zulip`, `rocketchat`, `signal`) dial out over long polling / WebSocket / TLS and require zero inbound ports. The 6 callback receivers (`webhook` `127.0.0.1:18791`, `wecom` `127.0.0.1:18792`, `line` `127.0.0.1:18793`, `whatsapp` `127.0.0.1:18794`, `teams` `127.0.0.1:18795`, `googlechat` `127.0.0.1:18796`) and `HealthServer` (`127.0.0.1:18790`) are disabled or loopback-only by default; `webhook` additionally blocks non-loopback hosts without `WEBHOOK_TOKEN`/`WEBHOOK_SECRET`.
 - **Signed Callbacks**: Inbound HTTP callbacks are verified before dispatch — `webhook` (Bearer token + HMAC-SHA256 `X-Webhook-Signature`), `wecom` (SHA1 `msg_signature` + AES-256-CBC WXBizMsgCrypt decrypt), `line` (`X-Line-Signature` HMAC-SHA256 over the raw body), `whatsapp` (`hub.verify_token` GET challenge + `X-Hub-Signature-256` HMAC-SHA256), `teams` (`Authorization: HMAC` with `TEAMS_WEBHOOK_SECRET` for outgoing webhooks), `googlechat` (`GOOGLECHAT_VERIFICATION_TOKEN` event token or Bearer header).
-- **Fail-Closed Auth &amp; Secret Audit**: Default-deny DM pairing (8-char unambiguous code, 1h TTL, 5-attempt lockout) across all 20 channels, outbound `MEDIA:<path>` guard against `.env*`/`.ssh`/private keys, single-instance lock (`<dataDir>/gateway.pid`), and `pnpm audit:secrets` before commits.
+- **Fail-Closed Auth &amp; Secret Audit**: Default-deny DM pairing (8-char unambiguous code, 1h TTL, 5-attempt lockout) across all 20 channels, outbound `MEDIA:<path>` guard against `.env*`/`.ssh`/private keys, single-instance lock (`<dataDir>/gateway.pid`), global IDE `file:///` link sanitization on every channel, and `pnpm audit:secrets` before commits.
 
 ---
 

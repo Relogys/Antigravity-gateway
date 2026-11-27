@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+#### Wave 10 — Cross-platform Markdown rendering, live progress & Photon 1.0
+
+- **Cross-platform Markdown rendering**: Photon/iMessage now keeps native
+  UTF-16 Markdown styling even for replies containing URLs, falls back to plain
+  text on render errors, and formats wide tables as mobile-friendly cards.
+  `PHOTON_MAX_CHUNK_CHARS` (default `1600`) caps bubble size so long messages
+  never fold/collapse on iOS. Telegram sends native HTML
+  (`parse_mode: "HTML"`) with automatic plain-text retry on parse errors and
+  gains `editMessage` / `deleteMessage`. Discord and Slack implement
+  `deleteMessage`; IRC, LINE, Signal, and OneBot convert Markdown to readable
+  plain text.
+- **Global IDE link sanitization**: `file:///` links are stripped from outbound
+  replies on all 20 channels, so local workspace paths never leak into chat.
+- **Live editable tool-call progress**: editable channels (Telegram, Discord,
+  Slack, …) show one compact progress card updated in place during long turns
+  (throttled by `TOOL_PROGRESS_EDIT_INTERVAL_MS`, default `1500`, with clean
+  ≤48-character tool titles). `TOOL_PROGRESS_KEEP=false` (default) deletes the
+  card when the final reply arrives; `true` keeps a compact completed summary.
+  `TOOL_PROGRESS_MODE=auto|edit|silence|off` selects live edits, silence pulses
+  (used on iMessage to avoid Apple's 5-edit cap), or no card.
+- **New `/progress` command**: `/progress [auto|edit|silence|off|keep|delete]`
+  is always available (with `-h` help) to inspect or switch progress mode and
+  the final card disposition at runtime.
+- **Photon 1.0 (`spectrum-ts@^12.16.0`) native upgrades**: startup cancellation
+  via `Spectrum({ signal })`, detailed `onHeartbeat(hb)` stream telemetry
+  (`stream` / `lineId`), `senderDeviceId` metadata, and inbound parsing for
+  iMessage polls (`poll` / `poll_option`), Mini App cards (`app`), and group
+  events (`addMember`, `removeMember`, `rename`, `avatar`, `leaveSpace`).
+- **Photon iMessage slash commands**: `/poll <question> | <opt1> | <opt2>`
+  (native polls), `/bg [preset|clear|list]` (24 built-in backgrounds),
+  `/unsend` (unsend the last outbound message, ~2-minute Apple window), and
+  `/card` (native "Share Name and Photo" contact card).
+
 #### Wave 5 & Wave 6 — Onboarding, reliability & containers
 
 - Photon iMessage **dual-layer heartbeat**: a transport heartbeat watchdog
@@ -61,6 +94,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Documented Wave 10 in `README.md` (rendering matrix, live-progress env vars,
+  `/progress`, Photon native commands, `PHOTON_MAX_CHUNK_CHARS`) and
+  `docs/QUICKSTART.md` (a "Rich rendering & live progress" section plus FAQ
+  entries for folded iMessage bubbles and a missing progress card).
 - Redesigned the README top-level Quick Start around a 4-step copy-paste
   onboarding flow (`pnpm setup` → `pnpm build` → `pnpm cli doctor` →
   `pnpm cli start`), with a prominent link to `docs/QUICKSTART.md`, a Docker

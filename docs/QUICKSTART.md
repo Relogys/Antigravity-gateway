@@ -117,10 +117,19 @@ PHOTON_HEARTBEAT_TIMEOUT_MS=180000
 PHOTON_PROBE_SPACE_ID=<a-photon-space-where-the-bot-is-active>
 ```
 
+Rendering / 气泡长度上限:
+
+```env
+# Cap each iMessage bubble; 1600 keeps long replies from folding/collapsing on iOS.
+PHOTON_MAX_CHUNK_CHARS=1600
+```
+
 What you get / 体验：
 
 - **Dual-layer heartbeat**: a transport heartbeat watchdog plus an application-level probe that catches half-open gRPC streams (see [FAQ](#photon-stops-replying-after-hours-idle--photon-闲置数小时后不再回复)).
 - **Read receipts & reactions**: the inbound message is marked read (**已读**) → reacts **👀** while `agy` is working → **👍** on success / **👎** on error. Typing indicators refresh periodically on long turns.
+- **Native iMessage rendering**: Markdown keeps its styling even with URLs; wide tables become mobile cards and render errors fall back to plain text.
+- **Native iMessage commands**: `/poll <question> | <opt1> | <opt2>`, `/bg [preset|clear|list]` (24 presets), `/unsend` (~2-minute window), and `/card` (Share Name and Photo).
 - Images sent to the bot are downloaded and forwarded to `agy` as native image attachments.
 
 ### 2) Telegram (easiest, 0 public domain / 最简单)
@@ -247,6 +256,32 @@ pnpm cli doctor
 ```
 
 `doctor` prints one line per channel: `configured` or `disabled` plus a non-secret hint. It never prints tokens, user IDs, or secrets.
+
+### Rich rendering & live progress / 富文本渲染与实时进度
+
+No configuration is required — the gateway adapts outbound Markdown per platform and falls back to plain text on any render error:
+
+| Platform | What you get |
+| :--- | :--- |
+| **Photon iMessage** | Native UTF-16 Markdown (URLs included), mobile cards for wide tables, `PHOTON_MAX_CHUNK_CHARS=1600` bubble cap against iOS fold/collapse, automatic plain-text fallback. |
+| **Telegram** | Native HTML (`parse_mode: "HTML"`) with plain-text retry on parse errors; `editMessage` / `deleteMessage`. |
+| **Discord & Slack** | `editMessage` / `deleteMessage`; IDE `file:///` links removed. |
+| **IRC, LINE, Signal, OneBot** | Markdown converted to readable plain text. |
+| **All channels** | IDE `file:///` links sanitized globally — local paths never leak into chat. |
+
+During long turns, editable channels (Telegram, Discord, Slack, …) update **a single compact tool-call card in place** instead of spamming messages:
+
+```env
+TOOL_PROGRESS_MODE=auto                   # auto | edit | silence | off
+TOOL_PROGRESS_KEEP=false                  # false deletes the card on completion; true keeps a summary
+TOOL_PROGRESS_EDIT_INTERVAL_MS=1500       # throttle between in-place edits
+```
+
+- `auto` → edit-in-place where supported, silence pulses on iMessage (avoids Apple's 5-edit cap).
+- Change it live from any chat: `/progress [auto|edit|silence|off|keep|delete]` (`-h` shows help).
+- `keep`/`delete` controls whether the final tool-call summary stays above the answer.
+
+> 中文提示：无需额外配置。iMessage 会自动限制单条气泡长度并降级为纯文本；长任务期间只在可编辑渠道原地刷新一张工具进度卡片，默认完成后删除，可用 `/progress keep` 保留摘要。
 
 ---
 
@@ -444,6 +479,8 @@ Requirements for all three:
 | `agy: not found` in container | Mount the `agy` binary/credentials or set `GEMINI_API_KEY`. |
 | Emoji reactions missing | Platform or channel disables reactions; set `PHOTON_REACTIONS=true` for Photon. Replies still work. |
 | Typing indicator disappears quickly | Normal; it refreshes periodically during long turns and may be throttled by the platform. |
+| Long iMessage replies fold/collapse | Lower `PHOTON_MAX_CHUNK_CHARS` (e.g. `1200`); wide tables render as mobile cards automatically. |
+| No live tool-call card | The channel may lack `editMessage`; use `/progress edit` on Telegram/Discord/Slack, or `/progress auto` to reset. |
 
 ---
 

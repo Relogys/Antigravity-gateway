@@ -41,7 +41,7 @@ describe("normalizeSpaceId", () => {
 });
 
 describe("chooseSendFormat & sanitizeForIMessage", () => {
-  it("selects richlink for bare URLs and text when URLs appear inline", () => {
+  it("selects richlink for bare URLs and markdown for inline URLs", () => {
     expect(chooseSendFormat("https://example.com/docs/page")).toEqual({
       mode: "richlink",
       content: "https://example.com/docs/page",
@@ -49,6 +49,13 @@ describe("chooseSendFormat & sanitizeForIMessage", () => {
 
     expect(
       chooseSendFormat("Check out https://example.com/docs for details."),
+    ).toEqual({
+      mode: "markdown",
+      content: "Check out https://example.com/docs for details.",
+    });
+
+    expect(
+      chooseSendFormat("Check out https://example.com/docs for details.", false),
     ).toEqual({
       mode: "text",
       content: "Check out https://example.com/docs for details.",

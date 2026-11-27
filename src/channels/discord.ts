@@ -8,6 +8,7 @@ import type {
   OutboundMessage,
 } from "../types.js";
 import { BaseChannelAdapter, type InboundHandler } from "./base.js";
+import { stripIdeFileLinks } from "./format.js";
 import { MAX_INBOUND_MEDIA_BYTES, downloadInboundMedia } from "./media.js";
 import {
   BoundedDedupeCache,
@@ -57,6 +58,7 @@ export interface DiscordMessageLike {
   };
   react?(emoji: string): Promise<unknown>;
   edit?(content: string): Promise<unknown>;
+  delete?(): Promise<unknown>;
   channel?: {
     messages?: { cache?: { get?(id: string): DiscordMessageLike | undefined } };
   };
@@ -269,7 +271,9 @@ export class DiscordChannelAdapter extends BaseChannelAdapter {
 
   async sendMessage(msg: OutboundMessage): Promise<{ messageId?: string } | void> {
     const channel = await this.fetchChannel(msg.chatId);
-    const chunks = chunkText(msg.text ?? "", DISCORD_MAX_TEXT);
+    const text =
+      msg.markdown === true ? stripIdeFileLinks(msg.text ?? "") : (msg.text ?? "");
+    const chunks = chunkText(text, DISCORD_MAX_TEXT);
 
     const files = (msg.attachments ?? [])
       .map((att) => {
@@ -350,12 +354,25 @@ export class DiscordChannelAdapter extends BaseChannelAdapter {
     }
   }
 
-  async editMessage(chatId: string, messageId: string, text: string): Promise<void> {
+  async editMessage(
+    chatId: string,
+    messageId: string,
+    text: string,
+    _options?: { markdown?: boolean },
+  ): Promise<void> {
     const message = await this.fetchMessage(chatId, messageId);
     if (typeof message.edit !== "function") {
       throw new Error("Discord message is not editable");
     }
-    await message.edit(text.slice(0, DISCORD_EDIT_MAX_TEXT) || "…");
+    const next =
+      _options?.markdown === true ? stripIdeFileLinks(text) : text;
+    await message.edit(next.slice(0, DISCORD_EDIT_MAX_TEXT) || "…");
+  }
+
+  async deleteMessage(chatId: string, messageId: string): Promise<void> {
+    const cached = this.recentMessages.get(messageId)?.message;
+    const message = cached ?? (await this.fetchMessage(chatId, messageId));
+    await message.delete?.();
   }
 
   // ----------------------------------------------------------------- inbound

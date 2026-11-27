@@ -4,6 +4,7 @@ import tls from "node:tls";
 import type { GatewayConfig, IrcConfig } from "../config.js";
 import type { ChannelAdapter, OutboundMessage } from "../types.js";
 import { BaseChannelAdapter, type InboundHandler } from "./base.js";
+import { stripMarkdownToReadableText } from "./format.js";
 import {
   BoundedDedupeCache,
   isMentioned,
@@ -439,9 +440,9 @@ export class IrcChannelAdapter extends BaseChannelAdapter {
     if (!chatId) {
       throw new Error("IRC chatId is required");
     }
-    const text = String(msg.text ?? "")
-      .replace(/[\r\n]+/g, " ")
-      .trim();
+    const source =
+      msg.markdown === true ? stripMarkdownToReadableText(msg.text ?? "") : String(msg.text ?? "");
+    const text = source.replace(/[\r\n]+/g, " ").trim();
     if (!text) {
       return;
     }

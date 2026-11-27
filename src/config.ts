@@ -1,7 +1,7 @@
 import path from "node:path";
 import dotenv from "dotenv";
 import { z } from "zod";
-import type { ApprovalMode, LogLevel } from "./types.js";
+import type { ApprovalMode, LogLevel, ToolProgressMode } from "./types.js";
 
 /** Canonical channel names (also the `channel` field on inbound messages and the chatId prefix). */
 export const CHANNEL_NAMES = [
@@ -213,9 +213,16 @@ const envSchema = z.object({
   HEALTH_PORT: z.coerce.number().int().min(1).max(65535).default(18790),
   PHOTON_READ_RECEIPTS: z.string().optional(),
   PHOTON_REACTIONS: z.string().optional(),
+  PHOTON_MAX_CHUNK_CHARS: numberEnv(400, 7500, 1600),
   QUOTA_WARN_THRESHOLD: z.coerce.number().min(0).max(100).default(15),
   PROGRESS_SILENCE_MS: numberEnv(0, 3_600_000, 120_000),
   SESSION_STALL_TIMEOUT_MS: numberEnv(0, 3_600_000, 300_000),
+  TOOL_PROGRESS_MODE: z.preprocess(
+    (v) => (typeof v === "string" ? v.trim().toLowerCase() || undefined : v),
+    z.enum(["auto", "edit", "silence", "off"]).default("auto"),
+  ),
+  TOOL_PROGRESS_KEEP: optionalString,
+  TOOL_PROGRESS_EDIT_INTERVAL_MS: numberEnv(500, 30_000, 1500),
   TURN_MAX_RETRIES: numberEnv(0, 5, 2),
   INGRESS_DEBOUNCE_MS: numberEnv(0, 10_000, 350),
   AUTO_BOOTSTRAP_CHANNEL_SESSION: optionalString,
@@ -351,6 +358,8 @@ export interface PhotonConfig {
   projectSecret: string;
   readReceipts: boolean;
   reactions: boolean;
+  /** Maximum characters per outbound iMessage bubble before splitting (default 1600). */
+  maxChunkChars?: number;
 }
 
 export interface TelegramConfig {
@@ -533,6 +542,12 @@ export interface GatewayConfig {
   quotaWarnThreshold: number;
   progressSilenceMs: number;
   sessionStallTimeoutMs: number;
+  /** Live tool-call progress strategy: auto (edit on editable channels, silence on iMessage), edit, silence, or off. */
+  toolProgressMode?: ToolProgressMode;
+  /** Whether to keep the intermediate tool-call progress message once the final reply finishes (default false = delete). */
+  toolProgressKeep?: boolean;
+  /** Minimum ms between live in-place edits of a tool-call progress message (default 1500). */
+  toolProgressEditIntervalMs?: number;
   turnMaxRetries: number;
   ingressDebounceMs: number;
   autoBootstrapChannelSession: boolean;
@@ -660,6 +675,7 @@ export function loadConfig(
           projectSecret: spectrumSecret,
           readReceipts: parseBoolEnv(parsed.PHOTON_READ_RECEIPTS, true),
           reactions: parseBoolEnv(parsed.PHOTON_REACTIONS, true),
+          maxChunkChars: parsed.PHOTON_MAX_CHUNK_CHARS,
         }
       : undefined;
 
@@ -739,6 +755,9 @@ export function loadConfig(
     quotaWarnThreshold: parsed.QUOTA_WARN_THRESHOLD,
     progressSilenceMs: parsed.PROGRESS_SILENCE_MS,
     sessionStallTimeoutMs: parsed.SESSION_STALL_TIMEOUT_MS,
+    toolProgressMode: parsed.TOOL_PROGRESS_MODE,
+    toolProgressKeep: parseBoolEnv(parsed.TOOL_PROGRESS_KEEP, false),
+    toolProgressEditIntervalMs: parsed.TOOL_PROGRESS_EDIT_INTERVAL_MS,
     turnMaxRetries: parsed.TURN_MAX_RETRIES,
     ingressDebounceMs: parsed.INGRESS_DEBOUNCE_MS,
     autoBootstrapChannelSession: parseBoolEnv(

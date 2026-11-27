@@ -1,3 +1,4 @@
+import { isPhotonChannel } from "../config.js";
 import type {
   ChannelAdapter,
   ChannelHealthStatus,
@@ -110,6 +111,8 @@ export class MultiChannelHub implements ChannelAdapter {
         lastInboundAt: maxDefined(stats.lastInboundAt, entry.lastInboundAt),
         lastOutboundAt: maxDefined(stats.lastOutboundAt, entry.lastOutboundAt),
         lastHeartbeatAt: stats.lastHeartbeatAt,
+        heartbeatStream: stats.heartbeatStream,
+        heartbeatLineId: stats.heartbeatLineId,
         lastError: stats.lastError ?? entry.lastError ?? entry.startError,
       };
     }
@@ -266,9 +269,42 @@ export class MultiChannelHub implements ChannelAdapter {
     await adapter.react?.(rawChatId, messageId, emoji);
   }
 
-  async editMessage(chatId: string, messageId: string, text: string): Promise<void> {
+  async editMessage(
+    chatId: string,
+    messageId: string,
+    text: string,
+    options?: { markdown?: boolean },
+  ): Promise<void> {
     const { adapter, rawChatId } = this.resolveTarget(chatId);
-    await adapter.editMessage?.(rawChatId, messageId, text);
+    await adapter.editMessage?.(rawChatId, messageId, text, options);
+  }
+
+  async deleteMessage(chatId: string, messageId: string): Promise<void> {
+    const { adapter, rawChatId } = this.resolveTarget(chatId);
+    await adapter.deleteMessage?.(rawChatId, messageId);
+  }
+
+  /**
+   * True when the target channel supports silent in-place editing suitable for
+   * live tool-call status updates (e.g. Telegram, Discord, Slack). Excludes
+   * iMessage/Photon because Apple imposes a 5-edit cap and visible edit markers.
+   */
+  supportsLiveProgressEdit(chatId: string): boolean {
+    try {
+      const { channel, adapter } = this.resolveTarget(chatId);
+      return Boolean(adapter.editMessage) && !isPhotonChannel(channel);
+    } catch {
+      return false;
+    }
+  }
+
+  canDeleteMessage(chatId: string): boolean {
+    try {
+      const { adapter } = this.resolveTarget(chatId);
+      return Boolean(adapter.deleteMessage);
+    } catch {
+      return false;
+    }
   }
 }
 

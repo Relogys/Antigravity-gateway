@@ -10,6 +10,7 @@ import type {
   OutboundMessage,
 } from "../types.js";
 import { BaseChannelAdapter, type InboundHandler } from "./base.js";
+import { markdownToTelegramHtml, stripMarkdownToReadableText } from "./format.js";
 import { MAX_INBOUND_MEDIA_BYTES, downloadInboundMedia } from "./media.js";
 import {
   BoundedDedupeCache,
@@ -26,8 +27,19 @@ import {
 
 const TELEGRAM_API = "https://api.telegram.org";
 const TELEGRAM_MAX_TEXT = 4000;
+const TELEGRAM_MARKDOWN_MAX_TEXT = 3500;
 const TELEGRAM_EDIT_MAX_TEXT = 4096;
 const DEFAULT_POLL_TIMEOUT_SEC = 30;
+
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function isTelegramParseError(err: unknown): boolean {
+  return /can't parse entities|parse_mode|bad request|unsupported start tag|can't find end tag/i.test(
+    errorText(err),
+  );
+}
 
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
@@ -206,7 +218,11 @@ export class TelegramChannelAdapter extends BaseChannelAdapter {
 
   async sendMessage(msg: OutboundMessage): Promise<{ messageId?: string } | void> {
     let lastId: string | undefined;
-    const chunks = chunkText(msg.text ?? "", TELEGRAM_MAX_TEXT);
+    const markdown = msg.markdown === true;
+    const chunks = chunkText(
+      msg.text ?? "",
+      markdown ? TELEGRAM_MARKDOWN_MAX_TEXT : TELEGRAM_MAX_TEXT,
+    );
     const replyTo = msg.replyToMessageId ? Number(msg.replyToMessageId) : undefined;
     let replyParams: Record<string, unknown> | undefined =
       replyTo !== undefined && Number.isFinite(replyTo)
@@ -214,12 +230,14 @@ export class TelegramChannelAdapter extends BaseChannelAdapter {
         : undefined;
 
     for (const chunk of chunks) {
-      const body: Record<string, unknown> = { chat_id: msg.chatId, text: chunk };
-      if (replyParams) {
-        body.reply_parameters = replyParams;
-        replyParams = undefined; // only the first chunk quotes the original
-      }
-      const sent = await this.call<{ message_id: number }>("sendMessage", body);
+      const sent = markdown
+        ? await this.sendMarkdownChunk(msg.chatId, chunk, replyParams)
+        : await this.call<{ message_id: number }>("sendMessage", {
+            chat_id: msg.chatId,
+            text: chunk,
+            ...(replyParams ? { reply_parameters: replyParams } : {}),
+          });
+      replyParams = undefined; // only the first chunk quotes the original
       lastId = String(sent.message_id);
     }
 
@@ -236,6 +254,33 @@ export class TelegramChannelAdapter extends BaseChannelAdapter {
     }
     this.noteOutbound();
     return lastId ? { messageId: lastId } : undefined;
+  }
+
+  private async sendMarkdownChunk(
+    chatId: string,
+    chunk: string,
+    replyParams?: Record<string, unknown>,
+  ): Promise<{ message_id: number }> {
+    const base: Record<string, unknown> = {
+      chat_id: chatId,
+      ...(replyParams ? { reply_parameters: replyParams } : {}),
+    };
+    try {
+      return await this.call<{ message_id: number }>("sendMessage", {
+        ...base,
+        text: markdownToTelegramHtml(chunk),
+        parse_mode: "HTML",
+      });
+    } catch (err) {
+      if (!isTelegramParseError(err)) {
+        throw err;
+      }
+      // Telegram rejected the entity markup: resend as readable plain text.
+      return this.call<{ message_id: number }>("sendMessage", {
+        ...base,
+        text: stripMarkdownToReadableText(chunk),
+      });
+    }
   }
 
   async sendTyping(chatId: string, active: boolean): Promise<void> {
@@ -261,12 +306,69 @@ export class TelegramChannelAdapter extends BaseChannelAdapter {
     }
   }
 
-  async editMessage(chatId: string, messageId: string, text: string): Promise<void> {
-    await this.call("editMessageText", {
-      chat_id: chatId,
-      message_id: Number(messageId),
-      text: text.slice(0, TELEGRAM_EDIT_MAX_TEXT) || "…",
-    });
+  async editMessage(
+    chatId: string,
+    messageId: string,
+    text: string,
+    options?: { markdown?: boolean },
+  ): Promise<void> {
+    if (options?.markdown === true) {
+      const html = markdownToTelegramHtml(text).slice(0, TELEGRAM_EDIT_MAX_TEXT) || "…";
+      try {
+        await this.call("editMessageText", {
+          chat_id: chatId,
+          message_id: Number(messageId),
+          text: html,
+          parse_mode: "HTML",
+        });
+        return;
+      } catch (err) {
+        if (/message is not modified/i.test(errorText(err))) {
+          return;
+        }
+        if (!isTelegramParseError(err)) {
+          throw err;
+        }
+        const plain = stripMarkdownToReadableText(text).slice(0, TELEGRAM_EDIT_MAX_TEXT) || "…";
+        try {
+          await this.call("editMessageText", {
+            chat_id: chatId,
+            message_id: Number(messageId),
+            text: plain,
+          });
+        } catch (fallbackErr) {
+          if (!/message is not modified/i.test(errorText(fallbackErr))) {
+            throw fallbackErr;
+          }
+        }
+        return;
+      }
+    }
+
+    try {
+      await this.call("editMessageText", {
+        chat_id: chatId,
+        message_id: Number(messageId),
+        text: text.slice(0, TELEGRAM_EDIT_MAX_TEXT) || "…",
+      });
+    } catch (err) {
+      if (!/message is not modified/i.test(errorText(err))) {
+        throw err;
+      }
+    }
+  }
+
+  async deleteMessage(chatId: string, messageId: string): Promise<void> {
+    try {
+      await this.call("deleteMessage", {
+        chat_id: chatId,
+        message_id: Number(messageId),
+      });
+    } catch (err) {
+      if (!/message to delete not found/i.test(errorText(err))) {
+        throw err;
+      }
+    }
   }
 
   // ----------------------------------------------------------------- inbound

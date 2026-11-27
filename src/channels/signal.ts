@@ -6,6 +6,7 @@ import type {
   OutboundMessage,
 } from "../types.js";
 import { BaseChannelAdapter, type InboundHandler } from "./base.js";
+import { stripMarkdownToReadableText } from "./format.js";
 import {
   BoundedDedupeCache,
   chunkText,
@@ -465,7 +466,9 @@ export class SignalChannelAdapter extends BaseChannelAdapter {
   }
 
   async sendMessage(msg: OutboundMessage): Promise<{ messageId?: string } | void> {
-    const chunks = chunkText(msg.text ?? "", MAX_TEXT_CHARS);
+    const text =
+      msg.markdown === true ? stripMarkdownToReadableText(msg.text ?? "") : (msg.text ?? "");
+    const chunks = chunkText(text, MAX_TEXT_CHARS);
     if (chunks.length === 0) {
       return;
     }

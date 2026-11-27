@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { ConversationGroupSync } from "../acp/conversation-sync.js";
 import { fetchAgyQuota, formatQuotaSummary } from "../acp/quota.js";
+import { stripIdeFileLinks } from "../channels/format.js";
 import { splitQualifiedChatId } from "../channels/hub.js";
 import {
   CHANNEL_NAMES,
@@ -28,10 +29,13 @@ import type {
   PendingPermission,
   QuotaSummary,
   SessionInfo,
+  ToolProgressMode,
   TurnActivitySnapshot,
 } from "../types.js";
 import { IngressBurstCoalescer, type ReplyQuoteMetadata } from "./burst.js";
+import { handlePhotonNativeCommand } from "./commands/photon.js";
 import { BotLoopGuard } from "./guards.js";
+import { LiveProgressTracker, sanitizeToolTitle } from "./progress.js";
 import {
   LoopScheduler,
   formatDurationMs,
@@ -87,6 +91,18 @@ export interface ExtendedAgentBackend extends AgentBackend {
 export interface ExtendedChannelAdapter extends ChannelAdapter {
   /** Implemented by MultiChannelHub: per-channel health keyed by channel name. */
   getChannelSnapshots?(): Record<string, ChannelHealthStatus>;
+  /** Implemented by MultiChannelHub: true when the target channel supports silent live edits. */
+  supportsLiveProgressEdit?(chatId: string): boolean;
+  /** Implemented by MultiChannelHub: true when the target channel supports message deletion. */
+  canDeleteMessage?(chatId: string): boolean;
+  /** Implemented by MultiChannelHub: resolve the owning adapter + raw chat id for a chat. */
+  resolveTarget?(chatId: string): {
+    channel: string;
+    adapter: ChannelAdapter;
+    rawChatId: string;
+  };
+  /** Implemented by MultiChannelHub: look up a registered adapter by channel name. */
+  getAdapter?(name: string): ChannelAdapter | undefined;
 }
 
 export interface GatewayRouterDeps {
@@ -136,6 +152,11 @@ const ALWAYS_DISPATCHABLE_COMMANDS = new Set([
   "ping",
   "sethome",
   "verbose",
+  "progress",
+  "poll",
+  "bg",
+  "unsend",
+  "card",
 ]);
 
 /** Slash commands that wipe/inspect pending work must also drop buffered burst fragments. */
@@ -176,6 +197,7 @@ const HELP_TEXT = [
   "• /approve [once|session|always] | /deny — Resolve tool permission",
   "• /yolo — Toggle auto-approval mode",
   "• /verbose [off|brief|full] — Progress-pulse verbosity",
+  "• /progress [auto|edit|silence|off|keep|delete] — Live tool-call progress & cleanup policy",
   "• /sethome — Set this chat as the recovery home",
   "• /channels — Show active channels & connection state",
   "• /whoami | /version | /help",
@@ -195,6 +217,12 @@ const HELP_TEXT = [
   "• /discard — Discard session & queue",
   "• /loop [list|add <dur> <prompt>|rm <id>|pause <id>|resume <id>]",
   "• /remind <dur> <text> — One-way reminder push",
+  "",
+  "Photon iMessage native:",
+  "• /poll <q> | <opt1> | <opt2> — Create native iMessage poll",
+  "• /bg [preset|clear|list] — Set or clear chat background (24 presets)",
+  "• /unsend — Retract bot's last iMessage (~2m window)",
+  "• /card — Share native bot contact card",
 ].join("\n");
 
 function formatUptime(ms: number): string {
@@ -263,6 +291,8 @@ export class GatewayRouter {
   private readonly hydratedChats = new Set<string>();
   private readonly sessionListCache = new Map<string, AcpSessionSummary[]>();
   private readonly verbosityByChatId = new Map<string, VerbosityLevel>();
+  private readonly toolProgressModeByChatId = new Map<string, ToolProgressMode>();
+  private readonly toolProgressKeepByChatId = new Map<string, boolean>();
   private readonly lastPromptByChatId = new Map<string, string>();
   private cachedQuota?: QuotaSummary;
 
@@ -527,6 +557,68 @@ export class GatewayRouter {
     return this.verbosityByChatId.get(chatId) ?? "brief";
   }
 
+  private getChatToolProgressMode(chatId: string): ToolProgressMode {
+    return (
+      this.toolProgressModeByChatId.get(chatId) ??
+      this.config.toolProgressMode ??
+      "auto"
+    );
+  }
+
+  private getChatToolProgressKeep(chatId: string): boolean {
+    return (
+      this.toolProgressKeepByChatId.get(chatId) ??
+      this.config.toolProgressKeep ??
+      false
+    );
+  }
+
+  /**
+   * Decides whether a turn should render a single in-place edited progress card
+   * (Telegram/Discord/Slack) instead of periodic silence pulses (iMessage/Photon).
+   */
+  private shouldUseLiveProgressEdit(chatId: string, channelName: string): boolean {
+    if (this.getChatVerbosity(chatId) === "off") {
+      return false;
+    }
+    const mode = this.getChatToolProgressMode(chatId);
+    if (mode === "off" || mode === "silence") {
+      return false;
+    }
+    if (mode === "edit") {
+      return Boolean(this.channel.editMessage);
+    }
+    if (this.channel.supportsLiveProgressEdit) {
+      return this.channel.supportsLiveProgressEdit(chatId);
+    }
+    return Boolean(this.channel.editMessage) && !isPhotonChannel(channelName);
+  }
+
+  /** Resolve the underlying adapter + raw platform chat id for native (Photon) calls. */
+  private resolveNativeAdapter(
+    chatId: string,
+    channelName: string,
+  ): { adapter: unknown; rawChatId: string } {
+    if (this.channel.resolveTarget) {
+      try {
+        const target = this.channel.resolveTarget(chatId);
+        return { adapter: target.adapter, rawChatId: target.rawChatId };
+      } catch {
+        // Fall through to the simpler resolution paths below.
+      }
+    }
+    if (this.channel.getAdapter) {
+      return {
+        adapter: this.channel.getAdapter(channelName),
+        rawChatId: splitQualifiedChatId(chatId).chatId,
+      };
+    }
+    return {
+      adapter: this.channel,
+      rawChatId: splitQualifiedChatId(chatId).chatId,
+    };
+  }
+
   private rememberLastPrompt(chatId: string, text: string): void {
     if (!text.trim()) {
       return;
@@ -573,6 +665,12 @@ export class GatewayRouter {
         `in ${ago(c.lastInboundAt)}`,
         `out ${ago(c.lastOutboundAt)}`,
       ];
+      if (c.lastHeartbeatAt !== undefined) {
+        const streamTag = c.heartbeatStream ? ` [${c.heartbeatStream}]` : "";
+        parts.push(`hb ${ago(c.lastHeartbeatAt)}${streamTag}`);
+      } else if (c.heartbeatStream) {
+        parts.push(`hb [${c.heartbeatStream}]`);
+      }
       if (c.lastError && !c.connected) {
         parts.push(`error: ${c.lastError.slice(0, 100)}`);
       }
@@ -944,6 +1042,83 @@ export class GatewayRouter {
         }
         this.verbosityByChatId.set(chatId, next);
         await this.sendReply(chatId, `Verbosity set to: ${next}`, msg.id);
+        return;
+      }
+
+      case "progress": {
+        const usage = "Usage: /progress [auto|edit|silence|off|keep|delete]";
+        const mode = this.getChatToolProgressMode(chatId);
+        const keep = this.getChatToolProgressKeep(chatId);
+        const liveEdit = this.shouldUseLiveProgressEdit(chatId, msg.channel);
+        const interval = this.config.toolProgressEditIntervalMs ?? 1500;
+
+        if (!args || isHelpFlag(args)) {
+          await this.sendReply(
+            chatId,
+            [
+              `Tool progress: mode=${mode} | live-edit=${liveEdit ? "yes" : "no — silence pulses"} | on-finish=${keep ? "keep" : "delete"}`,
+              `Edit interval: ${interval}ms`,
+              usage,
+              "auto — edit in place on editable channels, silence pulses on iMessage",
+              "edit — always edit a single live message in place",
+              "silence — periodic silence pulses only",
+              "off — no progress (stall alerts stay on)",
+              "keep / delete — keep or delete the final tool summary",
+            ].join("\n"),
+            msg.id,
+          );
+          return;
+        }
+
+        const tokens = args.toLowerCase().split(/\s+/).filter(Boolean);
+        const validModes = new Set<ToolProgressMode>(["auto", "edit", "silence", "off"]);
+        let nextMode: ToolProgressMode | undefined;
+        let nextKeep: boolean | undefined;
+        for (const token of tokens) {
+          if (validModes.has(token as ToolProgressMode)) {
+            nextMode = token as ToolProgressMode;
+          } else if (token === "keep") {
+            nextKeep = true;
+          } else if (token === "delete" || token === "clean") {
+            nextKeep = false;
+          } else {
+            await this.sendReply(chatId, `Invalid option: ${token}\n${usage}`, msg.id);
+            return;
+          }
+        }
+
+        if (nextMode) {
+          this.toolProgressModeByChatId.set(chatId, nextMode);
+        }
+        if (nextKeep !== undefined) {
+          this.toolProgressKeepByChatId.set(chatId, nextKeep);
+        }
+
+        const effectiveMode = this.getChatToolProgressMode(chatId);
+        const effectiveKeep = this.getChatToolProgressKeep(chatId);
+        await this.sendReply(
+          chatId,
+          `⚙️ Tool progress updated: mode=${effectiveMode} | on-finish=${effectiveKeep ? "keep" : "delete"}`,
+          msg.id,
+        );
+        return;
+      }
+
+      case "poll":
+      case "bg":
+      case "unsend":
+      case "card": {
+        const { adapter, rawChatId } = this.resolveNativeAdapter(chatId, msg.channel);
+        await handlePhotonNativeCommand({
+          cmd,
+          args,
+          chatId,
+          rawChatId,
+          channelName: msg.channel,
+          replyToMessageId: msg.id,
+          adapter,
+          sendReply: (to, text, replyTo) => this.sendReply(to, text, replyTo),
+        });
         return;
       }
 
@@ -2000,6 +2175,21 @@ export class GatewayRouter {
     const model = stored?.model ?? this.config.defaultModel;
     const effort = stored?.effort ?? this.config.defaultEffort;
 
+    const useLiveProgress =
+      !options.isLoop && this.shouldUseLiveProgressEdit(chatId, msg.channel);
+    const toolProgressMode = this.getChatToolProgressMode(chatId);
+    const liveProgress = useLiveProgress
+      ? new LiveProgressTracker({
+          chatId,
+          modelLabel: model ?? "default",
+          channel: this.channel,
+          keepOnComplete: this.getChatToolProgressKeep(chatId),
+          editIntervalMs: this.config.toolProgressEditIntervalMs ?? 1500,
+          verbosity: this.getChatVerbosity(chatId),
+          replyToMessageId: msg.id,
+        })
+      : undefined;
+
     try {
       // Silence progress & stall watchdog (interactive turns only).
       if (
@@ -2034,8 +2224,9 @@ export class GatewayRouter {
               return;
             }
 
-            // `off` silences periodic pulses but never the stall alert above.
-            if (verbosity === "off") {
+            // `off`, explicit `off` mode, and live edited cards all suppress pulses,
+            // but the stall alert above always fires.
+            if (verbosity === "off" || toolProgressMode === "off" || useLiveProgress) {
               return;
             }
 
@@ -2051,7 +2242,8 @@ export class GatewayRouter {
                   : "";
                 progressText = `⏳ [${modelLabel}] 遇到临时异常，正在第 ${activity.retryCount}/${activity.maxRetries} 次重试${reason}，已耗时 ${elapsed}…`;
               } else if (activity?.phase === "tool" && activity.currentTool) {
-                progressText = `⏳ [${modelLabel}] 处理中（已耗时 ${elapsed}）：正在执行工具「${activity.currentTool}」（已调用 ${activity.toolCount} 次）。发送 /stop 可取消。`;
+                const toolTitle = sanitizeToolTitle(activity.currentTool, 48);
+                progressText = `⏳ [${modelLabel}] 处理中（已耗时 ${elapsed}）：正在执行工具「${toolTitle}」（已调用 ${activity.toolCount} 次）。发送 /stop 可取消。`;
               } else {
                 const toolNote = activity?.toolCount
                   ? `，已调用 ${activity.toolCount} 次工具`
@@ -2091,6 +2283,9 @@ export class GatewayRouter {
         model,
         effort,
         approvalMode,
+        callbacks: liveProgress
+          ? { onToolCall: (event) => liveProgress.onToolCall(event) }
+          : undefined,
       });
 
       const wasResetDuringTurn =
@@ -2100,6 +2295,7 @@ export class GatewayRouter {
         result.stopReason === "cancelled";
 
       if (wasResetDuringTurn) {
+        await liveProgress?.finish("cancelled");
         return;
       }
 
@@ -2118,6 +2314,7 @@ export class GatewayRouter {
         this.reactionsEnabled(msg.channel) && Boolean(this.channel.react) && !options.isLoop;
 
       if (wasUserCancelled && !result.text.trim()) {
+        await liveProgress?.finish("cancelled");
         if (reactionsOn) {
           this.channel.react!(chatId, msg.id, "🛑").catch(() => {});
         }
@@ -2125,13 +2322,14 @@ export class GatewayRouter {
       }
 
       const { cleanText, mediaPaths } = extractOutboundMedia(result.text, cwd);
+      const strippedText = stripIdeFileLinks(cleanText);
       const quotaNotice = await this.maybeGetLowQuotaNotice();
       // Keep media-only replies pristine; the one-shot tip rides on the first text answer.
       const onboardingFooter =
         isFirstCompleted && mediaPaths.length === 0
           ? `💡 已自动建立 [${this.resolveChannelGroup(chatId)}] 分组会话；发 /model 切换模型，发 /help 查看全部指令。`
           : "";
-      const combinedText = [cleanText, quotaNotice, onboardingFooter]
+      const combinedText = [strippedText, quotaNotice, onboardingFooter]
         .filter(Boolean)
         .join("\n\n");
       const emptyResult = !combinedText && mediaPaths.length === 0;
@@ -2142,6 +2340,10 @@ export class GatewayRouter {
         progressTimer = undefined;
       }
       stopTyping();
+
+      // Finalize the live card first: deletes it cleanly (keep=false) or stamps
+      // ✅ (keep=true) BEFORE the final answer lands beneath it.
+      await liveProgress?.finish(wasUserCancelled ? "cancelled" : "completed");
 
       if (!emptyResult) {
         await this.sendReply(
@@ -2166,8 +2368,13 @@ export class GatewayRouter {
       const wasUserCancelled =
         this.cancelledByUser.delete(chatId) && isCancellationError(err);
 
+      if (wasResetDuringTurn || wasUserCancelled) {
+        await liveProgress?.finish("cancelled");
+      }
+
       if (!wasResetDuringTurn && !wasUserCancelled) {
         const message = err instanceof Error ? err.message : String(err);
+        await liveProgress?.finish("failed", message);
         this.lastError = message;
         if (this.reactionsEnabled(msg.channel) && this.channel.react && !options.isLoop) {
           this.channel.react(chatId, msg.id, "👎").catch(() => {});

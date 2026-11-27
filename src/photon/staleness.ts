@@ -12,6 +12,16 @@ export type ProbeOutcome =
   | "offline"
   | "heartbeat_timeout";
 
+/** Optional transport context attached to a live heartbeat observation. */
+export interface HeartbeatMetadata {
+  lineId?: string;
+  phone?: string;
+  projectId?: string;
+  stream?: string;
+  subscriptionId?: string;
+  receivedAt?: number;
+}
+
 export interface StreamStalenessWatchdogOptions {
   silenceThresholdMs?: number;
   probeIntervalMs?: number;
@@ -27,6 +37,8 @@ export interface StreamStalenessWatchdogOptions {
   }) => void | Promise<void>;
   onHeartbeatTimeout?: (info: {
     silentHeartbeatMs: number;
+    lastStream?: string;
+    lastLineId?: string;
   }) => void | Promise<void>;
   nowFn?: () => number;
 }
@@ -117,6 +129,8 @@ export class StreamStalenessWatchdog {
   private probeSpaceId?: string;
   private lastInboundAt: number;
   private lastHeartbeatAt: number;
+  private lastHeartbeatStream?: string;
+  private lastHeartbeatLineId?: string;
   private lastHeartbeatTimeoutAt?: number;
   private lastProbeAt?: number;
   private timer?: ReturnType<typeof setInterval>;
@@ -147,9 +161,16 @@ export class StreamStalenessWatchdog {
    * Records a transport heartbeat. This intentionally does NOT touch
    * `lastInboundAt`: a half-open stream can keep pulsing heartbeats while
    * dropping inbound messages, so inbound-silence detection must stay armed.
+   * Optional `meta` captures line/stream context for diagnostics.
    */
-  recordHeartbeat(at?: number): void {
+  recordHeartbeat(at?: number, meta?: HeartbeatMetadata): void {
     this.lastHeartbeatAt = at ?? this.nowFn();
+    if (meta?.stream !== undefined) {
+      this.lastHeartbeatStream = meta.stream;
+    }
+    if (meta?.lineId !== undefined) {
+      this.lastHeartbeatLineId = meta.lineId;
+    }
   }
 
   setProbeSpaceId(spaceId: string): void {
@@ -161,6 +182,8 @@ export class StreamStalenessWatchdog {
   getState(): {
     lastInboundAt: number;
     lastHeartbeatAt: number;
+    lastHeartbeatStream?: string;
+    lastHeartbeatLineId?: string;
     lastProbeAt?: number;
     probeSpaceId?: string;
     running: boolean;
@@ -168,6 +191,8 @@ export class StreamStalenessWatchdog {
     return {
       lastInboundAt: this.lastInboundAt,
       lastHeartbeatAt: this.lastHeartbeatAt,
+      lastHeartbeatStream: this.lastHeartbeatStream,
+      lastHeartbeatLineId: this.lastHeartbeatLineId,
       lastProbeAt: this.lastProbeAt,
       probeSpaceId: this.probeSpaceId,
       running: this.running,
@@ -216,7 +241,18 @@ export class StreamStalenessWatchdog {
         }
         this.lastHeartbeatTimeoutAt = now;
         if (this.onHeartbeatTimeout) {
-          await this.onHeartbeatTimeout({ silentHeartbeatMs });
+          const payload: {
+            silentHeartbeatMs: number;
+            lastStream?: string;
+            lastLineId?: string;
+          } = { silentHeartbeatMs };
+          if (this.lastHeartbeatStream !== undefined) {
+            payload.lastStream = this.lastHeartbeatStream;
+          }
+          if (this.lastHeartbeatLineId !== undefined) {
+            payload.lastLineId = this.lastHeartbeatLineId;
+          }
+          await this.onHeartbeatTimeout(payload);
         } else {
           await this.onZombieDetected({
             silentMs: silentHeartbeatMs,

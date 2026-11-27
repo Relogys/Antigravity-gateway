@@ -10,6 +10,7 @@ import type {
   OutboundMessage,
 } from "../types.js";
 import { BaseChannelAdapter, type InboundHandler } from "./base.js";
+import { stripMarkdownToReadableText } from "./format.js";
 import {
   BoundedDedupeCache,
   chunkText,
@@ -505,7 +506,9 @@ export class OneBotChannelAdapter extends BaseChannelAdapter {
       }
     };
 
-    for (const chunk of chunkText(msg.text ?? "", MAX_TEXT)) {
+    const text =
+      msg.markdown === true ? stripMarkdownToReadableText(msg.text ?? "") : (msg.text ?? "");
+    for (const chunk of chunkText(text, MAX_TEXT)) {
       const segs: OneBotSegment[] = [];
       if (replyTo) {
         segs.push({ type: "reply", data: { id: replyTo } });

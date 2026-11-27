@@ -9,6 +9,7 @@ import type {
   OutboundMessage,
 } from "../types.js";
 import { BaseChannelAdapter, type InboundHandler } from "./base.js";
+import { stripIdeFileLinks } from "./format.js";
 import {
   BoundedDedupeCache,
   MAX_INLINE_MEDIA_BYTES,
@@ -106,6 +107,11 @@ export interface SlackAppLike {
     chat: {
       postMessage(args: Record<string, unknown>): Promise<{ ts?: string }>;
       update(args: Record<string, unknown>): Promise<unknown>;
+      delete?: (args: {
+        token?: string;
+        channel: string;
+        ts: string;
+      }) => Promise<unknown>;
     };
     reactions: { add(args: Record<string, unknown>): Promise<unknown> };
     filesUploadV2?: (args: Record<string, unknown>) => Promise<unknown>;
@@ -244,7 +250,9 @@ export class SlackChannelAdapter extends BaseChannelAdapter {
   async sendMessage(msg: OutboundMessage): Promise<{ messageId?: string } | void> {
     const app = this.requireApp();
     const threadTs = this.resolveThread(msg.chatId, msg.replyToMessageId);
-    const chunks = chunkText(msg.text ?? "", SLACK_MAX_TEXT);
+    const text =
+      msg.markdown === true ? stripIdeFileLinks(msg.text ?? "") : (msg.text ?? "");
+    const chunks = chunkText(text, SLACK_MAX_TEXT);
     let lastTs: string | undefined;
 
     for (const chunk of chunks) {
@@ -288,12 +296,26 @@ export class SlackChannelAdapter extends BaseChannelAdapter {
     }
   }
 
-  async editMessage(chatId: string, messageId: string, text: string): Promise<void> {
+  async editMessage(
+    chatId: string,
+    messageId: string,
+    text: string,
+    options?: { markdown?: boolean },
+  ): Promise<void> {
+    const next = options?.markdown === true ? stripIdeFileLinks(text) : text;
     await this.requireApp().client.chat.update({
       token: this.botToken,
       channel: chatId,
       ts: messageId,
-      text: text.slice(0, SLACK_MAX_TEXT + 100) || "…",
+      text: next.slice(0, SLACK_MAX_TEXT + 100) || "…",
+    });
+  }
+
+  async deleteMessage(chatId: string, messageId: string): Promise<void> {
+    await this.requireApp().client.chat.delete?.({
+      token: this.botToken,
+      channel: chatId,
+      ts: messageId,
     });
   }
 

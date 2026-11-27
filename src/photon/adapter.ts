@@ -8,14 +8,17 @@ import {
   Spectrum,
   attachment,
   markdown,
+  poll,
   richlink,
   text,
   voice,
 } from "spectrum-ts";
 import {
   type IMessageMessageEffect,
+  background,
   effect,
   imessage,
+  nativeContactCard,
 } from "spectrum-ts/providers/imessage";
 import { normalizeSenderId, type GatewayConfig, type PhotonConfig } from "../config.js";
 import type {
@@ -25,6 +28,7 @@ import type {
   InboundMessage,
   OutboundAttachment,
   OutboundMessage,
+  PhotonNativeCapabilities,
 } from "../types.js";
 import {
   chooseSendFormat,
@@ -32,7 +36,38 @@ import {
   normalizeSpaceId,
   sanitizeForIMessage,
 } from "./format.js";
-import { StreamStalenessWatchdog } from "./staleness.js";
+import {
+  type HeartbeatMetadata,
+  StreamStalenessWatchdog,
+} from "./staleness.js";
+
+/** Built-in Messages backgrounds supported by `@spectrum-ts/imessage@12.16.0`. */
+export const PHOTON_BACKGROUND_PRESETS = [
+  "skyDusk",
+  "skyHaze",
+  "skySunset",
+  "skyClear",
+  "skySunrise",
+  "skyDawn",
+  "waterLight",
+  "waterDark",
+  "auroraGreen",
+  "auroraPurple",
+  "auroraPink",
+  "colorMango",
+  "colorIce",
+  "colorPlum",
+  "colorDeepSea",
+  "colorGreenApple",
+  "colorCherry",
+  "colorBubblegum",
+  "colorTangerine",
+  "colorMagenta",
+  "colorLime",
+  "colorSilver",
+  "colorCarbon",
+  "colorStone",
+] as const;
 
 const DEDUPE_TTL_MS = 48 * 60 * 60 * 1000;
 const DEDUPE_MAX_ENTRIES = 4000;
@@ -57,6 +92,30 @@ function stripPlaceholders(value: string): string {
   return value.replace(OBJECT_REPLACEMENT_RE, "");
 }
 
+/** Minimal Markdown stripper used only as a plain-text fallback when a styled send fails. */
+function stripBasicMarkdownFallback(value: string): string {
+  if (!value) {
+    return value;
+  }
+  const lines = value.split("\n").map((line) => {
+    const heading = line.match(/^\s*#{1,6}\s+(.*)$/);
+    return heading ? (heading[1] ?? "") : line;
+  });
+  return lines
+    .join("\n")
+    .replace(/^\s*```.*$/gm, "")
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+/** Resolve a user-supplied background preset to its canonical casing, or undefined. */
+function resolveBackgroundPreset(input: string): (typeof PHOTON_BACKGROUND_PRESETS)[number] | undefined {
+  const needle = input.trim().toLowerCase();
+  return PHOTON_BACKGROUND_PRESETS.find((preset) => preset.toLowerCase() === needle);
+}
+
 function parsePositiveIntEnv(raw: string | undefined): number | undefined {
   if (!raw) {
     return undefined;
@@ -69,13 +128,6 @@ const IGNORED_CONTENT_TYPES = new Set<string>([
   "read",
   "reaction",
   "typing",
-  "poll",
-  "poll_option",
-  "addMember",
-  "removeMember",
-  "rename",
-  "avatar",
-  "leaveSpace",
   "effect",
   "custom",
 ]);
@@ -157,7 +209,7 @@ interface ActiveReaction {
   handle?: ReactionHandle;
 }
 
-export class PhotonChannelAdapter implements ChannelAdapter {
+export class PhotonChannelAdapter implements ChannelAdapter, PhotonNativeCapabilities {
   readonly name = "photon";
 
   private readonly config: GatewayConfig;
@@ -180,6 +232,8 @@ export class PhotonChannelAdapter implements ChannelAdapter {
   private lastInboundAt?: number;
   private lastOutboundAt?: number;
   private lastHeartbeatAt?: number;
+  private lastHeartbeatStream?: string;
+  private lastHeartbeatLineId?: string;
   private lastError?: string;
 
   private readonly seenIds = new Map<string, number>();
@@ -189,6 +243,7 @@ export class PhotonChannelAdapter implements ChannelAdapter {
   private readonly lastUrlAtByChatId = new Map<string, number>();
   private readonly lastTypingAtByChatId = new Map<string, number>();
   private readonly activeReactionsByMessageId = new Map<string, ActiveReaction>();
+  private readonly lastOutboundMessageIdByChatId = new Map<string, string>();
 
   constructor(
     config: GatewayConfig,
@@ -237,12 +292,16 @@ export class PhotonChannelAdapter implements ChannelAdapter {
     lastInboundAt?: number;
     lastOutboundAt?: number;
     lastHeartbeatAt?: number;
+    heartbeatStream?: string;
+    heartbeatLineId?: string;
     lastError?: string;
   } {
     return {
       lastInboundAt: this.lastInboundAt,
       lastOutboundAt: this.lastOutboundAt,
       lastHeartbeatAt: this.lastHeartbeatAt,
+      heartbeatStream: this.lastHeartbeatStream,
+      heartbeatLineId: this.lastHeartbeatLineId,
       lastError: this.lastError,
     };
   }
@@ -341,6 +400,7 @@ export class PhotonChannelAdapter implements ChannelAdapter {
     this.lastUrlAtByChatId.clear();
     this.lastTypingAtByChatId.clear();
     this.activeReactionsByMessageId.clear();
+    this.lastOutboundMessageIdByChatId.clear();
   }
 
   /**
@@ -357,32 +417,48 @@ export class PhotonChannelAdapter implements ChannelAdapter {
     }
   }
 
-  private async createSpectrumApp(): Promise<Awaited<ReturnType<typeof Spectrum>>> {
+  private async createSpectrumApp(
+    parentSignal?: AbortSignal,
+  ): Promise<Awaited<ReturnType<typeof Spectrum>>> {
+    // Abort initialization on connect timeout or when the parent loop aborts.
+    const connectAbort = new AbortController();
+    const abortFromParent = () => connectAbort.abort();
+    if (parentSignal) {
+      if (parentSignal.aborted) {
+        connectAbort.abort();
+      } else {
+        parentSignal.addEventListener("abort", abortFromParent, { once: true });
+      }
+    }
+
     const pending = Spectrum({
       projectId: this.photon.projectId,
       projectSecret: this.photon.projectSecret,
       providers: [
         imessage.config({
-          onHeartbeat: () => {
-            const heartbeatAt = Date.now();
+          onHeartbeat: (hb?: HeartbeatMetadata) => {
+            const heartbeatAt = hb?.receivedAt ?? Date.now();
             this.lastHeartbeatAt = heartbeatAt;
-            this.watchdog?.recordHeartbeat(heartbeatAt);
+            this.lastHeartbeatStream = hb?.stream;
+            this.lastHeartbeatLineId = hb?.lineId;
+            this.watchdog?.recordHeartbeat(heartbeatAt, hb);
           },
         }),
       ],
+      signal: connectAbort.signal,
       options: {
         logLevel: this.config.logLevel,
       },
     });
 
-    // A hung handshake must not wedge the reconnect loop: time out, retry, and make sure
-    // a late-arriving app is closed instead of leaking.
+    // A hung handshake must not wedge the reconnect loop: time out, abort the
+    // signal, retry, and make sure a late-arriving app is closed instead of leaking.
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<never>((_, reject) => {
-      timer = setTimeout(
-        () => reject(new Error("Spectrum connection attempt timed out")),
-        this.connectTimeoutMs,
-      );
+      timer = setTimeout(() => {
+        connectAbort.abort();
+        reject(new Error("Spectrum connection attempt timed out"));
+      }, this.connectTimeoutMs);
       timer.unref?.();
     });
     try {
@@ -398,6 +474,9 @@ export class PhotonChannelAdapter implements ChannelAdapter {
       if (timer) {
         clearTimeout(timer);
       }
+      if (parentSignal) {
+        parentSignal.removeEventListener("abort", abortFromParent);
+      }
     }
   }
 
@@ -406,7 +485,7 @@ export class PhotonChannelAdapter implements ChannelAdapter {
 
     while (!this.stopping && !signal.aborted) {
       try {
-        const currentApp = await this.createSpectrumApp();
+        const currentApp = await this.createSpectrumApp(signal);
         if (this.stopping || signal.aborted) {
           await currentApp.stop().catch(() => undefined);
           break;
@@ -512,6 +591,7 @@ export class PhotonChannelAdapter implements ChannelAdapter {
     chatId: string,
     rawContent: Content,
     now: number,
+    rawMessage?: Message,
   ): Promise<{
     textParts: string[];
     attachments: InboundAttachment[];
@@ -525,6 +605,7 @@ export class PhotonChannelAdapter implements ChannelAdapter {
         chatId,
         rawContent.content as Content,
         now,
+        rawMessage,
       );
       const target = rawContent.target;
       const targetText = target ? this.extractPlainText(target.content) : "";
@@ -546,6 +627,7 @@ export class PhotonChannelAdapter implements ChannelAdapter {
           chatId,
           item.content as Content,
           now,
+          item as Message,
         );
         if (!sub.ignored) {
           textParts.push(...sub.textParts);
@@ -641,6 +723,143 @@ export class PhotonChannelAdapter implements ChannelAdapter {
         return {
           textParts: [],
           attachments: [inboundAtt],
+          ignored: false,
+        };
+      }
+      case "poll": {
+        const title = rawContent.title?.trim() || "Untitled poll";
+        const options = Array.isArray(rawContent.options)
+          ? rawContent.options
+              .map((option) => (typeof option?.title === "string" ? option.title.trim() : ""))
+              .filter((optionTitle) => optionTitle.length > 0)
+          : [];
+        const change = rawContent.change ?? "created";
+        return {
+          textParts: [
+            `[iMessage Poll (${change}): "${title}" | options: ${options.join(", ") || "none"}]`,
+          ],
+          attachments: [],
+          ignored: false,
+        };
+      }
+      case "poll_option": {
+        const optionTitle =
+          typeof rawContent.option?.title === "string"
+            ? rawContent.option.title.trim()
+            : "";
+        const pollTitle =
+          typeof rawContent.poll?.title === "string" ? rawContent.poll.title.trim() : "";
+        const selected = Boolean(rawContent.selected);
+        return {
+          textParts: [
+            `[iMessage Poll Vote (${selected ? "voted" : "unvoted"}): "${optionTitle || "option"}" on "${pollTitle || "poll"}"]`,
+          ],
+          attachments: [],
+          ignored: false,
+        };
+      }
+      case "app": {
+        const appContent = rawContent as unknown as {
+          layout?:
+            | (() => Promise<{ caption?: string; subcaption?: string; summary?: string }>)
+            | { caption?: string; subcaption?: string; summary?: string };
+          url?: (() => Promise<URL | string>) | URL | string;
+        };
+        let layout: { caption?: string; subcaption?: string; summary?: string } | undefined;
+        try {
+          layout =
+            typeof appContent.layout === "function"
+              ? await appContent.layout()
+              : appContent.layout;
+        } catch {
+          layout = undefined;
+        }
+
+        let appUrl: string | undefined;
+        try {
+          const urlValue =
+            typeof appContent.url === "function" ? await appContent.url() : appContent.url;
+          if (urlValue) {
+            appUrl = String(urlValue);
+          }
+        } catch {
+          appUrl = undefined;
+        }
+
+        const miniApp = (
+          rawMessage as
+            | {
+                miniApp?: {
+                  appName?: string;
+                  url?: string;
+                  layout?: { caption?: string; subcaption?: string; summary?: string };
+                };
+              }
+            | undefined
+        )?.miniApp;
+        const appName =
+          typeof miniApp?.appName === "string" ? miniApp.appName.trim() : "";
+        const effectiveLayout = layout ?? miniApp?.layout;
+        const resolvedUrl = appUrl ?? miniApp?.url;
+
+        const summaryParts: string[] = [];
+        for (const part of [
+          effectiveLayout?.caption,
+          effectiveLayout?.subcaption,
+          effectiveLayout?.summary,
+        ]) {
+          const trimmed = typeof part === "string" ? part.trim() : "";
+          if (trimmed) {
+            summaryParts.push(trimmed);
+          }
+        }
+        if (resolvedUrl) {
+          summaryParts.push(resolvedUrl);
+        }
+
+        return {
+          textParts: [
+            `[iMessage Mini App${appName ? ` (${appName})` : ""}: ${summaryParts.join(" — ") || "card"}]`,
+          ],
+          attachments: [],
+          ignored: false,
+        };
+      }
+      case "addMember":
+      case "removeMember": {
+        const members = Array.isArray(rawContent.members)
+          ? rawContent.members.filter(
+              (member): member is string =>
+                typeof member === "string" && member.trim().length > 0,
+            )
+          : [];
+        const verb = rawContent.type === "addMember" ? "added" : "removed";
+        return {
+          textParts: [`[Group event: ${verb} ${members.join(", ") || "members"}]`],
+          attachments: [],
+          ignored: false,
+        };
+      }
+      case "rename": {
+        const newName =
+          typeof rawContent.displayName === "string" ? rawContent.displayName.trim() : "";
+        return {
+          textParts: [`[Group event: renamed group to "${newName || "unnamed"}"]`],
+          attachments: [],
+          ignored: false,
+        };
+      }
+      case "avatar": {
+        return {
+          textParts: ["[Group event: updated group avatar]"],
+          attachments: [],
+          ignored: false,
+        };
+      }
+      case "leaveSpace": {
+        return {
+          textParts: ["[Group event: member left the group]"],
+          attachments: [],
           ignored: false,
         };
       }
@@ -740,6 +959,7 @@ export class PhotonChannelAdapter implements ChannelAdapter {
       chatId,
       message.content,
       now,
+      message,
     );
     if (extracted.ignored) {
       return;
@@ -752,6 +972,12 @@ export class PhotonChannelAdapter implements ChannelAdapter {
     if (!bodyText && extracted.attachments.length === 0) {
       return;
     }
+
+    const senderDeviceId =
+      typeof (message as { senderDeviceId?: unknown }).senderDeviceId === "string" &&
+      (message as { senderDeviceId?: string }).senderDeviceId
+        ? (message as { senderDeviceId?: string }).senderDeviceId
+        : undefined;
 
     const inboundMsg: InboundMessage = {
       id: message.id,
@@ -767,6 +993,7 @@ export class PhotonChannelAdapter implements ChannelAdapter {
       replyToIsOwnMessage: extracted.replyToIsOwnMessage,
       timestamp: message.timestamp.getTime(),
       service,
+      senderDeviceId,
       mentionsBot: isGroup ? this.matchesGroupMention(bodyText) : true,
       raw: message,
     };
@@ -843,7 +1070,7 @@ export class PhotonChannelAdapter implements ChannelAdapter {
     if (msg.text && msg.text.trim().length > 0) {
       const prepared =
         msg.markdown !== false ? sanitizeForIMessage(msg.text) : msg.text.trim();
-      const chunks = chunkMessage(prepared);
+      const chunks = chunkMessage(prepared, this.photon.maxChunkChars);
 
       let replyTarget: Message | undefined;
       if (msg.replyToMessageId && service !== "SMS") {
@@ -867,20 +1094,33 @@ export class PhotonChannelAdapter implements ChannelAdapter {
           contentBuilder = effect(contentBuilder, effectId);
         }
 
-        let sent: Message | undefined;
-        if (i === 0 && replyTarget) {
-          try {
-            sent = await replyTarget.reply(contentBuilder);
-          } catch {
-            sent = await space.send(contentBuilder);
+        const attemptSend = async (builder: ContentInput): Promise<Message | undefined> => {
+          if (i === 0 && replyTarget) {
+            try {
+              return await replyTarget.reply(builder);
+            } catch {
+              return await space.send(builder);
+            }
           }
-        } else {
-          sent = await space.send(contentBuilder);
+          return await space.send(builder);
+        };
+
+        let sent: Message | undefined;
+        try {
+          sent = await attemptSend(contentBuilder);
+        } catch (error) {
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          if (formatted.mode !== "markdown" || /target not allowed/i.test(errorMessage)) {
+            throw error;
+          }
+          // Styled send rejected (e.g. unsupported markdown): retry the chunk once as plain text.
+          sent = await attemptSend(text(stripBasicMarkdownFallback(chunk)));
         }
 
         if (sent) {
           this.cacheMessage(sent);
           lastSentId = sent.id;
+          this.rememberChatEntry(this.lastOutboundMessageIdByChatId, normalized, sent.id);
         }
         this.lastOutboundAt = Date.now();
       }
@@ -915,6 +1155,7 @@ export class PhotonChannelAdapter implements ChannelAdapter {
         if (sent) {
           this.cacheMessage(sent);
           lastSentId = sent.id;
+          this.rememberChatEntry(this.lastOutboundMessageIdByChatId, normalized, sent.id);
         }
         this.lastOutboundAt = Date.now();
       }
@@ -999,7 +1240,12 @@ export class PhotonChannelAdapter implements ChannelAdapter {
     }
   }
 
-  async editMessage(chatId: string, messageId: string, newText: string): Promise<void> {
+  async editMessage(
+    chatId: string,
+    messageId: string,
+    newText: string,
+    _options?: { markdown?: boolean },
+  ): Promise<void> {
     try {
       const space = await this.resolveSpace(chatId);
       const target = await this.resolveTargetMessage(space, messageId);
@@ -1008,6 +1254,95 @@ export class PhotonChannelAdapter implements ChannelAdapter {
       }
     } catch {
       // Edits are best-effort
+    }
+  }
+
+  async deleteMessage(chatId: string, messageId: string): Promise<void> {
+    const space = await this.resolveSpace(chatId);
+    const target = await this.resolveTargetMessage(space, messageId);
+    if (target && target.direction === "outbound" && typeof target.unsend === "function") {
+      await target.unsend();
+    }
+  }
+
+  async sendPoll(
+    chatId: string,
+    title: string,
+    options: string[],
+  ): Promise<{ messageId?: string }> {
+    const cleanTitle = typeof title === "string" ? title.trim() : "";
+    if (!cleanTitle) {
+      throw new Error("Poll title must not be empty.");
+    }
+    const cleanOptions = Array.isArray(options)
+      ? options.map((option) => (typeof option === "string" ? option.trim() : ""))
+      : [];
+    const nonEmptyOptions = cleanOptions.filter((option) => option.length > 0);
+    if (nonEmptyOptions.length < 2) {
+      throw new Error("Poll requires at least two non-empty options.");
+    }
+
+    const space = await this.resolveSpace(chatId);
+    const normalized = normalizeSpaceId(chatId);
+    const sent = await space.send(poll(cleanTitle, nonEmptyOptions));
+    if (sent) {
+      this.cacheMessage(sent);
+      this.rememberChatEntry(this.lastOutboundMessageIdByChatId, normalized, sent.id);
+      this.lastOutboundAt = Date.now();
+    }
+    return { messageId: sent?.id };
+  }
+
+  async setBackground(chatId: string, presetOrClear: string): Promise<void> {
+    const input = typeof presetOrClear === "string" ? presetOrClear.trim() : "";
+    if (!input) {
+      throw new Error("Background requires a preset name or \"clear\".");
+    }
+
+    const space = await this.resolveSpace(chatId);
+    if (input.toLowerCase() === "clear") {
+      await space.send(background("clear"));
+      this.lastOutboundAt = Date.now();
+      return;
+    }
+
+    const preset = resolveBackgroundPreset(input);
+    if (!preset) {
+      throw new Error(
+        `Unknown background preset "${presetOrClear}". Valid presets: ${PHOTON_BACKGROUND_PRESETS.join(", ")} (or "clear").`,
+      );
+    }
+    await space.send(background({ preset }));
+    this.lastOutboundAt = Date.now();
+  }
+
+  async shareContactCard(chatId: string): Promise<void> {
+    const space = await this.resolveSpace(chatId);
+    await space.send(nativeContactCard());
+    this.lastOutboundAt = Date.now();
+  }
+
+  async unsendLastMessage(
+    chatId: string,
+  ): Promise<{ ok: boolean; messageId?: string; reason?: string }> {
+    const normalized = normalizeSpaceId(chatId);
+    const messageId = this.lastOutboundMessageIdByChatId.get(normalized);
+    if (!messageId) {
+      return { ok: false, reason: "No recent outbound message to unsend in this chat." };
+    }
+
+    try {
+      const space = await this.resolveSpace(chatId);
+      const target = await this.resolveTargetMessage(space, messageId);
+      if (!target || typeof target.unsend !== "function") {
+        return { ok: false, messageId, reason: "Message could not be resolved for unsend." };
+      }
+      await target.unsend();
+      this.lastOutboundMessageIdByChatId.delete(normalized);
+      return { ok: true, messageId };
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      return { ok: false, messageId, reason };
     }
   }
 }

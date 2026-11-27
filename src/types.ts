@@ -4,6 +4,8 @@ export type BusyMode = "queue" | "interrupt" | "steer";
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
+export type ToolProgressMode = "auto" | "edit" | "silence" | "off";
+
 export type AttachmentKind = "image" | "audio" | "video" | "file" | "other";
 
 export interface InboundAttachment {
@@ -34,6 +36,8 @@ export interface InboundMessage {
   replyToIsOwnMessage?: boolean;
   timestamp: number;
   service?: "iMessage" | "SMS" | "RCS" | "unknown";
+  /** Optional verified sender device identifier reported by the transport (e.g., Spectrum 12.16+). */
+  senderDeviceId?: string;
   mentionsBot?: boolean;
   raw?: unknown;
 }
@@ -63,15 +67,31 @@ export interface ChannelAdapter {
   sendTyping?(chatId: string, active: boolean): Promise<void>;
   markRead?(chatId: string, messageId?: string): Promise<void>;
   react?(chatId: string, messageId: string, emoji: string): Promise<void>;
-  editMessage?(chatId: string, messageId: string, text: string): Promise<void>;
+  editMessage?(
+    chatId: string,
+    messageId: string,
+    text: string,
+    options?: { markdown?: boolean },
+  ): Promise<void>;
+  deleteMessage?(chatId: string, messageId: string): Promise<void>;
   isConnected(): boolean;
   /** Optional per-channel counters surfaced by `/channels`, health, and the hub. */
   getStats?(): {
     lastInboundAt?: number;
     lastOutboundAt?: number;
     lastHeartbeatAt?: number;
+    heartbeatStream?: string;
+    heartbeatLineId?: string;
     lastError?: string;
   };
+}
+
+/** Optional iMessage / Photon-native interactive capabilities exposed by PhotonChannelAdapter. */
+export interface PhotonNativeCapabilities {
+  sendPoll(chatId: string, title: string, options: string[]): Promise<{ messageId?: string }>;
+  setBackground(chatId: string, presetOrClear: string): Promise<void>;
+  shareContactCard(chatId: string): Promise<void>;
+  unsendLastMessage(chatId: string): Promise<{ ok: boolean; messageId?: string; reason?: string }>;
 }
 
 export interface ChannelHealthStatus {
@@ -80,6 +100,8 @@ export interface ChannelHealthStatus {
   lastInboundAt?: number;
   lastOutboundAt?: number;
   lastHeartbeatAt?: number;
+  heartbeatStream?: string;
+  heartbeatLineId?: string;
   lastError?: string;
 }
 

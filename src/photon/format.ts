@@ -1,7 +1,11 @@
 import path from "node:path";
+import { stripIdeFileLinks } from "../channels/format.js";
 import { normalizeSenderId } from "../config.js";
 
-const DEFAULT_MAX_MESSAGE_LENGTH = 7500;
+/** iOS Messages folds long bubbles behind a `>` chevron past this size. */
+export const DEFAULT_PHOTON_MAX_CHUNK_CHARS = 1600;
+
+const DEFAULT_MAX_MESSAGE_LENGTH = DEFAULT_PHOTON_MAX_CHUNK_CHARS;
 
 const SENSITIVE_PATH_SEGMENTS = new Set([
   ".ssh",
@@ -61,7 +65,7 @@ export function sanitizeForIMessage(text: string): string {
     return "";
   }
 
-  const lines = text.replace(/\r\n/g, "\n").split("\n");
+  const lines = stripIdeFileLinks(text).replace(/\r\n/g, "\n").split("\n");
   const out: string[] = [];
   let inFence = false;
   let tableHeaders: string[] | null = null;
@@ -120,7 +124,19 @@ export function sanitizeForIMessage(text: string): string {
           const hdr = tableHeaders?.[idx];
           return hdr ? `${hdr}: ${cell}` : cell;
         });
-        out.push(`• ${pairs.join(" | ")}`);
+        const compact = `• ${pairs.join(" | ")}`;
+        // Two short columns stay on one scannable line; wide or 3+ column
+        // comparisons become mobile-friendly cards.
+        if (cells.length <= 2 && compact.length <= 60) {
+          out.push(compact);
+          continue;
+        }
+        out.push(`• **${cells[0] ?? ""}**`);
+        for (let idx = 1; idx < cells.length; idx += 1) {
+          const hdr = tableHeaders[idx];
+          const value = cells[idx] ?? "";
+          out.push(hdr ? `  ${hdr}: ${value}` : `  ${value}`);
+        }
         continue;
       }
 
@@ -144,13 +160,13 @@ export function sanitizeForIMessage(text: string): string {
 }
 
 const BARE_URL_RE = /^https?:\/\/\S+$/i;
-const CONTAINS_URL_RE = /https?:\/\/\S+/i;
 
 /**
  * Select the safest Spectrum content mode for an outbound text message:
  * - Bare single http(s) URL -> `"richlink"`
- * - Any text containing a URL -> `"text"` (avoids markdown/data-detection edge cases)
- * - Otherwise `"markdown"` when `preferMarkdown !== false`, else `"text"`
+ * - Otherwise `"markdown"` when `preferMarkdown !== false`, else `"text"`.
+ *   `@spectrum-ts/imessage` renders Markdown with embedded URLs into real
+ *   Apple UTF-16 formatting ranges, so inline URLs no longer force plain text.
  */
 export function chooseSendFormat(
   text: string,
@@ -167,10 +183,6 @@ export function chooseSendFormat(
     } catch {
       // Fall through to text mode if URL parsing fails
     }
-  }
-
-  if (CONTAINS_URL_RE.test(text)) {
-    return { mode: "text", content: text };
   }
 
   return {
