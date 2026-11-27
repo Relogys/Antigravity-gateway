@@ -30,6 +30,7 @@ const SESSION_COMMANDS = new Set([
   "q",
   "steer",
   "s",
+  "inject",
   "busy",
   "approve",
   "deny",
@@ -262,21 +263,35 @@ export async function handleSessionCommand(
     }
 
     case "steer":
-    case "s": {
+    case "s":
+    case "inject": {
       if (isHelpFlag(args)) {
         await ctx.sendReply(
           chatId,
-          "Usage: /steer <prompt> — Interrupt & redirect the active turn.",
+          "Usage: /steer (/s, /inject) <prompt> — Inject a live mid-turn interjection into the active turn (falls back to cancelling & redirecting if the backend does not support in-flight steering).",
           msg.id,
         );
         return true;
       }
       if (!args) {
-        await ctx.sendReply(chatId, "Usage: /steer <prompt>", msg.id);
+        await ctx.sendReply(chatId, "Usage: /steer (/s, /inject) <prompt>", msg.id);
         return true;
       }
       if (!busy) {
-        await ctx.handleUserPrompt(msg, args, []);
+        await ctx.handleUserPrompt(msg, args, msg.attachments ?? []);
+        return true;
+      }
+      const steered = await ctx.steerActiveTurn(args, msg.attachments);
+      if (steered) {
+        await ctx.sendReply(
+          chatId,
+          "💬 Injected into active turn (in-flight).",
+          msg.id,
+        );
+        return true;
+      }
+      if (!ctx.isBusy()) {
+        await ctx.handleUserPrompt(msg, args, msg.attachments ?? []);
         return true;
       }
       ctx.clearQueue();
@@ -291,7 +306,12 @@ export async function handleSessionCommand(
       if (isHelpFlag(args)) {
         await ctx.sendReply(
           chatId,
-          "Usage: /busy [queue|interrupt|steer] — Set the busy-turn policy.",
+          [
+            "Usage: /busy [steer|queue|interrupt] — Set the busy-turn policy.",
+            "steer — live mid-turn interjection without cancelling (default)",
+            "queue — FIFO wait queue drained after the active turn finishes",
+            "interrupt — cancel the active turn and replace it with the new prompt",
+          ].join("\n"),
           msg.id,
         );
         return true;
@@ -299,7 +319,7 @@ export async function handleSessionCommand(
       if (!args) {
         await ctx.sendReply(
           chatId,
-          `Current busy mode: ${ctx.getBusyMode()} (options: queue, interrupt, steer)`,
+          `Current busy mode: ${ctx.getBusyMode()} (options: steer [default], queue, interrupt)`,
           msg.id,
         );
         return true;
@@ -308,7 +328,7 @@ export async function handleSessionCommand(
       if (next !== "queue" && next !== "interrupt" && next !== "steer") {
         await ctx.sendReply(
           chatId,
-          "Invalid busy mode. Use: /busy [queue|interrupt|steer]",
+          "Invalid busy mode. Use: /busy [steer|queue|interrupt]",
           msg.id,
         );
         return true;

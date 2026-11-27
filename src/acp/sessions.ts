@@ -41,6 +41,13 @@ export interface AgyAcpClientLike {
       permissionHandler?: AcpPermissionHandler;
     },
   ): Promise<AgentTurnResult>;
+  steer?(
+    sessionId: string,
+    input: {
+      text: string;
+      attachments?: InboundAttachment[];
+    },
+  ): Promise<boolean>;
   cancel(sessionId: string): Promise<void>;
   getAvailableModels(): string[];
   getAvailableBaseModels(): string[];
@@ -354,11 +361,11 @@ export class AgyAgentBackend implements AgentBackend {
           model: initialModel?.model,
           effort: this.config.defaultEffort ?? initialModel?.effort,
           approvalMode: this.config.approvalMode,
-          busyMode: "queue",
+          busyMode: this.config.defaultBusyMode ?? "steer",
           createdAt: now,
           updatedAt: now,
         },
-        busyMode: "queue",
+        busyMode: this.config.defaultBusyMode ?? "steer",
         activeTurn: false,
         queuedPrompts: [],
         turnChain: Promise.resolve(),
@@ -737,6 +744,28 @@ export class AgyAgentBackend implements AgentBackend {
         activity.phase = "retrying";
       }
     }
+  }
+
+  async steerTurn(
+    chatId: string,
+    text: string,
+    attachments?: InboundAttachment[],
+  ): Promise<boolean> {
+    const state = this.chats.get(chatId);
+    if (!state || !state.activeTurn || !state.info.sessionId || !this.client.steer) {
+      return false;
+    }
+    const steered = await this.client.steer(state.info.sessionId, {
+      text,
+      attachments,
+    });
+    if (steered) {
+      const activity = this.activeTurnActivities.get(chatId);
+      if (activity) {
+        activity.lastActivityAt = Date.now();
+      }
+    }
+    return steered;
   }
 
   async cancelTurn(chatId: string): Promise<boolean> {

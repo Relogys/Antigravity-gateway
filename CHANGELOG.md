@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## [0.4.3] - 2026-11-27
+
+### Live Mid-Turn Steering, Intermediate Reply Bubbles & Photon Capability Gating
+
+- **Pre-tool-call intermediate reply bubble flushing**: `TurnExecutor` now flushes buffered assistant text immediately as separate chat bubbles before tool execution begins (controlled by `STREAM_INTERMEDIATE_REPLIES=true` by default), keeping narrative updates clearly separated from final tool-assisted answers.
+- **Native ACP in-flight mid-turn steering (`/steer`, `/s`, `/inject`)**: `AgyAcpClient.steer()` and `AgyAgentBackend.steerTurn()` inject follow-up prompts directly into an active turn without cancelling running tools, flushing pending output first. `DEFAULT_BUSY_MODE` now defaults to `steer` (`queue` and `interrupt` remain configurable via `DEFAULT_BUSY_MODE` and `/busy`), with automatic fallback to cancel-and-redirect when a backend does not support in-flight steering.
+- **Photon native command gating & context-aware `/help`**: Added `PHOTON_NATIVE_COMMANDS` (`all` | `none` | comma-separated subset of `poll,bg,unsend,card`), automatic runtime detection of unsupported Photon/Spectrum backend errors (`UNIMPLEMENTED`, shared-mode / plan restrictions) with clean guidance, and channel/capability-aware `/help` formatting that hides unavailable Photon commands.
+- **Windows service & supervisor hardening**: Updated `scripts/install-task.ps1` for non-admin current-user Task Scheduler registration and fixed PowerShell 5.1 stderr handling and `.clean_shutdown` exit coordination in `scripts/start-gateway.ps1`.
+
 ## [0.4.2] - 2026-11-26
 
 ### Interactive UX, Modularity & Zero High Prod Advisories

@@ -97,6 +97,8 @@ export interface ChannelAdapter {
   };
 }
 
+export type PhotonNativeCommandName = "poll" | "bg" | "unsend" | "card";
+
 /** Optional iMessage / Photon-native interactive capabilities exposed by PhotonChannelAdapter. */
 export interface PhotonNativeCapabilities {
   sendPoll(chatId: string, title: string, options: string[]): Promise<{ messageId?: string }>;
@@ -235,6 +237,12 @@ export interface AgentBackend {
   start?(): Promise<void>;
   stop(): Promise<void>;
   sendTurn(input: AgentTurnInput): Promise<AgentTurnResult>;
+  /** Inject a live mid-turn steering prompt into an active turn without cancelling running tools. */
+  steerTurn?(
+    chatId: string,
+    text: string,
+    attachments?: InboundAttachment[],
+  ): Promise<boolean>;
   cancelTurn(chatId: string): Promise<boolean>;
   resetSession(chatId: string): Promise<void>;
   listSessions(cwd?: string): Promise<AcpSessionSummary[]>;

@@ -27,6 +27,46 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+const UNSUPPORTED_BACKEND_PATTERN =
+  /\b(?:UNIMPLEMENTED|UnsupportedError|FAILED_PRECONDITION|PERMISSION_DENIED)\b|not supported|unsupported|shared mode|requires dedicated|not enabled|not available on this plan/i;
+
+/**
+ * Returns `true` when an error or failure reason from Photon / Spectrum
+ * indicates the active backend or line does not support the requested native
+ * iMessage capability (e.g., gRPC `UNIMPLEMENTED`, shared-mode restrictions).
+ */
+export function isUnsupportedPhotonBackendError(err: unknown): boolean {
+  const seen = new Set<unknown>();
+  const parts: string[] = [];
+  let current: unknown = err;
+
+  while (current !== null && current !== undefined && !seen.has(current)) {
+    seen.add(current);
+    if (typeof current === "object") {
+      const rec = current as Record<string, unknown>;
+      if (rec.code === 12 || rec.code === 7 || rec.status === 12 || rec.status === 7) {
+        return true;
+      }
+      if (typeof rec.name === "string") parts.push(rec.name);
+      if (typeof rec.message === "string") parts.push(rec.message);
+      if (typeof rec.details === "string") parts.push(rec.details);
+      if (typeof rec.code === "string") parts.push(rec.code);
+      if (parts.length === 0 && current instanceof Error) {
+        parts.push(current.message);
+      }
+      current = rec.cause;
+    } else {
+      parts.push(String(current));
+      break;
+    }
+  }
+
+  if (parts.length === 0) {
+    return false;
+  }
+  return UNSUPPORTED_BACKEND_PATTERN.test(parts.join(" "));
+}
+
 /**
  * Structural check for adapters that expose the Photon iMessage native surface
  * (polls, chat backgrounds, contact cards, unsend). Never trusts `name` alone.
@@ -54,11 +94,25 @@ export interface PhotonNativeCommandContext {
   channelName: string;
   replyToMessageId?: string;
   adapter?: unknown;
+  enabledCommands?: ReadonlySet<string>;
+  unsupportedCommands?: Set<string>;
   sendReply: (
     chatId: string,
     text: string,
     replyToMessageId?: string,
   ) => Promise<void>;
+}
+
+async function replyUnsupportedBackend(
+  ctx: PhotonNativeCommandContext,
+  cmd: string,
+): Promise<void> {
+  ctx.unsupportedCommands?.add(cmd);
+  await ctx.sendReply(
+    ctx.chatId,
+    `⚠️ /${cmd} is not supported by your current Photon backend/line. Tip: set PHOTON_NATIVE_COMMANDS in .env to enable only supported commands.`,
+    ctx.replyToMessageId,
+  );
 }
 
 function formatBackgroundList(): string {
@@ -122,6 +176,10 @@ async function runPoll(
       ctx.replyToMessageId,
     );
   } catch (err) {
+    if (isUnsupportedPhotonBackendError(err)) {
+      await replyUnsupportedBackend(ctx, "poll");
+      return;
+    }
     await ctx.sendReply(
       ctx.chatId,
       `⚠️ Could not create poll: ${errorMessage(err)}`,
@@ -145,6 +203,10 @@ async function runBackground(
       await adapter.setBackground(ctx.rawChatId, "clear");
       await ctx.sendReply(ctx.chatId, "🎨 Chat background cleared.", ctx.replyToMessageId);
     } catch (err) {
+      if (isUnsupportedPhotonBackendError(err)) {
+        await replyUnsupportedBackend(ctx, "bg");
+        return;
+      }
       await ctx.sendReply(ctx.chatId, `⚠️ ${errorMessage(err)}`, ctx.replyToMessageId);
     }
     return;
@@ -158,6 +220,10 @@ async function runBackground(
       ctx.replyToMessageId,
     );
   } catch (err) {
+    if (isUnsupportedPhotonBackendError(err)) {
+      await replyUnsupportedBackend(ctx, "bg");
+      return;
+    }
     await ctx.sendReply(ctx.chatId, `⚠️ ${errorMessage(err)}`, ctx.replyToMessageId);
   }
 }
@@ -174,6 +240,10 @@ async function runCard(
       ctx.replyToMessageId,
     );
   } catch (err) {
+    if (isUnsupportedPhotonBackendError(err)) {
+      await replyUnsupportedBackend(ctx, "card");
+      return;
+    }
     await ctx.sendReply(
       ctx.chatId,
       `⚠️ Could not share contact card: ${errorMessage(err)}`,
@@ -190,6 +260,8 @@ async function runUnsend(
     const res = await adapter.unsendLastMessage(ctx.rawChatId);
     if (res.ok) {
       await ctx.sendReply(ctx.chatId, "↩️ Retracted last message.", ctx.replyToMessageId);
+    } else if (res.reason && isUnsupportedPhotonBackendError(res.reason)) {
+      await replyUnsupportedBackend(ctx, "unsend");
     } else {
       await ctx.sendReply(
         ctx.chatId,
@@ -198,6 +270,10 @@ async function runUnsend(
       );
     }
   } catch (err) {
+    if (isUnsupportedPhotonBackendError(err)) {
+      await replyUnsupportedBackend(ctx, "unsend");
+      return;
+    }
     await ctx.sendReply(
       ctx.chatId,
       `⚠️ Could not unsend: ${errorMessage(err)}`,
@@ -237,6 +313,24 @@ export async function handlePhotonNativeCommand(
 
   if (help) {
     await sendCommandHelp(ctx, cmd);
+    return true;
+  }
+
+  if (ctx.enabledCommands && !ctx.enabledCommands.has(cmd)) {
+    await ctx.sendReply(
+      ctx.chatId,
+      `⚠️ /${cmd} is disabled on this gateway (configured via PHOTON_NATIVE_COMMANDS).`,
+      ctx.replyToMessageId,
+    );
+    return true;
+  }
+
+  if (ctx.unsupportedCommands?.has(cmd)) {
+    await ctx.sendReply(
+      ctx.chatId,
+      `⚠️ /${cmd} is not supported by the current Photon backend/line.`,
+      ctx.replyToMessageId,
+    );
     return true;
   }
 

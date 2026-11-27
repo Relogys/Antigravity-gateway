@@ -69,6 +69,7 @@ function isCancellationError(err: unknown): boolean {
 export class TurnExecutor {
   private readonly activeTurnChats = new Set<string>();
   private readonly activeTurnCleanups = new Set<() => void>();
+  private readonly activeTurnFlushers = new Map<string, () => Promise<void>>();
 
   constructor(private readonly host: TurnExecutorHost) {}
 
@@ -78,6 +79,17 @@ export class TurnExecutor {
 
   activeTurnCount(): number {
     return this.activeTurnChats.size;
+  }
+
+  /**
+   * Flushes any buffered pre-tool / pre-interjection text for an active turn
+   * before a live steering prompt is injected so bubbles stay cleanly separated.
+   */
+  async flushPendingOutput(chatId: string): Promise<void> {
+    const flusher = this.activeTurnFlushers.get(chatId);
+    if (flusher) {
+      await flusher();
+    }
   }
 
   /** Force-clear all active typing and progress intervals during shutdown. */
@@ -90,6 +102,7 @@ export class TurnExecutor {
       }
     }
     this.activeTurnCleanups.clear();
+    this.activeTurnFlushers.clear();
   }
 
   async executeTurn(
@@ -313,6 +326,69 @@ export class TurnExecutor {
             msg.senderId || msg.rawSenderId || "",
           ) || undefined;
 
+      const streamIntermediate =
+        !isLoop && this.host.config.streamIntermediateReplies !== false;
+      let pendingSegment = "";
+      let sawTextDelta = false;
+      let flushedSegmentCount = 0;
+      let firstBubbleSent = false;
+      let flushChain: Promise<void> = Promise.resolve();
+
+      const flushPendingSegment = (): Promise<void> => {
+        if (!streamIntermediate) {
+          return flushChain;
+        }
+        if (this.host.getSessionGeneration(chatId) !== turnGeneration) {
+          pendingSegment = "";
+          return flushChain;
+        }
+        if (!pendingSegment.trim()) {
+          // Drop whitespace-only pre-tool buffers so post-tool bubbles don't inherit leading blank lines.
+          pendingSegment = "";
+          return flushChain;
+        }
+
+        const rawSegment = pendingSegment;
+        pendingSegment = "";
+
+        const task = flushChain.then(async () => {
+          if (this.host.getSessionGeneration(chatId) !== turnGeneration) {
+            return;
+          }
+          const { cleanText, mediaPaths } = extractOutboundMedia(rawSegment, cwd);
+          const strippedText = stripIdeFileLinks(cleanText);
+          if (!strippedText && mediaPaths.length === 0) {
+            return;
+          }
+          try {
+            await this.host.sendReply(
+              chatId,
+              strippedText,
+              firstBubbleSent ? undefined : msg.id,
+              mediaPaths,
+            );
+            firstBubbleSent = true;
+            flushedSegmentCount += 1;
+            // Sending an outbound message clears typing indicators on iMessage/Telegram;
+            // re-arm typing immediately so the user sees activity while tools run.
+            if (typingActive) {
+              this.host.channel.sendTyping?.(chatId, true).catch(() => {});
+            }
+          } catch (flushErr) {
+            // Preserve the segment so the final turn reply can still deliver it.
+            pendingSegment = rawSegment + pendingSegment;
+            const errMsg = flushErr instanceof Error ? flushErr.message : String(flushErr);
+            this.host.recordError(`Intermediate reply flush failed: ${errMsg}`);
+          }
+        });
+        flushChain = task.catch(() => {});
+        return task;
+      };
+
+      if (!isLoop) {
+        this.activeTurnFlushers.set(chatId, flushPendingSegment);
+      }
+
       const result = await this.host.backend.sendTurn({
         chatId: backendChatId,
         sessionId: isLoop ? undefined : stored?.sessionId || undefined,
@@ -323,10 +399,30 @@ export class TurnExecutor {
         effort,
         approvalMode,
         requesterSenderId,
-        callbacks: liveProgress
-          ? { onToolCall: (event) => liveProgress.onToolCall(event) }
-          : undefined,
+        callbacks:
+          streamIntermediate || liveProgress
+            ? {
+                ...(streamIntermediate
+                  ? {
+                      onTextDelta: (delta: string) => {
+                        sawTextDelta = true;
+                        pendingSegment += delta;
+                      },
+                    }
+                  : {}),
+                onToolCall: async (event) => {
+                  if (streamIntermediate) {
+                    await flushPendingSegment();
+                  }
+                  if (liveProgress) {
+                    await liveProgress.onToolCall(event);
+                  }
+                },
+              }
+            : undefined,
       });
+
+      await flushChain;
 
       const wasResetDuringTurn =
         !isLoop && this.host.getSessionGeneration(chatId) !== turnGeneration;
@@ -356,7 +452,10 @@ export class TurnExecutor {
         Boolean(this.host.channel.react) &&
         !isLoop;
 
-      if (wasUserCancelled && !result.text.trim()) {
+      const finalRawText =
+        sawTextDelta && flushedSegmentCount > 0 ? pendingSegment : result.text;
+
+      if (wasUserCancelled && !finalRawText.trim() && flushedSegmentCount === 0) {
         await liveProgress?.finish("cancelled");
         if (reactionsOn) {
           this.host.channel.react!(chatId, msg.id, "🛑").catch(() => {});
@@ -364,7 +463,7 @@ export class TurnExecutor {
         return;
       }
 
-      const { cleanText, mediaPaths } = extractOutboundMedia(result.text, cwd);
+      const { cleanText, mediaPaths } = extractOutboundMedia(finalRawText, cwd);
       const strippedText = stripIdeFileLinks(cleanText);
       const quotaNotice = await this.host.maybeGetLowQuotaNotice();
       const onboardingFooter =
@@ -384,14 +483,18 @@ export class TurnExecutor {
         await this.host.sendReply(
           chatId,
           combinedText,
-          isLoop ? undefined : msg.id,
+          isLoop || firstBubbleSent ? undefined : msg.id,
           mediaPaths,
         );
       }
 
       if (reactionsOn) {
         this.host.channel
-          .react!(chatId, msg.id, wasUserCancelled || emptyResult ? "🛑" : "👍")
+          .react!(
+            chatId,
+            msg.id,
+            wasUserCancelled || (emptyResult && flushedSegmentCount === 0) ? "🛑" : "👍",
+          )
           .catch(() => {});
       }
     } catch (err) {
@@ -424,6 +527,9 @@ export class TurnExecutor {
           .catch(() => {});
       }
     } finally {
+      if (!isLoop) {
+        this.activeTurnFlushers.delete(chatId);
+      }
       this.activeTurnCleanups.delete(cleanupTurnTimers);
       cleanupTurnTimers();
       if (isLoop) {

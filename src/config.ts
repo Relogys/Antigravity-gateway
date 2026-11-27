@@ -1,7 +1,13 @@
 import path from "node:path";
 import dotenv from "dotenv";
 import { z } from "zod";
-import type { ApprovalMode, LogLevel, ToolProgressMode } from "./types.js";
+import type {
+  ApprovalMode,
+  BusyMode,
+  LogLevel,
+  PhotonNativeCommandName,
+  ToolProgressMode,
+} from "./types.js";
 
 /** Canonical channel names (also the `channel` field on inbound messages and the chatId prefix). */
 export const CHANNEL_NAMES = [
@@ -209,6 +215,40 @@ export function parseWorkspaceAliases(raw: string | undefined): Record<string, s
   return result;
 }
 
+export const ALL_PHOTON_NATIVE_COMMANDS: readonly PhotonNativeCommandName[] = [
+  "poll",
+  "bg",
+  "unsend",
+  "card",
+];
+
+/**
+ * Parse `PHOTON_NATIVE_COMMANDS`:
+ * - unset / `"all"` -> all 4 native commands (`poll`, `bg`, `unsend`, `card`)
+ * - `"none"` / `"off"` / `"false"` -> empty set (disables all native commands)
+ * - comma-separated list (e.g. `"unsend,poll"`) -> only the listed valid commands
+ */
+export function parsePhotonNativeCommands(
+  raw: string | undefined,
+): Set<PhotonNativeCommandName> {
+  const cleaned = raw?.trim().toLowerCase();
+  if (!cleaned || cleaned === "all" || cleaned === "*" || cleaned === "true") {
+    return new Set(ALL_PHOTON_NATIVE_COMMANDS);
+  }
+  if (cleaned === "none" || cleaned === "off" || cleaned === "false" || cleaned === "0") {
+    return new Set();
+  }
+  const valid = new Set<string>(ALL_PHOTON_NATIVE_COMMANDS);
+  const selected = new Set<PhotonNativeCommandName>();
+  for (const token of cleaned.split(/[,;\s]+/)) {
+    const name = token.replace(/^\/+/, "");
+    if (valid.has(name)) {
+      selected.add(name as PhotonNativeCommandName);
+    }
+  }
+  return selected;
+}
+
 const optionalString = z.string().optional();
 
 /** Numeric env that treats blank strings as "unset" (so `FOO=` falls back to the default). */
@@ -230,6 +270,11 @@ const envSchema = z.object({
   AGY_PASSTHROUGH_ENV: optionalString,
   DEFAULT_CWD: z.string().trim().optional(),
   APPROVAL_MODE: z.enum(["auto", "interactive", "sandbox"]).default("interactive"),
+  DEFAULT_BUSY_MODE: z.preprocess(
+    (v) => (typeof v === "string" ? v.trim().toLowerCase() || undefined : v),
+    z.enum(["queue", "interrupt", "steer"]).default("steer"),
+  ),
+  STREAM_INTERMEDIATE_REPLIES: optionalString,
   DEFAULT_MODEL: z.string().trim().optional(),
   DEFAULT_EFFORT: z.string().trim().optional(),
   GEMINI_API_KEY: z.string().trim().optional(),
@@ -240,6 +285,7 @@ const envSchema = z.object({
   PHOTON_READ_RECEIPTS: z.string().optional(),
   PHOTON_REACTIONS: z.string().optional(),
   PHOTON_MAX_CHUNK_CHARS: numberEnv(400, 7500, 1600),
+  PHOTON_NATIVE_COMMANDS: optionalString,
   QUOTA_WARN_THRESHOLD: z.coerce.number().min(0).max(100).default(15),
   PROGRESS_SILENCE_MS: numberEnv(0, 3_600_000, 120_000),
   SESSION_STALL_TIMEOUT_MS: numberEnv(0, 3_600_000, 300_000),
@@ -397,6 +443,8 @@ export interface PhotonConfig {
   reactions: boolean;
   /** Maximum characters per outbound iMessage bubble before splitting (default 1600). */
   maxChunkChars?: number;
+  /** Enabled Photon native slash commands (`poll`, `bg`, `unsend`, `card`); defaults to all 4. */
+  nativeCommands?: Set<PhotonNativeCommandName>;
 }
 
 export interface TelegramConfig {
@@ -584,6 +632,10 @@ export interface GatewayConfig {
   /** Optional per-IM-channel default workspace (`<CHANNEL>_CWD`), keyed by channel name. */
   channelDefaultCwds: Partial<Record<ChannelName, string>>;
   approvalMode: ApprovalMode;
+  /** Default busy-turn policy for new chats (`steer` | `queue` | `interrupt`, default `steer`). */
+  defaultBusyMode?: BusyMode;
+  /** Flush pre-tool-call assistant text immediately as separate chat bubbles before tool execution (default true). */
+  streamIntermediateReplies?: boolean;
   defaultModel?: string;
   defaultEffort?: string;
   geminiApiKey?: string;
@@ -735,6 +787,7 @@ export function loadConfig(
           readReceipts: parseBoolEnv(parsed.PHOTON_READ_RECEIPTS, true),
           reactions: parseBoolEnv(parsed.PHOTON_REACTIONS, true),
           maxChunkChars: parsed.PHOTON_MAX_CHUNK_CHARS,
+          nativeCommands: parsePhotonNativeCommands(parsed.PHOTON_NATIVE_COMMANDS),
         }
       : undefined;
 
@@ -813,6 +866,8 @@ export function loadConfig(
     defaultCwd,
     channelDefaultCwds,
     approvalMode: parsed.APPROVAL_MODE,
+    defaultBusyMode: parsed.DEFAULT_BUSY_MODE,
+    streamIntermediateReplies: parseBoolEnv(parsed.STREAM_INTERMEDIATE_REPLIES, true),
     defaultModel: parsed.DEFAULT_MODEL || undefined,
     defaultEffort: parsed.DEFAULT_EFFORT || undefined,
     geminiApiKey: parsed.GEMINI_API_KEY || undefined,

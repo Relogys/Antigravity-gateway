@@ -6,6 +6,7 @@ import type {
 import { fetchAgyQuota } from "../acp/quota.js";
 import { splitQualifiedChatId } from "../channels/hub.js";
 import {
+  ALL_PHOTON_NATIVE_COMMANDS,
   getChannelAllowedUsers,
   isPhotonChannel,
   normalizeSenderId,
@@ -28,6 +29,7 @@ import type {
   ModelCatalogEntry,
   OutboundActionButton,
   PendingPermission,
+  PhotonNativeCommandName,
   QuotaSummary,
   SessionInfo,
   ToolProgressMode,
@@ -50,7 +52,7 @@ import { TurnExecutor } from "./turn-executor.js";
 const DEFAULT_TYPING_INTERVAL_MS = 5000;
 const DEFAULT_PROGRESS_POLL_INTERVAL_MS = 15_000;
 const QUOTA_CHECK_INTERVAL_MS = 5 * 60 * 1000;
-const GATEWAY_VERSION = "0.4.2";
+const GATEWAY_VERSION = "0.4.3";
 const MAX_SESSION_LIST_CACHE = 500;
 const MAX_LAST_PROMPTS = 500;
 const REPLY_QUOTE_SNIPPET_MAX = 500;
@@ -146,6 +148,7 @@ const ALWAYS_DISPATCHABLE_COMMANDS = new Set([
   "q",
   "steer",
   "s",
+  "inject",
   "busy",
   "approve",
   "deny",
@@ -232,6 +235,7 @@ export class GatewayRouter {
   private readonly toolProgressModeByChatId = new Map<string, ToolProgressMode>();
   private readonly toolProgressKeepByChatId = new Map<string, boolean>();
   private readonly lastPromptByChatId = new Map<string, string>();
+  private readonly unsupportedPhotonCommands = new Set<string>();
   private readonly turnExecutor: TurnExecutor;
   private cachedQuota?: QuotaSummary;
 
@@ -741,6 +745,24 @@ export class GatewayRouter {
     );
   }
 
+  private getEnabledPhotonCommands(): PhotonNativeCommandName[] {
+    const configured = this.config.photon?.nativeCommands;
+    return ALL_PHOTON_NATIVE_COMMANDS.filter(
+      (cmd) =>
+        (!configured || configured.has(cmd)) &&
+        !this.unsupportedPhotonCommands.has(cmd),
+    );
+  }
+
+  private async steerActiveTurn(
+    chatId: string,
+    text: string,
+    attachments?: InboundAttachment[],
+  ): Promise<boolean> {
+    await this.turnExecutor.flushPendingOutput(chatId);
+    return (await this.backend.steerTurn?.(chatId, text, attachments)) ?? false;
+  }
+
   private getChatBusyMode(chatId: string): BusyMode {
     this.hydrateChatFromStore(chatId);
     if (this.backend.getBusyMode) {
@@ -749,7 +771,8 @@ export class GatewayRouter {
     return (
       this.fallbackBusyModes.get(chatId) ??
       this.store.getSession(chatId)?.busyMode ??
-      "queue"
+      this.config.defaultBusyMode ??
+      "steer"
     );
   }
 
@@ -966,6 +989,8 @@ export class GatewayRouter {
         channelName: msg.channel,
         replyToMessageId: msg.id,
         adapter,
+        enabledCommands: this.config.photon?.nativeCommands,
+        unsupportedCommands: this.unsupportedPhotonCommands,
         sendReply: (to, text, replyTo) => this.sendReply(to, text, replyTo),
       });
       return;
@@ -1005,11 +1030,14 @@ export class GatewayRouter {
       sendReply: (to, text, replyTo) => this.sendReply(to, text, replyTo),
       handleUserPrompt: (m, text, attachments) =>
         this.handleUserPrompt(m, text, attachments),
+      steerActiveTurn: (text, attachments) =>
+        this.steerActiveTurn(chatId, text, attachments),
       isChannelConnected: () => this.channel.isConnected(),
       getChannelStatuses: () => this.getChannelStatuses(),
       resolveAuthSource: () =>
         this.resolveAuthSource(channel, rawSender, senderId),
       resolveNativeAdapter: () => this.resolveNativeAdapter(chatId, channel),
+      getEnabledPhotonCommands: () => this.getEnabledPhotonCommands(),
       isAdminSender: () => this.isAdminSender(channel, rawSender, senderId),
       getVerbosity: () => this.getChatVerbosity(chatId),
       setVerbosity: (level) => this.verbosityByChatId.set(chatId, level),
@@ -1025,6 +1053,7 @@ export class GatewayRouter {
       setApprovalMode: (mode) => this.setChatApprovalMode(chatId, mode),
       getBusyMode: () => this.getChatBusyMode(chatId),
       setBusyMode: (mode) => this.setChatBusyMode(chatId, mode),
+      isBusy: () => this.isChatBusy(chatId),
       getQueue: () => this.getChatQueue(chatId),
       enqueuePrompt: (prompt) => this.enqueueChatPrompt(chatId, prompt),
       clearQueue: () => this.clearChatQueue(chatId),
@@ -1080,10 +1109,30 @@ export class GatewayRouter {
         );
         return;
       }
-      // interrupt or steer: enqueue before cancelling so the single executeTurn loop drains it cleanly
       if (mode === "steer") {
+        const steered = await this.steerActiveTurn(
+          chatId,
+          this.withReplyQuote(msg, text),
+          attachments,
+        );
+        if (steered) {
+          if (this.reactionsEnabled(msg.channel) && this.channel.react) {
+            this.channel.react(chatId, msg.id, "👀").catch(() => {});
+          }
+          await this.sendReply(
+            chatId,
+            "💬 Injected into active turn (in-flight).",
+            msg.id,
+          );
+          return;
+        }
+        if (!this.isChatBusy(chatId)) {
+          await this.executeTurn(msg, text, attachments);
+          return;
+        }
         this.clearChatQueue(chatId);
       }
+      // interrupt or steer fallback: enqueue before cancelling so the single executeTurn loop drains it cleanly
       this.enqueueChatPrompt(chatId, text);
       this.stopDrainChats.delete(chatId);
       this.cancelledByUser.add(chatId);

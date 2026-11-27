@@ -72,6 +72,8 @@ const SENSITIVE_ENV_EXACT_KEYS = new Set([
   "TURN_MAX_RETRIES",
   "INGRESS_DEBOUNCE_MS",
   "AUTO_BOOTSTRAP_CHANNEL_SESSION",
+  "DEFAULT_BUSY_MODE",
+  "STREAM_INTERMEDIATE_REPLIES",
 ]);
 
 /** True for any gateway/channel credential or internal config env variable. */
@@ -169,6 +171,13 @@ interface ActiveTurnState {
   textChunks: string[];
   callbacks?: AgentTurnCallbacks;
   permissionHandler?: AcpPermissionHandler;
+  inFlightCount: number;
+  latestRequestId: number;
+  anyResolved: boolean;
+  lastStopReason: string;
+  lastError?: unknown;
+  latestOutcome?: { ok: true; stopReason: string } | { ok: false; error: Error };
+  resolve: (stopReason: string) => void;
   reject: (err: Error) => void;
 }
 
@@ -654,9 +663,11 @@ export class AgyAcpClient {
     const conn = await this.ensureStarted();
     const blocks = await this.buildPromptBlocks(input.text, input.attachments);
 
-    let rejectActiveTurn: (err: Error) => void = () => undefined;
-    const abortPromise = new Promise<never>((_resolve, reject) => {
-      rejectActiveTurn = reject;
+    let resolveTurn: (stopReason: string) => void = () => undefined;
+    let rejectTurn: (err: Error) => void = () => undefined;
+    const completionPromise = new Promise<string>((resolve, reject) => {
+      resolveTurn = resolve;
+      rejectTurn = reject;
     });
 
     const turnState: ActiveTurnState = {
@@ -664,28 +675,127 @@ export class AgyAcpClient {
       textChunks: [],
       callbacks: input.callbacks,
       permissionHandler: input.permissionHandler,
-      reject: rejectActiveTurn,
+      inFlightCount: 1,
+      latestRequestId: 1,
+      anyResolved: false,
+      lastStopReason: "end_turn",
+      resolve: resolveTurn,
+      reject: rejectTurn,
     };
     this.activeTurns.set(sessionId, turnState);
 
+    this.attachPromptRequest(
+      turnState,
+      1,
+      conn.agent.request(acp.methods.agent.session.prompt, {
+        sessionId,
+        prompt: blocks,
+      }),
+    );
+
     try {
-      const response = await Promise.race([
-        conn.agent.request(acp.methods.agent.session.prompt, {
-          sessionId,
-          prompt: blocks,
-        }),
-        abortPromise,
-      ]);
+      const stopReason = await completionPromise;
       return {
         sessionId,
         text: turnState.textChunks.join(""),
-        stopReason: response.stopReason,
+        stopReason,
       };
     } finally {
       if (this.activeTurns.get(sessionId) === turnState) {
         this.activeTurns.delete(sessionId);
       }
     }
+  }
+
+  /**
+   * Injects a live mid-turn steering prompt into an already-running ACP turn
+   * using `agy acp`'s concurrent `session/prompt` steering semantics. Running
+   * tools continue to completion without cancellation while the agent weaves
+   * the user's interjection into the active turn.
+   *
+   * Returns `true` when dispatched to an active turn, or `false` if no turn is
+   * currently active on `sessionId`.
+   */
+  async steer(
+    sessionId: string,
+    input: {
+      text: string;
+      attachments?: InboundAttachment[];
+    },
+  ): Promise<boolean> {
+    if (!this.isRunning() || !this.connection) {
+      return false;
+    }
+    const turnState = this.activeTurns.get(sessionId);
+    if (!turnState || turnState.inFlightCount <= 0) {
+      return false;
+    }
+
+    const blocks = await this.buildPromptBlocks(input.text, input.attachments);
+    const conn = this.connection;
+    if (!conn || this.activeTurns.get(sessionId) !== turnState || turnState.inFlightCount <= 0) {
+      return false;
+    }
+
+    const reqId = turnState.latestRequestId + 1;
+    turnState.latestRequestId = reqId;
+    turnState.latestOutcome = undefined;
+    turnState.inFlightCount += 1;
+    this.attachPromptRequest(
+      turnState,
+      reqId,
+      conn.agent.request(acp.methods.agent.session.prompt, {
+        sessionId,
+        prompt: blocks,
+      }),
+    );
+    return true;
+  }
+
+  private settleTurnIfIdle(turnState: ActiveTurnState, fallbackError?: Error): void {
+    if (turnState.inFlightCount > 0) {
+      return;
+    }
+    if (turnState.latestOutcome) {
+      if (turnState.latestOutcome.ok) {
+        turnState.resolve(turnState.latestOutcome.stopReason);
+      } else {
+        turnState.reject(turnState.latestOutcome.error);
+      }
+      return;
+    }
+    if (turnState.anyResolved || !fallbackError) {
+      turnState.resolve(turnState.lastStopReason);
+    } else {
+      turnState.reject(fallbackError);
+    }
+  }
+
+  private attachPromptRequest(
+    turnState: ActiveTurnState,
+    reqId: number,
+    requestPromise: Promise<acp.PromptResponse>,
+  ): void {
+    requestPromise.then(
+      (response) => {
+        turnState.anyResolved = true;
+        turnState.lastStopReason = response.stopReason;
+        if (reqId === turnState.latestRequestId) {
+          turnState.latestOutcome = { ok: true, stopReason: response.stopReason };
+        }
+        turnState.inFlightCount -= 1;
+        this.settleTurnIfIdle(turnState);
+      },
+      (err: unknown) => {
+        const error = err instanceof Error ? err : new Error(String(err));
+        turnState.lastError = error;
+        if (reqId === turnState.latestRequestId) {
+          turnState.latestOutcome = { ok: false, error };
+        }
+        turnState.inFlightCount -= 1;
+        this.settleTurnIfIdle(turnState, error);
+      },
+    );
   }
 
   async cancel(sessionId: string): Promise<void> {

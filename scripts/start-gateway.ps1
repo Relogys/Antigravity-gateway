@@ -52,17 +52,57 @@ function Rotate-GatewayLog {
     Write-SupervisorLog "Rotated gateway.log (exceeded 5MB)."
 }
 
+$NodeExe = (Get-Command node -ErrorAction Stop).Source
+
+$RawDataDir = $null
+if (-not [string]::IsNullOrWhiteSpace($env:DATA_DIR)) {
+    $RawDataDir = $env:DATA_DIR.Trim()
+} else {
+    $EnvFile = Join-Path $RepoRoot ".env"
+    if (Test-Path -LiteralPath $EnvFile) {
+        foreach ($Line in Get-Content -LiteralPath $EnvFile -Encoding UTF8) {
+            $Trimmed = $Line.Trim()
+            if (-not $Trimmed -or $Trimmed.StartsWith("#")) {
+                continue
+            }
+            if ($Trimmed -match '^(?:export\s+)?DATA_DIR\s*=\s*(.*)$') {
+                $Candidate = $Matches[1].Trim()
+                if (($Candidate.StartsWith('"') -and $Candidate.EndsWith('"') -and $Candidate.Length -ge 2) -or
+                    ($Candidate.StartsWith("'") -and $Candidate.EndsWith("'") -and $Candidate.Length -ge 2)) {
+                    $Candidate = $Candidate.Substring(1, $Candidate.Length - 2)
+                } else {
+                    $Candidate = ($Candidate -replace '\s+#.*$', '').Trim()
+                }
+                if (-not [string]::IsNullOrWhiteSpace($Candidate)) {
+                    $RawDataDir = $Candidate
+                }
+            }
+        }
+    }
+}
+
+if ([string]::IsNullOrWhiteSpace($RawDataDir)) {
+    $DataDir = Join-Path $RepoRoot "data"
+} elseif ([System.IO.Path]::IsPathRooted($RawDataDir)) {
+    $DataDir = $RawDataDir
+} else {
+    $DataDir = [System.IO.Path]::GetFullPath((Join-Path $RepoRoot $RawDataDir))
+}
+
+$CleanShutdownSentinel = Join-Path $DataDir ".clean_shutdown"
+
 $Delay = 2
 while ($true) {
     Rotate-GatewayLog
-    Write-SupervisorLog "Launching: node $DistEntry"
+    Write-SupervisorLog "Launching: $NodeExe $DistEntry"
     Write-Host "Launching gateway (logs: $GatewayLog)"
 
     $StartedAt = Get-Date
     $ExitCode = 0
     try {
-        & node $DistEntry *>> $GatewayLog
-        $ExitCode = $LASTEXITCODE
+        $CmdArgs = "/d /c `"`"$NodeExe`" `"$DistEntry`" >> `"$GatewayLog`" 2>&1`""
+        $Proc = Start-Process -FilePath "cmd.exe" -ArgumentList $CmdArgs -WorkingDirectory $RepoRoot -NoNewWindow -Wait -PassThru
+        $ExitCode = $Proc.ExitCode
     }
     catch {
         Write-SupervisorLog ("Launcher error: {0}" -f $_.Exception.Message)
@@ -70,8 +110,8 @@ while ($true) {
     }
     $RanSeconds = ((Get-Date) - $StartedAt).TotalSeconds
 
-    if ($ExitCode -eq 0) {
-        Write-SupervisorLog ("Gateway exited cleanly after {0:N0}s." -f $RanSeconds)
+    if ($ExitCode -eq 0 -or (Test-Path -LiteralPath $CleanShutdownSentinel)) {
+        Write-SupervisorLog ("Gateway stopped cleanly after {0:N0}s (exit={1})." -f $RanSeconds, $ExitCode)
         Write-Host "Gateway exited cleanly."
         exit 0
     }

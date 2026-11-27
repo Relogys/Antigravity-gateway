@@ -8,12 +8,20 @@ if (-not (Test-Path $StartScript)) {
     throw "Start script not found: $StartScript"
 }
 
+$CurrentUser = if ($env:USERDOMAIN) { "$env:USERDOMAIN\$env:USERNAME" } else { $env:USERNAME }
+
 $Action = New-ScheduledTaskAction `
     -Execute "powershell.exe" `
     -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$StartScript`"" `
     -WorkingDirectory $RepoRoot
 
-$Trigger = New-ScheduledTaskTrigger -AtLogOn
+$Trigger = New-ScheduledTaskTrigger -AtLogOn -User $CurrentUser
+$Trigger.Delay = "PT10S"
+
+$Principal = New-ScheduledTaskPrincipal `
+    -UserId $CurrentUser `
+    -LogonType Interactive `
+    -RunLevel Limited
 
 $Settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
@@ -27,9 +35,10 @@ Register-ScheduledTask `
     -TaskName $TaskName `
     -Action $Action `
     -Trigger $Trigger `
+    -Principal $Principal `
     -Settings $Settings `
-    -Description "Antigravity iMessage (Photon Spectrum) Gateway" `
+    -Description "Antigravity Multi-Channel Gateway" `
     -Force | Out-Null
 
-Write-Host "Registered scheduled task '$TaskName' (AtLogOn, hidden window, restart on failure)."
+Write-Host "Registered scheduled task '$TaskName' for $CurrentUser (AtLogOn +10s, hidden window, restart on failure)."
 Write-Host "To start now: Start-ScheduledTask -TaskName '$TaskName'"

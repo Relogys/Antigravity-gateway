@@ -1112,10 +1112,28 @@ async function runStopCommand(dataDir: string, logDir?: string): Promise<number>
     return 0;
   }
 
+  // On Windows, `process.kill(pid, "SIGTERM")` terminates immediately without running
+  // JS SIGTERM handlers. Write `.clean_shutdown` BEFORE signalling so a supervisor
+  // never wakes up before the sentinel exists, and clean it up if signalling fails.
+  const cleanShutdownPath = path.join(dataDir, ".clean_shutdown");
+  let wroteWinSentinel = false;
+  if (process.platform === "win32") {
+    try {
+      fs.mkdirSync(dataDir, { recursive: true });
+      fs.writeFileSync(cleanShutdownPath, `${new Date().toISOString()}\n`, "utf8");
+      wroteWinSentinel = true;
+    } catch {
+      // Best-effort sentinel write.
+    }
+  }
+
   try {
     process.kill(pid, "SIGTERM");
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== "ESRCH") {
+      if (wroteWinSentinel) {
+        fs.rmSync(cleanShutdownPath, { force: true });
+      }
       console.error(
         `Failed to signal PID ${pid}: ${err instanceof Error ? err.message : String(err)}`,
       );
@@ -1136,22 +1154,11 @@ async function runStopCommand(dataDir: string, logDir?: string): Promise<number>
   }
 
   if (!exited) {
+    if (wroteWinSentinel) {
+      fs.rmSync(cleanShutdownPath, { force: true });
+    }
     console.error(`Gateway (PID ${pid}) did not exit; leaving ${paths.pidFile} in place.`);
     return 1;
-  }
-
-  // On Windows, `process.kill(pid, "SIGTERM")` terminates immediately without running
-  // JS SIGTERM handlers, so write `.clean_shutdown` here to avoid a false crash notice.
-  if (process.platform === "win32") {
-    try {
-      fs.writeFileSync(
-        path.join(dataDir, ".clean_shutdown"),
-        `${new Date().toISOString()}\n`,
-        "utf8",
-      );
-    } catch {
-      // Best-effort sentinel write.
-    }
   }
 
   fs.rmSync(paths.pidFile, { force: true });

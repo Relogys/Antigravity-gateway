@@ -1,4 +1,4 @@
-import type { GatewayConfig } from "../../config.js";
+import { isPhotonChannel, type GatewayConfig } from "../../config.js";
 import type {
   AcpSessionSummary,
   ApprovalMode,
@@ -46,11 +46,16 @@ export interface RouterCommandContext {
     text: string,
     attachments: InboundAttachment[],
   ): Promise<void>;
+  steerActiveTurn(
+    text: string,
+    attachments?: InboundAttachment[],
+  ): Promise<boolean>;
 
   isChannelConnected(): boolean;
   getChannelStatuses(): Record<string, ChannelHealthStatus>;
   resolveAuthSource(): string | undefined;
   resolveNativeAdapter(): { adapter: unknown; rawChatId: string };
+  getEnabledPhotonCommands?(): readonly string[];
   isAdminSender(): boolean;
 
   getVerbosity(): VerbosityLevel;
@@ -65,6 +70,7 @@ export interface RouterCommandContext {
   setApprovalMode(mode: ApprovalMode): Promise<void>;
   getBusyMode(): BusyMode;
   setBusyMode(mode: BusyMode): Promise<void>;
+  isBusy(): boolean;
   getQueue(): string[];
   enqueuePrompt(prompt: string): number;
   clearQueue(): number;
@@ -90,47 +96,73 @@ export interface RouterCommandContext {
   fetchQuota(): Promise<QuotaSummary>;
 }
 
-export const HELP_TEXT = [
-  "Antigravity Gateway Commands:",
-  "Always available (even while busy):",
-  "• /stop — Cancel active turn",
-  "• /new [title] (/reset) — Start a fresh session (optionally titled)",
-  "• /status — Show session, model, busy & queue state",
-  "• /ping — Health check (uptime & connection state)",
-  "• /usage — Check Antigravity quota (0 tokens)",
-  "• /queue (/q) [prompt|list|clear] — Manage prompt queue",
-  "• /steer (/s) <prompt> — Interrupt & redirect active turn",
-  "• /busy [queue|interrupt|steer] — Set busy-turn policy",
-  "• /approve [once|session|always] | /deny — Resolve tool permission",
-  "• /yolo — Toggle auto-approval mode",
-  "• /verbose [off|brief|full] — Progress-pulse verbosity",
-  "• /progress [auto|edit|silence|off|keep|delete] — Live tool-call progress & cleanup policy",
-  "• /sethome — Set this chat as the recovery home",
-  "• /channels — Show active channels & connection state",
-  "• /whoami | /version | /help",
-  "",
-  "Session & Config (when idle):",
-  "• /retry — Re-run the last prompt in this chat",
-  "• /model [slug] — View or switch model",
-  "• /effort [low|medium|high|xhigh] — Set reasoning effort",
-  "• /mode [default|accept-edits|auto|plan] — Set ACP mode",
-  "• /approvals [auto|interactive|sandbox] — Set permission mode",
-  "• /sessions [channel|all] — List sessions (defaults to this channel group)",
-  "• /groups — Summarize every IM channel session group",
-  "• /resume [id|index] — Resume a saved session",
-  "• /title [name] — View or rename session",
-  "• /compact (/compress) — Summarize & compact context",
-  "• /cwd [path|@alias|save|rm|list] — Switch or bookmark working directories",
-  "• /discard — Discard session & queue",
-  "• /loop [list|add <dur>|daily <HH:MM>|cron <expr>|rm|pause|resume]",
-  "• /remind <dur> <text> — One-way reminder push",
-  "",
-  "Photon iMessage native:",
-  "• /poll <q> | <opt1> | <opt2> — Create native iMessage poll",
-  "• /bg [preset|clear|list] — Set or clear chat background (24 presets)",
-  "• /unsend — Retract bot's last iMessage (~2m window)",
-  "• /card — Share native bot contact card",
-].join("\n");
+const PHOTON_HELP_LINES: Readonly<Record<string, string>> = {
+  poll: "• /poll <q> | <opt1> | <opt2> — Create native iMessage poll",
+  bg: "• /bg [preset|clear|list] — Set or clear chat background (24 presets)",
+  unsend: "• /unsend — Retract bot's last iMessage (~2m window)",
+  card: "• /card — Share native bot contact card",
+};
+
+const PHOTON_HELP_ORDER = ["poll", "bg", "unsend", "card"] as const;
+
+export function formatHelpText(options?: {
+  channel?: string;
+  enabledPhotonCommands?: readonly string[];
+}): string {
+  const lines = [
+    "Antigravity Gateway Commands:",
+    "Always available (even while busy):",
+    "• /stop — Cancel active turn",
+    "• /new [title] (/reset) — Start a fresh session (optionally titled)",
+    "• /status — Show session, model, busy & queue state",
+    "• /ping — Health check (uptime & connection state)",
+    "• /usage — Check Antigravity quota (0 tokens)",
+    "• /queue (/q) [prompt|list|clear] — Manage prompt queue",
+    "• /steer (/s, /inject) <prompt> — Inject mid-turn interjection (falls back to redirect)",
+    "• /busy [steer|queue|interrupt] — Set busy-turn policy (default: steer)",
+    "• /approve [once|session|always] | /deny — Resolve tool permission",
+    "• /yolo — Toggle auto-approval mode",
+    "• /verbose [off|brief|full] — Progress-pulse verbosity",
+    "• /progress [auto|edit|silence|off|keep|delete] — Live tool-call progress & cleanup policy",
+    "• /sethome — Set this chat as the recovery home",
+    "• /channels — Show active channels & connection state",
+    "• /whoami | /version | /help",
+    "",
+    "Session & Config (when idle):",
+    "• /retry — Re-run the last prompt in this chat",
+    "• /model [slug] — View or switch model",
+    "• /effort [low|medium|high|xhigh] — Set reasoning effort",
+    "• /mode [default|accept-edits|auto|plan] — Set ACP mode",
+    "• /approvals [auto|interactive|sandbox] — Set permission mode",
+    "• /sessions [channel|all] — List sessions (defaults to this channel group)",
+    "• /groups — Summarize every IM channel session group",
+    "• /resume [id|index] — Resume a saved session",
+    "• /title [name] — View or rename session",
+    "• /compact (/compress) — Summarize & compact context",
+    "• /cwd [path|@alias|save|rm|list] — Switch or bookmark working directories",
+    "• /discard — Discard session & queue",
+    "• /loop [list|add <dur>|daily <HH:MM>|cron <expr>|rm|pause|resume]",
+    "• /remind <dur> <text> — One-way reminder push",
+  ];
+
+  const showPhoton =
+    options?.channel === undefined || isPhotonChannel(options.channel);
+  if (showPhoton) {
+    const allowed = options?.enabledPhotonCommands
+      ? new Set(options.enabledPhotonCommands.map((c) => c.toLowerCase()))
+      : undefined;
+    const photonLines = PHOTON_HELP_ORDER.filter(
+      (cmd) => !allowed || allowed.has(cmd),
+    ).map((cmd) => PHOTON_HELP_LINES[cmd]);
+    if (photonLines.length > 0) {
+      lines.push("", "Photon iMessage native:", ...photonLines);
+    }
+  }
+
+  return lines.join("\n");
+}
+
+export const HELP_TEXT = formatHelpText();
 
 export function formatUptime(ms: number): string {
   const totalSec = Math.max(0, Math.floor(ms / 1000));
@@ -210,7 +242,14 @@ export async function handleSystemCommand(
   switch (cmd) {
     case "help":
     case "commands":
-      await ctx.sendReply(chatId, HELP_TEXT, msg.id);
+      await ctx.sendReply(
+        chatId,
+        formatHelpText({
+          channel: msg.channel,
+          enabledPhotonCommands: ctx.getEnabledPhotonCommands?.(),
+        }),
+        msg.id,
+      );
       return true;
 
     case "channels":
