@@ -423,7 +423,10 @@ export class PhotonChannelAdapter implements ChannelAdapter {
         if (this.stopping || signal.aborted) {
           break;
         }
-        this.lastError = error instanceof Error ? error.message : String(error);
+        const rawMessage = error instanceof Error ? error.message : String(error);
+        this.lastError = /CatchUpEvents/i.test(rawMessage)
+          ? `Spectrum upstream CatchUpEvents error (retrying): ${rawMessage}`
+          : rawMessage;
       } finally {
         this.connected = false;
         const currentApp = this.app;
@@ -760,6 +763,19 @@ export class PhotonChannelAdapter implements ChannelAdapter {
   }
 
   async sendMessage(msg: OutboundMessage): Promise<{ messageId?: string } | void> {
+    try {
+      return await this.deliverMessage(msg);
+    } catch (error) {
+      if (error instanceof Error && /target not allowed/i.test(error.message)) {
+        throw new Error(
+          "Photon plan restriction (Target not allowed): register this recipient in Photon Dashboard or have them message the bot first.",
+        );
+      }
+      throw error;
+    }
+  }
+
+  private async deliverMessage(msg: OutboundMessage): Promise<{ messageId?: string } | void> {
     const space = await this.resolveSpace(msg.chatId);
     const normalized = normalizeSpaceId(msg.chatId);
     const service = this.lastServiceByChatId.get(normalized);

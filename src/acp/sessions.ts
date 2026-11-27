@@ -9,8 +9,10 @@ import type {
   ApprovalMode,
   BusyMode,
   InboundAttachment,
+  ModelCatalogEntry,
   PendingPermission,
   SessionInfo,
+  TurnActivitySnapshot,
 } from "../types.js";
 import { AgyAcpClient, type AcpPermissionHandler, type NewSessionInfo } from "./client.js";
 import { PermissionManager, type PermissionDecision } from "./permissions.js";
@@ -39,12 +41,16 @@ export interface AgyAcpClientLike {
   getAvailableBaseModels(): string[];
   getAvailableEfforts(): string[];
   getAvailableModes(): string[];
+  getModelCatalog?(): ModelCatalogEntry[];
+  ensureCatalogLoaded?(cwd: string): Promise<ModelCatalogEntry[]>;
 }
 
 export interface AgyAgentBackendOptions {
   client?: AgyAcpClientLike;
   permissionNotifier?: (chatId: string, perm: PendingPermission) => Promise<void> | void;
   permissionManager?: PermissionManager;
+  /** Overrides the default `1500 * attempt` ms backoff between transient retries. */
+  retryDelayMs?: number;
 }
 
 const EFFORT_SUFFIX_RE = /^(.*)-(low|medium|high|xhigh|max)$/i;
@@ -77,6 +83,194 @@ export function splitModelAndEffort(
   return { model: trimmed };
 }
 
+const EFFORT_TOKENS = ["low", "medium", "high", "xhigh"] as const;
+const TRAILING_EFFORT_RE = /^(.*)-(low|medium|high|xhigh)$/i;
+const MODEL_SLUG_RE = /^[a-z0-9][a-z0-9._-]{1,80}$/i;
+const TRANSIENT_TURN_ERROR_RE =
+  /timeout|timed out|rate.?limit|429|502|503|504|unavailable|econnreset|etimedout|epipe|overloaded|internal error|transport/i;
+
+export type ModelResolution =
+  | { ok: true; model: string; label?: string; effort?: string }
+  | { ok: false; reason: "ambiguous"; message: string; candidates: ModelCatalogEntry[] }
+  | { ok: false; reason: "invalid"; message: string };
+
+/**
+ * Resolves fuzzy / numbered / exact user model input against the live catalog.
+ *
+ * Accepts: a 1-based catalog index ("4"), index + effort ("4 xhigh"), a
+ * `<query> <effort>` pair ("hydrogen xhigh"), an exact catalog id / available
+ * slug ("gemini-4-neon-medium"), or a case-insensitive substring ("neon").
+ * Ambiguous and unknown inputs are rejected explicitly so flags like "-h" are
+ * never silently treated as model names.
+ */
+export function resolveModelSelection(
+  input: string,
+  catalog: ModelCatalogEntry[],
+  availableModels: string[],
+  availableEfforts: string[],
+): ModelResolution {
+  const trimmed = input.trim();
+  if (!trimmed) {
+    return {
+      ok: false,
+      reason: "invalid",
+      message: "Provide a model name, number, or exact ID.",
+    };
+  }
+
+  const effortSet = new Set<string>([
+    ...EFFORT_TOKENS,
+    ...availableEfforts.map((e) => e.toLowerCase()),
+  ]);
+  const tokens = trimmed.split(/\s+/);
+  let effort: string | undefined;
+  let query = trimmed;
+  if (tokens.length >= 2) {
+    const last = tokens[tokens.length - 1]!.toLowerCase();
+    if (effortSet.has(last)) {
+      effort = last;
+      query = tokens.slice(0, -1).join(" ");
+    }
+  }
+
+  // Reject CLI-style flags up front (e.g. "-h", "--help") so they are never
+  // mistaken for a model; otherwise "-h" would substring-match "-hydrogen".
+  if (query.startsWith("-")) {
+    return {
+      ok: false,
+      reason: "invalid",
+      message: `"${query}" is not a valid model name.`,
+    };
+  }
+
+  // (a) 1-based numeric index into the catalog.
+  if (/^\d+$/.test(query)) {
+    const index = Number(query);
+    if (catalog.length === 0) {
+      return {
+        ok: false,
+        reason: "invalid",
+        message: `No model catalog is available to resolve number "${query}".`,
+      };
+    }
+    if (index >= 1 && index <= catalog.length) {
+      const entry = catalog[index - 1]!;
+      return { ok: true, model: entry.id, label: entry.name, effort };
+    }
+    return {
+      ok: false,
+      reason: "invalid",
+      message: `Model number ${index} is out of range (1-${catalog.length}).`,
+    };
+  }
+
+  // (b) exact catalog id.
+  const exactEntry = catalog.find((e) => e.id === query);
+  if (exactEntry) {
+    return { ok: true, model: exactEntry.id, label: exactEntry.name, effort };
+  }
+
+  // (b) exact availableModels slug, splitting a trailing effort suffix.
+  const exactSlug = availableModels.find((m) => m === query);
+  if (exactSlug) {
+    const split = TRAILING_EFFORT_RE.exec(exactSlug);
+    if (split && split[1] && split[2]) {
+      const base = split[1];
+      const suffix = split[2].toLowerCase();
+      const entry = catalog.find((e) => e.id === base);
+      return {
+        ok: true,
+        model: entry?.id ?? base,
+        label: entry?.name ?? base,
+        effort: effort ?? suffix,
+      };
+    }
+    const splitEntry = catalog.find((e) => e.id === exactSlug);
+    return { ok: true, model: exactSlug, label: splitEntry?.name ?? exactSlug, effort };
+  }
+
+  // (d) case-insensitive substring match against catalog id or name.
+  const needle = query.toLowerCase();
+  const matches = catalog.filter(
+    (e) =>
+      e.id.toLowerCase().includes(needle) || e.name.toLowerCase().includes(needle),
+  );
+  if (matches.length === 1) {
+    const entry = matches[0]!;
+    return { ok: true, model: entry.id, label: entry.name, effort };
+  }
+  if (matches.length > 1) {
+    const candidates = matches.map((m) => `${m.id} (${m.name})`).join(", ");
+    return {
+      ok: false,
+      reason: "ambiguous",
+      message: `Model "${query}" is ambiguous. Did you mean one of: ${candidates}?`,
+      candidates: matches,
+    };
+  }
+
+  if (catalog.length > 0) {
+    const preview = catalog.slice(0, 10).map((m) => m.id).join(", ");
+    const more = catalog.length > 10 ? `, +${catalog.length - 10} more` : "";
+    return {
+      ok: false,
+      reason: "invalid",
+      message: `Unknown model "${query}". Available: ${preview}${more}.`,
+    };
+  }
+
+  // Empty catalog (e.g. offline / bare unit mocks): accept a plausible slug only,
+  // which rejects flags such as "-h".
+  if (!MODEL_SLUG_RE.test(query)) {
+    return {
+      ok: false,
+      reason: "invalid",
+      message: `"${query}" is not a valid model name.`,
+    };
+  }
+  const split = splitModelAndEffort(query, []);
+  return { ok: true, model: split.model, effort: effort ?? split.effort };
+}
+
+function isTransientTurnError(error: unknown): boolean {
+  if (error instanceof Error) {
+    const code = (error as { code?: unknown }).code;
+    return TRANSIENT_TURN_ERROR_RE.test(
+      `${error.message} ${code !== undefined ? String(code) : ""}`,
+    );
+  }
+  return TRANSIENT_TURN_ERROR_RE.test(String(error));
+}
+
+function isCancellationLike(error: unknown): boolean {
+  const msg = error instanceof Error ? error.message : String(error);
+  return /\b(cancel|cancelled|canceled|aborted)\b/i.test(msg);
+}
+
+function conciseReason(error: unknown): string {
+  const msg = error instanceof Error ? error.message : String(error);
+  return msg.split(/\r?\n/)[0]?.trim().slice(0, 200) || "unknown error";
+}
+
+function delayWithAbort(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted || ms <= 0) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    timer.unref?.();
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 interface ChatSessionState {
   info: SessionInfo;
   busyMode: BusyMode;
@@ -93,6 +287,9 @@ export class AgyAgentBackend implements AgentBackend {
     perm: PendingPermission,
   ) => Promise<void> | void;
   private readonly chats = new Map<string, ChatSessionState>();
+  private readonly activeTurnActivities = new Map<string, TurnActivitySnapshot>();
+  private readonly turnAbortControllers = new Map<string, AbortController>();
+  private readonly retryDelayMs?: number;
 
   constructor(
     private readonly config: GatewayConfig,
@@ -108,6 +305,7 @@ export class AgyAgentBackend implements AgentBackend {
       });
     this.permissions = options.permissionManager ?? new PermissionManager();
     this.permissionNotifier = options.permissionNotifier;
+    this.retryDelayMs = options.retryDelayMs;
   }
 
   async start(): Promise<void> {
@@ -225,6 +423,22 @@ export class AgyAgentBackend implements AgentBackend {
     return this.client.getAvailableModes();
   }
 
+  async getModelCatalog(): Promise<ModelCatalogEntry[]> {
+    if (this.client.ensureCatalogLoaded) {
+      try {
+        return await this.client.ensureCatalogLoaded(this.config.defaultCwd);
+      } catch {
+        return this.client.getModelCatalog?.() ?? [];
+      }
+    }
+    return this.client.getModelCatalog?.() ?? [];
+  }
+
+  getTurnActivity(chatId: string): TurnActivitySnapshot | undefined {
+    const snapshot = this.activeTurnActivities.get(chatId);
+    return snapshot ? { ...snapshot } : undefined;
+  }
+
   getStats(): {
     activeSessions: number;
     activeTurns: number;
@@ -252,9 +466,29 @@ export class AgyAgentBackend implements AgentBackend {
 
     const run = state.turnChain.then(async () => {
       state.activeTurn = true;
+      const abort = new AbortController();
+      this.turnAbortControllers.set(input.chatId, abort);
+      const maxRetries = Math.max(0, this.config.turnMaxRetries ?? 2);
+      const now = Date.now();
+      const activity: TurnActivitySnapshot = {
+        chatId: input.chatId,
+        startedAt: now,
+        lastActivityAt: now,
+        phase: "starting",
+        model: input.model ?? state.info.model,
+        effort: input.effort ?? state.info.effort,
+        toolCount: 0,
+        retryCount: 0,
+        maxRetries,
+      };
+      this.activeTurnActivities.set(input.chatId, activity);
       try {
-        return await this.executeTurn(state, input);
+        return await this.executeTurn(state, input, activity, abort.signal);
       } finally {
+        this.activeTurnActivities.delete(input.chatId);
+        if (this.turnAbortControllers.get(input.chatId) === abort) {
+          this.turnAbortControllers.delete(input.chatId);
+        }
         state.activeTurn = false;
         state.info.updatedAt = Date.now();
       }
@@ -272,6 +506,8 @@ export class AgyAgentBackend implements AgentBackend {
   private async executeTurn(
     state: ChatSessionState,
     input: AgentTurnInput,
+    activity: TurnActivitySnapshot,
+    abortSignal: AbortSignal,
   ): Promise<AgentTurnResult> {
     const cwd = input.cwd || state.info.cwd || this.config.defaultCwd;
     if (input.approvalMode) {
@@ -373,16 +609,72 @@ export class AgyAgentBackend implements AgentBackend {
       };
     };
 
-    const result = await this.client.prompt(state.info.sessionId, {
-      text: input.text,
-      attachments: input.attachments,
-      callbacks: input.callbacks,
-      permissionHandler,
-    });
-    return result;
+    let hasStreamedText = false;
+    const wrappedCallbacks: AgentTurnCallbacks = {
+      onPermissionRequest: input.callbacks?.onPermissionRequest,
+      onThoughtDelta: async (delta) => {
+        activity.phase = "thinking";
+        activity.lastActivityAt = Date.now();
+        await input.callbacks?.onThoughtDelta?.(delta);
+      },
+      onToolCall: async (event) => {
+        activity.phase = "tool";
+        activity.currentTool = event.title;
+        activity.toolCount += 1;
+        activity.lastActivityAt = Date.now();
+        await input.callbacks?.onToolCall?.(event);
+      },
+      onTextDelta: async (delta) => {
+        activity.phase = "streaming";
+        hasStreamedText = true;
+        activity.lastActivityAt = Date.now();
+        await input.callbacks?.onTextDelta?.(delta);
+      },
+    };
+
+    const maxRetries = activity.maxRetries;
+    let attempt = 0;
+    for (;;) {
+      try {
+        return await this.client.prompt(state.info.sessionId, {
+          text: input.text,
+          attachments: input.attachments,
+          callbacks: wrappedCallbacks,
+          permissionHandler,
+        });
+      } catch (error) {
+        const aborted = abortSignal.aborted;
+        const canRetry =
+          !hasStreamedText &&
+          !aborted &&
+          !isCancellationLike(error) &&
+          isTransientTurnError(error) &&
+          attempt < maxRetries;
+
+        if (!canRetry) {
+          if (aborted) {
+            throw new Error(`Turn cancelled: ${conciseReason(error)}`);
+          }
+          throw error;
+        }
+
+        attempt += 1;
+        activity.retryCount = attempt;
+        activity.phase = "retrying";
+        activity.lastRetryReason = conciseReason(error);
+        activity.lastActivityAt = Date.now();
+
+        await delayWithAbort(this.retryDelayMs ?? 1500 * attempt, abortSignal);
+        if (abortSignal.aborted) {
+          throw new Error(`Turn cancelled: ${conciseReason(error)}`);
+        }
+        activity.phase = "retrying";
+      }
+    }
   }
 
   async cancelTurn(chatId: string): Promise<boolean> {
+    this.turnAbortControllers.get(chatId)?.abort();
     const state = this.chats.get(chatId);
     if (!state || !state.info.sessionId || !state.activeTurn) {
       return false;
@@ -452,33 +744,57 @@ export class AgyAgentBackend implements AgentBackend {
   async setModel(
     chatId: string,
     modelInput: string,
-  ): Promise<{ model: string; effort?: string }> {
+  ): Promise<{ model: string; effort?: string; label?: string }> {
     const state = this.getOrCreateChatState(chatId);
-    // Ensure client metadata is loaded if not yet started
-    if (this.client.getAvailableBaseModels().length === 0) {
-      await this.client.ensureStarted();
+
+    let catalog = this.client.getModelCatalog?.() ?? [];
+    if (catalog.length === 0 && this.client.ensureCatalogLoaded) {
+      catalog = await this.client.ensureCatalogLoaded(this.config.defaultCwd).catch(
+        () => [],
+      );
     }
-    const split = splitModelAndEffort(
+
+    const resolved = resolveModelSelection(
       modelInput,
-      this.client.getAvailableBaseModels(),
+      catalog,
+      this.client.getAvailableModels(),
+      this.client.getAvailableEfforts(),
     );
-    state.info.model = split.model;
-    if (split.effort) {
-      state.info.effort = split.effort;
+    if (!resolved.ok) {
+      throw new Error(resolved.message);
+    }
+
+    state.info.model = resolved.model;
+    if (resolved.effort) {
+      state.info.effort = resolved.effort;
     }
     state.info.updatedAt = Date.now();
 
     if (state.info.sessionId) {
-      await this.client.setConfigOption(state.info.sessionId, "model", split.model);
-      if (split.effort) {
+      await this.client.setConfigOption(
+        state.info.sessionId,
+        "model",
+        resolved.model,
+      );
+      if (resolved.effort) {
         await this.client.setConfigOption(
           state.info.sessionId,
           "thought_level",
-          split.effort,
+          resolved.effort,
         );
       }
     }
-    return split;
+
+    const result: { model: string; effort?: string; label?: string } = {
+      model: resolved.model,
+    };
+    if (resolved.effort) {
+      result.effort = resolved.effort;
+    }
+    if (resolved.label && resolved.label !== resolved.model) {
+      result.label = resolved.label;
+    }
+    return result;
   }
 
   async setEffort(chatId: string, effort: string): Promise<void> {

@@ -214,6 +214,10 @@ const envSchema = z.object({
   PHOTON_READ_RECEIPTS: z.string().optional(),
   PHOTON_REACTIONS: z.string().optional(),
   QUOTA_WARN_THRESHOLD: z.coerce.number().min(0).max(100).default(15),
+  PROGRESS_SILENCE_MS: numberEnv(0, 3_600_000, 120_000),
+  SESSION_STALL_TIMEOUT_MS: numberEnv(0, 3_600_000, 300_000),
+  TURN_MAX_RETRIES: numberEnv(0, 5, 2),
+  AUTO_BOOTSTRAP_CHANNEL_SESSION: optionalString,
   DATA_DIR: z.string().trim().optional(),
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
 
@@ -524,6 +528,10 @@ export interface GatewayConfig {
   healthHost: string;
   healthPort: number;
   quotaWarnThreshold: number;
+  progressSilenceMs: number;
+  sessionStallTimeoutMs: number;
+  turnMaxRetries: number;
+  autoBootstrapChannelSession: boolean;
   dataDir: string;
   logLevel: LogLevel;
 
@@ -716,6 +724,13 @@ export function loadConfig(
     healthHost: parsed.HEALTH_HOST,
     healthPort: parsed.HEALTH_PORT,
     quotaWarnThreshold: parsed.QUOTA_WARN_THRESHOLD,
+    progressSilenceMs: parsed.PROGRESS_SILENCE_MS,
+    sessionStallTimeoutMs: parsed.SESSION_STALL_TIMEOUT_MS,
+    turnMaxRetries: parsed.TURN_MAX_RETRIES,
+    autoBootstrapChannelSession: parseBoolEnv(
+      parsed.AUTO_BOOTSTRAP_CHANNEL_SESSION,
+      true,
+    ),
     dataDir,
     logLevel: parsed.LOG_LEVEL,
 

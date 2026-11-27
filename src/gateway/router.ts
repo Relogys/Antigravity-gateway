@@ -21,9 +21,11 @@ import type {
   InboundAttachment,
   InboundMessage,
   LoopJob,
+  ModelCatalogEntry,
   PendingPermission,
   QuotaSummary,
   SessionInfo,
+  TurnActivitySnapshot,
 } from "../types.js";
 import {
   LoopScheduler,
@@ -33,6 +35,7 @@ import {
 import type { GatewayStore } from "./store.js";
 
 const DEFAULT_TYPING_INTERVAL_MS = 5000;
+const DEFAULT_PROGRESS_POLL_INTERVAL_MS = 15_000;
 const QUOTA_CHECK_INTERVAL_MS = 5 * 60 * 1000;
 const GATEWAY_VERSION = "0.1.0";
 const MAX_SESSION_LIST_CACHE = 500;
@@ -48,11 +51,15 @@ export interface ExtendedAgentBackend extends AgentBackend {
   setModel?(
     chatId: string,
     modelInput: string,
-  ): Promise<{ model: string; effort?: string }>;
+  ): Promise<{ model: string; effort?: string; label?: string }>;
   setEffort?(chatId: string, effort: string): Promise<void>;
   getAvailableModels?(): string[];
   getAvailableEfforts?(): string[];
   getAvailableModes?(): string[];
+  /** Live model catalog (id + human-friendly name + efforts). Falls back to getAvailableModels. */
+  getModelCatalog?(): Promise<ModelCatalogEntry[]>;
+  /** Live per-turn activity used by the silence/stall watchdog. */
+  getTurnActivity?(chatId: string): TurnActivitySnapshot | undefined;
   setApprovalMode?(chatId: string, mode: ApprovalMode): void;
   getApprovalMode?(chatId: string): ApprovalMode;
   getPendingPermission?(chatId: string): PendingPermission | undefined;
@@ -83,6 +90,8 @@ export interface GatewayRouterDeps {
   version?: string;
   /** Typing refresh cadence during long ACP turns (default 5000ms; 0 disables). */
   typingIntervalMs?: number;
+  /** How often the silence/stall watchdog samples turn activity (default 15000ms). */
+  progressPollIntervalMs?: number;
 }
 
 const ALWAYS_DISPATCHABLE_COMMANDS = new Set([
@@ -165,6 +174,16 @@ function escapeRegExp(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+/** True for `-h`, `--h`, `--help`, `help`, `?` (case-insensitive). */
+function isHelpFlag(s: string): boolean {
+  return /^(?:-h|--h|--help|help|\?)$/i.test(s.trim());
+}
+
+/** True for `list` / `ls` (case-insensitive). */
+function isListFlag(s: string): boolean {
+  return /^(?:list|ls)$/i.test(s.trim());
+}
+
 function isCancellationError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
   return /\b(cancel|cancelled|canceled|aborted)\b/i.test(msg);
@@ -183,6 +202,7 @@ export class GatewayRouter {
   private readonly quotaFetcher: () => Promise<QuotaSummary>;
   private readonly version: string;
   private readonly typingIntervalMs: number;
+  private readonly progressPollIntervalMs: number;
 
   private readonly startedAt = Date.now();
   private ready = false;
@@ -210,6 +230,8 @@ export class GatewayRouter {
     this.version = deps.version ?? GATEWAY_VERSION;
     this.typingIntervalMs =
       deps.typingIntervalMs ?? DEFAULT_TYPING_INTERVAL_MS;
+    this.progressPollIntervalMs =
+      deps.progressPollIntervalMs ?? DEFAULT_PROGRESS_POLL_INTERVAL_MS;
     this.quotaFetcher =
       deps.quotaFetcher ??
       (() =>
@@ -592,12 +614,40 @@ export class GatewayRouter {
     return count;
   }
 
+  /** Channel group a chat belongs to: qualified prefix, else the channel name (hub legacy => photon). */
+  private resolveChannelGroup(chatId: string): string {
+    return (
+      splitQualifiedChatId(chatId).channel ??
+      (this.channel.name === "hub" ? "photon" : this.channel.name)
+    );
+  }
+
+  /** Number of active channels (used to decide whether `/sessions` can flatten groups). */
+  private channelCount(): number {
+    const snapshots = this.channel.getChannelSnapshots?.();
+    if (snapshots) {
+      return Object.keys(snapshots).length;
+    }
+    return 1;
+  }
+
   private async ensureSessionRecord(
     chatId: string,
     patch: Partial<SessionInfo> = {},
   ): Promise<SessionInfo> {
     const existing = this.store.getSession(chatId);
     const now = Date.now();
+    const channelGroup =
+      existing?.channelGroup ?? this.resolveChannelGroup(chatId);
+
+    let title = existing?.title;
+    if (!title) {
+      const siblings = this.store
+        .listSessionsByChannel(channelGroup)
+        .filter((session) => session.chatId !== chatId).length;
+      title = `[${channelGroup}] Session #${siblings + 1}`;
+    }
+
     const merged: SessionInfo = {
       chatId,
       sessionId: existing?.sessionId ?? "",
@@ -607,12 +657,15 @@ export class GatewayRouter {
       mode: existing?.mode,
       approvalMode: existing?.approvalMode ?? this.getChatApprovalMode(chatId),
       busyMode: existing?.busyMode ?? this.getChatBusyMode(chatId),
-      title: existing?.title,
+      title,
+      channelGroup,
+      onboarded: existing?.onboarded,
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
       ...patch,
     };
     await this.store.upsertSession(merged);
+    await this.store.ensureChannelBinding(channelGroup);
     return merged;
   }
 
@@ -802,6 +855,14 @@ export class GatewayRouter {
 
       case "queue":
       case "q": {
+        if (isHelpFlag(args)) {
+          await this.sendReply(
+            chatId,
+            "Usage: /queue [list|clear] or /queue <prompt> — inspect, clear, or enqueue prompts.",
+            msg.id,
+          );
+          return;
+        }
         if (!args || args.toLowerCase() === "list") {
           const q = this.getChatQueue(chatId);
           if (q.length === 0) {
@@ -828,6 +889,14 @@ export class GatewayRouter {
 
       case "steer":
       case "s": {
+        if (isHelpFlag(args)) {
+          await this.sendReply(
+            chatId,
+            "Usage: /steer <prompt> — Interrupt & redirect the active turn.",
+            msg.id,
+          );
+          return;
+        }
         if (!args) {
           await this.sendReply(chatId, "Usage: /steer <prompt>", msg.id);
           return;
@@ -845,6 +914,14 @@ export class GatewayRouter {
       }
 
       case "busy": {
+        if (isHelpFlag(args)) {
+          await this.sendReply(
+            chatId,
+            "Usage: /busy [queue|interrupt|steer] — Set the busy-turn policy.",
+            msg.id,
+          );
+          return;
+        }
         if (!args) {
           await this.sendReply(
             chatId,
@@ -913,38 +990,91 @@ export class GatewayRouter {
       }
 
       case "model": {
+        const liveInfo = this.backend.getSessionInfo?.(chatId);
         const current =
-          this.backend.getSessionInfo?.(chatId)?.model ??
+          liveInfo?.model ??
           this.store.getSession(chatId)?.model ??
           this.config.defaultModel ??
           "(server default)";
-        if (!args) {
-          const available = this.backend.getAvailableModels?.() ?? [];
-          const listText =
-            available.length > 0
-              ? `\nAvailable: ${available.slice(0, 15).join(", ")}${available.length > 15 ? ` (+${available.length - 15} more)` : ""}`
-              : "";
-          await this.sendReply(chatId, `Current model: ${current}${listText}`, msg.id);
+        const currentEffort =
+          liveInfo?.effort ??
+          this.store.getSession(chatId)?.effort ??
+          this.config.defaultEffort ??
+          "default";
+
+        if (!args || isHelpFlag(args) || isListFlag(args)) {
+          let catalog: ModelCatalogEntry[];
+          const live = await this.backend.getModelCatalog?.();
+          if (live && live.length > 0) {
+            catalog = live;
+          } else {
+            catalog = (this.backend.getAvailableModels?.() ?? []).map((id) => ({
+              id,
+              name: id,
+            }));
+          }
+
+          const currentEntry = catalog.find((m) => m.id === current);
+          const currentLabel =
+            currentEntry && currentEntry.name !== currentEntry.id
+              ? `${currentEntry.name} (${current})`
+              : current;
+
+          const lines: string[] = [
+            `🧠 Current model: ${currentLabel} | effort: ${currentEffort}`,
+          ];
+          if (catalog.length > 0) {
+            lines.push("", `Available models (${catalog.length}):`);
+            catalog.forEach((m, idx) => {
+              lines.push(
+                `${idx + 1}. ${m.name}${m.name !== m.id ? ` (${m.id})` : ""}`,
+              );
+            });
+          }
+          lines.push(
+            "",
+            "Switch by number: /model 4",
+            "Switch by keyword + effort: /model hydrogen xhigh",
+            "Switch by full ID: /model gemini-4-neon-high",
+            "Change effort only: /effort [low|medium|high|xhigh]",
+          );
+          await this.sendReply(chatId, lines.join("\n"), msg.id);
           return;
         }
-        if (this.backend.setModel) {
-          const updated = await this.backend.setModel(chatId, args);
-          await this.ensureSessionRecord(chatId, {
-            model: updated.model,
-            ...(updated.effort ? { effort: updated.effort } : {}),
-          });
+
+        try {
+          if (this.backend.setModel) {
+            const updated = await this.backend.setModel(chatId, args);
+            await this.ensureSessionRecord(chatId, {
+              model: updated.model,
+              ...(updated.effort ? { effort: updated.effort } : {}),
+            });
+            const hasLabel =
+              Boolean(updated.label) && updated.label !== updated.model;
+            const modelLine = hasLabel
+              ? `Model set to: ${updated.label} (${updated.model})`
+              : `Model set to: ${updated.model}`;
+            const effortSuffix = updated.effort
+              ? hasLabel
+                ? ` | effort: ${updated.effort}`
+                : ` (effort: ${updated.effort})`
+              : "";
+            await this.sendReply(chatId, `${modelLine}${effortSuffix}`, msg.id);
+          } else if (this.backend.setConfigOption) {
+            await this.backend.setConfigOption(chatId, "model", args);
+            await this.ensureSessionRecord(chatId, { model: args });
+            await this.sendReply(chatId, `Model set to: ${args}`, msg.id);
+          } else {
+            await this.ensureSessionRecord(chatId, { model: args });
+            await this.sendReply(chatId, `Model set to: ${args}`, msg.id);
+          }
+        } catch (err) {
+          const reason = err instanceof Error ? err.message : String(err);
           await this.sendReply(
             chatId,
-            `Model set to: ${updated.model}${updated.effort ? ` (effort: ${updated.effort})` : ""}`,
+            `⚠️ Couldn't switch model: ${reason}\nSend /model to see the numbered list.`,
             msg.id,
           );
-        } else if (this.backend.setConfigOption) {
-          await this.backend.setConfigOption(chatId, "model", args);
-          await this.ensureSessionRecord(chatId, { model: args });
-          await this.sendReply(chatId, `Model set to: ${args}`, msg.id);
-        } else {
-          await this.ensureSessionRecord(chatId, { model: args });
-          await this.sendReply(chatId, `Model set to: ${args}`, msg.id);
         }
         return;
       }
@@ -955,6 +1085,14 @@ export class GatewayRouter {
           this.store.getSession(chatId)?.effort ??
           this.config.defaultEffort ??
           "(default)";
+        if (isHelpFlag(args)) {
+          await this.sendReply(
+            chatId,
+            `Usage: /effort [low|medium|high|xhigh] — Set reasoning effort. Current: ${current}`,
+            msg.id,
+          );
+          return;
+        }
         if (!args) {
           const available = this.backend.getAvailableEfforts?.() ?? [
             "low",
@@ -993,6 +1131,14 @@ export class GatewayRouter {
           this.backend.getSessionInfo?.(chatId)?.mode ??
           this.store.getSession(chatId)?.mode ??
           "default";
+        if (isHelpFlag(args)) {
+          await this.sendReply(
+            chatId,
+            `Usage: /mode [default|accept-edits|auto|plan] — Set ACP mode. Current: ${current}`,
+            msg.id,
+          );
+          return;
+        }
         if (!args) {
           const available = this.backend.getAvailableModes?.() ?? [
             "default",
@@ -1027,6 +1173,14 @@ export class GatewayRouter {
       }
 
       case "approvals": {
+        if (isHelpFlag(args)) {
+          await this.sendReply(
+            chatId,
+            "Usage: /approvals [auto|interactive|sandbox] — Set permission mode.",
+            msg.id,
+          );
+          return;
+        }
         if (!args) {
           await this.sendReply(
             chatId,
@@ -1050,28 +1204,75 @@ export class GatewayRouter {
       }
 
       case "sessions": {
+        if (isHelpFlag(args)) {
+          await this.sendReply(
+            chatId,
+            "Usage: /sessions [all] — List saved sessions grouped by channel (send /resume <index|id> to resume).",
+            msg.id,
+          );
+          return;
+        }
         const cwd = this.store.getSession(chatId)?.cwd ?? this.config.defaultCwd;
         const list = await this.backend.listSessions(cwd);
         const sliced = list.slice(0, 10);
         this.cacheSessionList(chatId, sliced);
-        if (sliced.length === 0) {
-          await this.sendReply(chatId, "No saved sessions found.", msg.id);
-          return;
+
+        const currentGroup = this.resolveChannelGroup(chatId);
+        const showAll =
+          args.toLowerCase() === "all" || this.channelCount() <= 1;
+        const stored = showAll
+          ? this.store.listSessions()
+          : this.store.listSessionsByChannel(currentGroup);
+
+        const lines: string[] = [];
+        if (stored.length === 0) {
+          lines.push(`📂 ${currentGroup}: no gateway sessions yet.`);
+        } else {
+          const groups = new Map<string, SessionInfo[]>();
+          for (const session of stored) {
+            const group = session.channelGroup ?? currentGroup;
+            const bucket = groups.get(group);
+            if (bucket) {
+              bucket.push(session);
+            } else {
+              groups.set(group, [session]);
+            }
+          }
+          lines.push(`📂 Saved sessions${showAll ? " (all groups)" : ""}:`);
+          for (const [group, sessions] of groups) {
+            lines.push(`📂 ${group}`);
+            for (const session of sessions) {
+              const title = session.title ? ` — ${session.title}` : "";
+              lines.push(`  • ${session.chatId}${title}`);
+            }
+          }
         }
-        const lines = sliced.map((s, idx) => {
-          const shortId = s.sessionId.slice(0, 10);
-          const label = s.title ? ` — ${s.title}` : "";
-          return `${idx + 1}. ${shortId}${label}`;
-        });
-        await this.sendReply(
-          chatId,
-          `Sessions (use /resume <index|id>):\n${lines.join("\n")}`,
-          msg.id,
-        );
+
+        if (sliced.length > 0) {
+          if (lines.length > 0) {
+            lines.push("");
+          }
+          lines.push("ACP sessions (use /resume <index|id>):");
+          sliced.forEach((s, idx) => {
+            const shortId = s.sessionId.slice(0, 10);
+            const label = s.title ? ` — ${s.title}` : "";
+            lines.push(`${idx + 1}. ${shortId}${label}`);
+          });
+        }
+
+        await this.sendReply(chatId, lines.join("\n"), msg.id);
         return;
       }
 
       case "resume": {
+        if (isHelpFlag(args)) {
+          await this.sendReply(
+            chatId,
+            "Usage: /resume <id|index> — Resume a saved session (send /sessions to list).",
+            msg.id,
+          );
+          return;
+        }
         if (!args) {
           await this.sendReply(chatId, "Usage: /resume <id|index>", msg.id);
           return;
@@ -1115,6 +1316,14 @@ export class GatewayRouter {
       }
 
       case "title": {
+        if (isHelpFlag(args)) {
+          await this.sendReply(
+            chatId,
+            "Usage: /title [name] — View or rename this session.",
+            msg.id,
+          );
+          return;
+        }
         const stored = this.store.getSession(chatId);
         if (!args) {
           await this.sendReply(
@@ -1145,6 +1354,14 @@ export class GatewayRouter {
       }
 
       case "cwd": {
+        if (isHelpFlag(args)) {
+          await this.sendReply(
+            chatId,
+            "Usage: /cwd [path] — View or change the working directory.",
+            msg.id,
+          );
+          return;
+        }
         const currentCwd =
           this.store.getSession(chatId)?.cwd ?? this.config.defaultCwd;
         if (!args) {
@@ -1179,6 +1396,14 @@ export class GatewayRouter {
       }
 
       case "remind": {
+        if (isHelpFlag(args)) {
+          await this.sendReply(
+            chatId,
+            "Usage: /remind <duration> <text> — One-way reminder push (e.g. /remind 15m stand up).",
+            msg.id,
+          );
+          return;
+        }
         const m = /^(\S+)\s+([\s\S]+)$/.exec(args);
         if (!m) {
           await this.sendReply(chatId, "Usage: /remind <duration> <text>", msg.id);
@@ -1217,6 +1442,14 @@ export class GatewayRouter {
     args: string,
   ): Promise<void> {
     const { chatId } = msg;
+    if (isHelpFlag(args)) {
+      await this.sendReply(
+        chatId,
+        "Usage: /loop [list|add <dur> <prompt>|rm <id>|pause <id>|resume <id>]",
+        msg.id,
+      );
+      return;
+    }
     if (!args || args.toLowerCase() === "list") {
       const jobs = this.scheduler.listJobs(chatId);
       if (jobs.length === 0) {
@@ -1408,7 +1641,20 @@ export class GatewayRouter {
     }
 
     let typingTimer: ReturnType<typeof setInterval> | undefined;
+    let progressTimer: ReturnType<typeof setInterval> | undefined;
+    let typingActive = false;
+    const stopTyping = () => {
+      if (typingTimer) {
+        clearInterval(typingTimer);
+        typingTimer = undefined;
+      }
+      if (typingActive) {
+        typingActive = false;
+        this.channel.sendTyping?.(chatId, false).catch(() => {});
+      }
+    };
     if (this.channel.sendTyping) {
+      typingActive = true;
       this.channel.sendTyping(chatId, true).catch(() => {});
       if (this.typingIntervalMs > 0) {
         typingTimer = setInterval(() => {
@@ -1425,6 +1671,69 @@ export class GatewayRouter {
     const effort = stored?.effort ?? this.config.defaultEffort;
 
     try {
+      // Hermes-grade silence progress & stall watchdog (interactive turns only).
+      if (
+        !options.isLoop &&
+        (this.config.progressSilenceMs > 0 ||
+          this.config.sessionStallTimeoutMs > 0)
+      ) {
+        const turnStartedAt = Date.now();
+        let lastProgressNotifyAt = turnStartedAt;
+        let stallNotified = false;
+        progressTimer = setInterval(() => {
+          try {
+            const now = Date.now();
+            const activity = this.backend.getTurnActivity?.(chatId);
+            const elapsed = formatUptime(now - turnStartedAt);
+            const modelLabel = activity?.model ?? model ?? "default";
+            const lastActivityAt = activity?.lastActivityAt ?? turnStartedAt;
+
+            if (
+              this.config.sessionStallTimeoutMs > 0 &&
+              !stallNotified &&
+              now - lastActivityAt >= this.config.sessionStallTimeoutMs
+            ) {
+              stallNotified = true;
+              lastProgressNotifyAt = now;
+              const silentFor = formatUptime(now - lastActivityAt);
+              void this.sendReply(
+                chatId,
+                `⚠️ 当前会话已静默 ${silentFor} 无模型/工具活动（模型：${modelLabel}）。发送 /stop 可取消当前任务，或 /new 开启新会话。`,
+              ).catch(() => {});
+              return;
+            }
+
+            if (
+              this.config.progressSilenceMs > 0 &&
+              now - lastProgressNotifyAt >= this.config.progressSilenceMs
+            ) {
+              lastProgressNotifyAt = now;
+              let progressText: string;
+              if (activity?.phase === "retrying") {
+                const reason = activity.lastRetryReason
+                  ? `（${activity.lastRetryReason}）`
+                  : "";
+                progressText = `⏳ [${modelLabel}] 遇到临时异常，正在第 ${activity.retryCount}/${activity.maxRetries} 次重试${reason}，已耗时 ${elapsed}…`;
+              } else if (activity?.phase === "tool" && activity.currentTool) {
+                progressText = `⏳ [${modelLabel}] 处理中（已耗时 ${elapsed}）：正在执行工具「${activity.currentTool}」（已调用 ${activity.toolCount} 次）。发送 /stop 可取消。`;
+              } else {
+                const toolNote = activity?.toolCount
+                  ? `，已调用 ${activity.toolCount} 次工具`
+                  : "";
+                const retryNote = activity?.retryCount
+                  ? `，已重试 ${activity.retryCount} 次`
+                  : "";
+                progressText = `⏳ [${modelLabel}] 思考/处理中（已耗时 ${elapsed}${toolNote}${retryNote}）。发送 /stop 可取消。`;
+              }
+              void this.sendReply(chatId, progressText).catch(() => {});
+            }
+          } catch {
+            // Sampling must never break the turn.
+          }
+        }, this.progressPollIntervalMs);
+        progressTimer.unref?.();
+      }
+
       const result = await this.backend.sendTurn({
         chatId,
         sessionId: stored?.sessionId || undefined,
@@ -1446,11 +1755,15 @@ export class GatewayRouter {
         return;
       }
 
+      const isFirstCompleted =
+        !options.isLoop && !stored?.onboarded && !wasUserCancelled;
+
       await this.ensureSessionRecord(chatId, {
         sessionId: result.sessionId,
         cwd,
         approvalMode,
         busyMode: this.getChatBusyMode(chatId),
+        ...(isFirstCompleted ? { onboarded: true } : {}),
       });
 
       const reactionsOn =
@@ -1465,8 +1778,22 @@ export class GatewayRouter {
 
       const { cleanText, mediaPaths } = extractOutboundMedia(result.text, cwd);
       const quotaNotice = await this.maybeGetLowQuotaNotice();
-      const combinedText = [cleanText, quotaNotice].filter(Boolean).join("\n\n");
+      // Keep media-only replies pristine; the one-shot tip rides on the first text answer.
+      const onboardingFooter =
+        isFirstCompleted && mediaPaths.length === 0
+          ? `💡 已自动建立 [${this.resolveChannelGroup(chatId)}] 分组会话；发 /model 切换模型，发 /help 查看全部指令。`
+          : "";
+      const combinedText = [cleanText, quotaNotice, onboardingFooter]
+        .filter(Boolean)
+        .join("\n\n");
       const emptyResult = !combinedText && mediaPaths.length === 0;
+
+      // Hermes pattern: drop typing + stop the watchdog BEFORE the final reply.
+      if (progressTimer) {
+        clearInterval(progressTimer);
+        progressTimer = undefined;
+      }
+      stopTyping();
 
       if (!emptyResult) {
         await this.sendReply(
@@ -1504,10 +1831,11 @@ export class GatewayRouter {
         ).catch(() => {});
       }
     } finally {
-      if (typingTimer) {
-        clearInterval(typingTimer);
+      if (progressTimer) {
+        clearInterval(progressTimer);
+        progressTimer = undefined;
       }
-      this.channel.sendTyping?.(chatId, false).catch(() => {});
+      stopTyping();
     }
   }
 

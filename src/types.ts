@@ -89,8 +89,45 @@ export interface SessionInfo {
   approvalMode: ApprovalMode;
   busyMode: BusyMode;
   title?: string;
+  channelGroup?: string;
+  onboarded?: boolean;
   createdAt: number;
   updatedAt: number;
+}
+
+export interface BoundChannelRecord {
+  channel: string;
+  groupName: string;
+  firstBoundAt: number;
+  defaultChatId?: string;
+  defaultSessionId?: string;
+}
+
+export interface ModelCatalogEntry {
+  id: string;
+  name: string;
+  efforts?: string[];
+}
+
+export type TurnActivityPhase =
+  | "starting"
+  | "thinking"
+  | "tool"
+  | "streaming"
+  | "retrying";
+
+export interface TurnActivitySnapshot {
+  chatId: string;
+  startedAt: number;
+  lastActivityAt: number;
+  phase: TurnActivityPhase;
+  model?: string;
+  effort?: string;
+  currentTool?: string;
+  toolCount: number;
+  retryCount: number;
+  maxRetries: number;
+  lastRetryReason?: string;
 }
 
 export interface PermissionOption {

@@ -8,11 +8,13 @@ import type {
   AgentTurnResult,
   ApprovalMode,
   InboundAttachment,
+  ModelCatalogEntry,
 } from "../types.js";
 
 const MAX_INLINE_IMAGE_BYTES = 10 * 1024 * 1024; // 10 MiB
 const INIT_TIMEOUT_MS = 30_000;
 const STOP_GRACE_MS = 1500;
+const EFFORT_TOKENS = new Set(["low", "medium", "high", "xhigh", "max"]);
 
 export interface AgyAcpClientOptions {
   agyBin: string;
@@ -73,6 +75,8 @@ export class AgyAcpClient {
   private cachedEfforts: string[] = ["low", "medium", "high", "xhigh"];
   private cachedModes: string[] = ["default", "accept-edits", "auto", "plan"];
   private cachedConfigOptions: SessionConfigOption[] = [];
+  private cachedModelCatalog: ModelCatalogEntry[] = [];
+  private catalogPromise: Promise<ModelCatalogEntry[]> | null = null;
 
   constructor(private readonly options: AgyAcpClientOptions) {}
 
@@ -102,6 +106,46 @@ export class AgyAcpClient {
 
   getConfigOptions(): SessionConfigOption[] {
     return [...this.cachedConfigOptions];
+  }
+
+  /** Shallow copy of the live model catalog hydrated from the most recent session metadata. */
+  getModelCatalog(): ModelCatalogEntry[] {
+    return [...this.cachedModelCatalog];
+  }
+
+  /**
+   * Returns the live model catalog, hydrating it once via a throwaway single-flight
+   * `newSession(cwd)` if it is still empty. Never throws when ACP is offline: falls
+   * back to whatever metadata (possibly nothing) has been cached so far.
+   */
+  async ensureCatalogLoaded(cwd: string): Promise<ModelCatalogEntry[]> {
+    if (this.cachedModelCatalog.length > 0) {
+      return this.getModelCatalog();
+    }
+    if (this.catalogPromise) {
+      return this.catalogPromise;
+    }
+
+    const run = (async () => {
+      try {
+        await this.ensureStarted();
+        const info = await this.newSession(cwd);
+        if (this.cachedModelCatalog.length === 0) {
+          this.cacheSessionMetadata(info);
+        }
+        if (info?.sessionId) {
+          await this.closeSession(info.sessionId).catch(() => undefined);
+        }
+      } catch {
+        // ACP offline / handshake failure: degrade gracefully to cached/empty.
+      }
+      return this.getModelCatalog();
+    })();
+
+    this.catalogPromise = run.finally(() => {
+      this.catalogPromise = null;
+    });
+    return this.catalogPromise;
   }
 
   setSessionPermissionHandler(
@@ -336,7 +380,60 @@ export class AgyAcpClient {
       if (modeOpt?.options) {
         this.cachedModes = modeOpt.options.map((o) => o.value);
       }
+    } else if (
+      this.cachedBaseModels.length === 0 &&
+      this.cachedAvailableModels.length > 0
+    ) {
+      // No explicit configOptions model entry: fall back to the available slugs as bases.
+      this.cachedBaseModels = [...this.cachedAvailableModels];
     }
+
+    const catalog = this.buildModelCatalog(raw);
+    if (catalog.length > 0) {
+      this.cachedModelCatalog = catalog;
+    }
+  }
+
+  private buildModelCatalog(raw: NewSessionInfo): ModelCatalogEntry[] {
+    const available = raw.models?.availableModels ?? [];
+    const modelOpt = Array.isArray(raw.configOptions)
+      ? raw.configOptions.find((c) => c.id === "model")
+      : undefined;
+
+    if (modelOpt?.options && modelOpt.options.length > 0) {
+      return modelOpt.options.map((o) => ({
+        id: o.value,
+        name: o.name ?? o.value,
+        efforts: this.availableEffortsForBase(o.value, available),
+      }));
+    }
+
+    if (available.length > 0) {
+      return available.map((m) => ({
+        id: m.modelId,
+        name: m.name ?? m.modelId,
+      }));
+    }
+
+    return [];
+  }
+
+  private availableEffortsForBase(
+    base: string,
+    available: Array<{ modelId: string }>,
+  ): string[] {
+    const prefix = `${base}-`;
+    const efforts: string[] = [];
+    for (const model of available) {
+      if (!model.modelId.startsWith(prefix)) {
+        continue;
+      }
+      const suffix = model.modelId.slice(prefix.length).toLowerCase();
+      if (EFFORT_TOKENS.has(suffix) && !efforts.includes(suffix)) {
+        efforts.push(suffix);
+      }
+    }
+    return efforts.length > 0 ? efforts : [...this.cachedEfforts];
   }
 
   async newSession(cwd: string): Promise<NewSessionInfo> {

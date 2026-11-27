@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { normalizeStoreSenderKey } from "../config.js";
-import type { LoopJob, SessionInfo } from "../types.js";
+import type { BoundChannelRecord, LoopJob, SessionInfo } from "../types.js";
 
 const PAIRING_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const PAIRING_CODE_LENGTH = 8;
@@ -44,6 +44,7 @@ interface PersistedState {
   pairingLockedUntil?: number;
   loops: LoopJob[];
   homeChatId?: string;
+  boundChannels: Record<string, BoundChannelRecord>;
 }
 
 function emptyState(): PersistedState {
@@ -54,7 +55,24 @@ function emptyState(): PersistedState {
     pendingPairings: [],
     pairingFailedAttempts: 0,
     loops: [],
+    boundChannels: {},
   };
+}
+
+/**
+ * Resolve the channel group a stored session belongs to.
+ * Prefers the explicit `channelGroup`, then the `<channel>::` chatId prefix,
+ * and finally "photon" for unqualified legacy Photon chat ids.
+ */
+function sessionChannelGroup(session: SessionInfo): string {
+  if (session.channelGroup) {
+    return session.channelGroup.toLowerCase();
+  }
+  const sepIdx = session.chatId.indexOf("::");
+  if (sepIdx > 0) {
+    return session.chatId.slice(0, sepIdx).toLowerCase();
+  }
+  return "photon";
 }
 
 function generatePairingCode(): string {
@@ -131,6 +149,17 @@ export class GatewayStore {
           typeof parsed.homeChatId === "string" && parsed.homeChatId.length > 0
             ? parsed.homeChatId
             : undefined,
+        boundChannels:
+          parsed.boundChannels && typeof parsed.boundChannels === "object"
+            ? Object.fromEntries(
+                Object.entries(parsed.boundChannels).filter(
+                  ([, value]) =>
+                    value &&
+                    typeof value === "object" &&
+                    typeof (value as BoundChannelRecord).channel === "string",
+                ),
+              )
+            : {},
       };
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === "ENOENT") {
@@ -192,6 +221,52 @@ export class GatewayStore {
     return Object.values(this.state.sessions)
       .map((s) => ({ ...s }))
       .sort((a, b) => b.updatedAt - a.updatedAt);
+  }
+
+  /**
+   * Sessions sorted by `updatedAt` desc, optionally filtered to a channel group.
+   * A session belongs to a group via its `channelGroup`, the `<channel>::` chatId
+   * prefix, or "photon" for unqualified legacy chat ids.
+   */
+  listSessionsByChannel(channelGroup?: string): SessionInfo[] {
+    const all = this.listSessions();
+    if (!channelGroup) {
+      return all;
+    }
+    const target = channelGroup.trim().toLowerCase();
+    return all.filter((session) => sessionChannelGroup(session) === target);
+  }
+
+  /**
+   * Register a channel as a bound session group (idempotent). Returns whether the
+   * binding was newly created so callers can log first-time bindings.
+   */
+  async ensureChannelBinding(
+    channel: string,
+  ): Promise<{ isNew: boolean; record: BoundChannelRecord }> {
+    const name = channel.trim().toLowerCase();
+    if (!name) {
+      return {
+        isNew: false,
+        record: { channel: name, groupName: name, firstBoundAt: Date.now() },
+      };
+    }
+    const existing = this.state.boundChannels[name];
+    if (existing) {
+      return { isNew: false, record: { ...existing } };
+    }
+    const record: BoundChannelRecord = {
+      channel: name,
+      groupName: name,
+      firstBoundAt: Date.now(),
+    };
+    this.state.boundChannels[name] = record;
+    await this.save();
+    return { isNew: true, record: { ...record } };
+  }
+
+  getBoundChannels(): BoundChannelRecord[] {
+    return Object.values(this.state.boundChannels).map((record) => ({ ...record }));
   }
 
   async upsertSession(info: SessionInfo): Promise<void> {

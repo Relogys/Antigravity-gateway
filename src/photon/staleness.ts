@@ -58,9 +58,29 @@ export function isProbeChannelAliveRejection(error: unknown): boolean {
   const code = record.code;
   const status = record.status;
   const msg = String(record.message ?? "");
+  const name = String(record.name ?? "");
+  const codeText = typeof code === "string" ? code : "";
 
   // gRPC status 5 = NOT_FOUND
   if (code === 5 || status === 5 || code === "NOT_FOUND") {
+    return true;
+  }
+
+  // Upstream Spectrum now validates GUID format on space.getMessage(probeId) and
+  // rejects synthetic probe UUIDs with gRPC INVALID_ARGUMENT (3). That still proves
+  // the unary channel is alive, so it must trigger a zombie restart rather than be
+  // mistaken for an offline transport.
+  if (
+    code === 3 ||
+    status === 3 ||
+    code === "3" ||
+    code === "INVALID_ARGUMENT" ||
+    code === "invalidArgument" ||
+    /invalidArgument/i.test(codeText) ||
+    /ValidationError/i.test(name) ||
+    /ValidationError/i.test(msg) ||
+    /expected message resource guid/i.test(msg)
+  ) {
     return true;
   }
 

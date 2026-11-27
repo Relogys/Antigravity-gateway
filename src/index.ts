@@ -121,6 +121,16 @@ async function main(): Promise<void> {
       // Unqualified legacy chat ids (pre-hub stores) belong to the iMessage channel.
       defaultChannel: config.photon ? "photon" : undefined,
     });
+    if (config.autoBootstrapChannelSession) {
+      for (const name of channel.listChannelNames()) {
+        const bound = await store.ensureChannelBinding(name);
+        if (bound.isNew) {
+          console.log(
+            `[gateway] Bound new channel session group [${bound.record.groupName}]`,
+          );
+        }
+      }
+    }
     backend = new AgyAgentBackend(config, {
       permissionNotifier: async (chatId: string, perm: PendingPermission) => {
         await router?.notifyPermission(chatId, perm);
