@@ -13,8 +13,50 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  changes:
+    name: Detect docs-only change
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.diff.outputs.code }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # Docs-only changes (Markdown, docs/, LICENSE) skip the heavy jobs.
+      # Skipped jobs report "success", so required status checks still pass.
+      - name: Classify changed files
+        id: diff
+        shell: bash
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ] && [ "${{ github.event_name }}" != "push" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            echo "code=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          files=$(git diff --name-only "$BASE...$HEAD" 2>/dev/null || git diff --name-only "$BASE" "$HEAD")
+          echo "Changed files:"; echo "$files"
+          code=false
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            case "$f" in
+              *.md|docs/*|LICENSE) ;;
+              *) code=true ;;
+            esac
+          done <<< "$files"
+          [ -z "$files" ] && code=true
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "Run full checks: $code"
+
   verify:
     name: Node ${{ matrix.node }}
+    needs: changes
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -22,37 +64,51 @@ jobs:
       matrix:
         node: [22, 24]
     steps:
+      - name: Docs-only change, nothing to verify
+        if: needs.changes.outputs.code != 'true'
+        run: echo "Docs-only change; skipping build and tests."
+
       - name: Checkout
+        if: needs.changes.outputs.code == 'true'
         uses: actions/checkout@v7
 
       - name: Set up pnpm
+        if: needs.changes.outputs.code == 'true'
         uses: pnpm/action-setup@v6
         with:
           version: 12
 
       - name: Set up Node.js
+        if: needs.changes.outputs.code == 'true'
         uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}
           cache: pnpm
 
       - name: Install dependencies
+        if: needs.changes.outputs.code == 'true'
         run: pnpm install --frozen-lockfile
 
       - name: Typecheck
+        if: needs.changes.outputs.code == 'true'
         run: pnpm typecheck
 
       - name: Build
+        if: needs.changes.outputs.code == 'true'
         run: pnpm build
 
       - name: Test
+        if: needs.changes.outputs.code == 'true'
         run: pnpm test
 
       - name: Audit for leaked secrets
+        if: needs.changes.outputs.code == 'true'
         run: pnpm audit:secrets
 
   verify-windows:
     name: Windows / Node 24
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
@@ -87,6 +143,8 @@ jobs:
 
   verify-macos:
     name: macOS (Apple Silicon) / Node 24
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: macos-latest
     timeout-minutes: 20
     steps:
@@ -121,6 +179,8 @@ jobs:
 
   docker-build:
     name: Docker image build
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
