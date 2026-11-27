@@ -35,9 +35,31 @@ export class HealthServer {
       const snapshot = this.getSnapshot();
 
       if (urlPath === "/healthz") {
-        const isOk = snapshot.status === "ok";
+        // Liveness: a degraded multi-channel deployment with at least one live
+        // channel stays alive so a single flapping channel cannot crash-loop
+        // the whole gateway. Only total outage or startup is unhealthy.
+        const isOk =
+          snapshot.status === "ok" ||
+          (snapshot.status === "degraded" && snapshot.channelConnected === true);
         this.sendJson(res, isOk ? 200 : 503, {
           ok: isOk,
+          status: snapshot.status,
+          uptimeMs: snapshot.uptimeMs,
+          channelConnected: snapshot.channelConnected,
+          channels: snapshot.channels
+            ? Object.fromEntries(
+                Object.entries(snapshot.channels).map(([key, c]) => [key, c.connected]),
+              )
+            : undefined,
+        });
+        return;
+      }
+
+      if (urlPath === "/readyz") {
+        // Strict readiness: only truly "ok" is ready (every channel upstream).
+        const isReady = snapshot.status === "ok";
+        this.sendJson(res, isReady ? 200 : 503, {
+          ok: isReady,
           status: snapshot.status,
           uptimeMs: snapshot.uptimeMs,
           channelConnected: snapshot.channelConnected,
@@ -73,6 +95,8 @@ export class HealthServer {
                     lastInboundAt: c.lastInboundAt,
                     lastOutboundAt: c.lastOutboundAt,
                     lastHeartbeatAt: c.lastHeartbeatAt,
+                    heartbeatStream: c.heartbeatStream,
+                    heartbeatLineId: c.heartbeatLineId,
                     lastError: c.lastError,
                   },
                 ]),

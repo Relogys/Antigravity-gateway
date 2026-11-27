@@ -169,6 +169,8 @@ export interface PendingPermission {
   toolCallId: string;
   title: string;
   kind?: string;
+  /** Canonical sender key of the user whose turn triggered this permission prompt. */
+  requesterSenderId?: string;
   options: PermissionOption[];
   createdAt: number;
   resolve: (optionId: string | null) => void;
@@ -200,6 +202,8 @@ export interface AgentTurnInput {
   model?: string;
   effort?: string;
   approvalMode?: ApprovalMode;
+  /** Canonical sender key of the user initiating this turn (used to bind group approvals). */
+  requesterSenderId?: string;
   callbacks?: AgentTurnCallbacks;
 }
 
@@ -238,6 +242,10 @@ export interface LoopJob {
   enabled: boolean;
   lastRunAt?: number;
   nextRunAt?: number;
+  /** Number of consecutive transient delivery failures (used for one-shot/reminder retries). */
+  failedAttempts?: number;
+  /** Most recent transient failure message, if any. */
+  lastError?: string;
   createdAt: number;
 }
 

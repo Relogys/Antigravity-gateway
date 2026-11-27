@@ -633,12 +633,30 @@ powershell -ExecutionPolicy Bypass -File .\scripts\uninstall-task.ps1
 
 ---
 
+## GitHub Actions &amp; Releases / CI 集成与发版产物
+
+- **Pre-built Container Images (GHCR)**: Every tagged release publishes a multi-architecture (`linux/amd64`, `linux/arm64`) image to `ghcr.io/relogys/antigravity-gateway:latest` (and `:vX.Y.Z`), plus precompiled npm tarballs + `SHA256SUMS.txt` on GitHub Releases.
+- **Reusable Notify Action (`.github/actions/notify`)**: Send HMAC-signed, anti-replay (`X-Webhook-Timestamp` + `X-Webhook-Id`) notifications or Agent prompts from any GitHub Actions workflow directly into your gateway's Webhook channel:
+
+```yaml
+- uses: Relogys/Antigravity-gateway/.github/actions/notify@v0.2.0
+  with:
+    url: ${{ secrets.GATEWAY_WEBHOOK_URL }}
+    chat-id: ops-alerts
+    text: "Deployment finished on ${{ github.ref_name }}"
+    secret: ${{ secrets.GATEWAY_WEBHOOK_SECRET }}
+```
+
+---
+
 ## Security &amp; Compliance / 安全与合规
 
 - **Official Protocol &amp; Auth Compliance**: Connects strictly through official `agy acp` using your local cached `agy` session or `GEMINI_API_KEY`. Never extracts or reverse-proxies OAuth tokens. (Note: `GEMINI_API_KEY` mode disables `/usage` quota reporting inside `agy`.)
-- **Zero Public Listening Ports by Default**: The 14 outbound transports (`photon`, `telegram`, `discord`, `slack`, `feishu`, `dingtalk`, `onebot`, `qqbot`, `matrix`, `mattermost`, `irc`, `zulip`, `rocketchat`, `signal`) dial out over long polling / WebSocket / TLS and require zero inbound ports. The 6 callback receivers (`webhook` `127.0.0.1:18791`, `wecom` `127.0.0.1:18792`, `line` `127.0.0.1:18793`, `whatsapp` `127.0.0.1:18794`, `teams` `127.0.0.1:18795`, `googlechat` `127.0.0.1:18796`) and `HealthServer` (`127.0.0.1:18790`) are disabled or loopback-only by default; `webhook` additionally blocks non-loopback hosts without `WEBHOOK_TOKEN`/`WEBHOOK_SECRET`.
-- **Signed Callbacks**: Inbound HTTP callbacks are verified before dispatch — `webhook` (Bearer token + HMAC-SHA256 `X-Webhook-Signature`), `wecom` (SHA1 `msg_signature` + AES-256-CBC WXBizMsgCrypt decrypt), `line` (`X-Line-Signature` HMAC-SHA256 over the raw body), `whatsapp` (`hub.verify_token` GET challenge + `X-Hub-Signature-256` HMAC-SHA256), `teams` (`Authorization: HMAC` with `TEAMS_WEBHOOK_SECRET` for outgoing webhooks), `googlechat` (`GOOGLECHAT_VERIFICATION_TOKEN` event token or Bearer header).
-- **Fail-Closed Auth &amp; Secret Audit**: Default-deny DM pairing (8-char unambiguous code, 1h TTL, 5-attempt lockout) across all 20 channels, outbound `MEDIA:<path>` guard against `.env*`/`.ssh`/private keys, single-instance lock (`<dataDir>/gateway.pid`), global IDE `file:///` link sanitization on every channel, and `pnpm audit:secrets` before commits.
+- **Child Process Environment Isolation**: Before spawning `agy acp`, `buildChildProcessEnv` strips credentials and configuration variables belonging to all 20 IM channels (plus internal gateway tokens), keeping only OS runtime variables, explicit `GEMINI_API_KEY`, and any user-selected `AGY_PASSTHROUGH_ENV` keys.
+- **Requester-Bound Group Approvals**: Pending tool permissions in group chats are bound to the originating `requesterSenderId`; only the requester or configured `ADMIN_SENDERS` can approve/deny, and `/yolo` in groups is restricted to `ADMIN_SENDERS`.
+- **Zero Public Listening Ports by Default**: The 14 outbound transports (`photon`, `telegram`, `discord`, `slack`, `feishu`, `dingtalk`, `onebot`, `qqbot`, `matrix`, `mattermost`, `irc`, `zulip`, `rocketchat`, `signal`) dial out over long polling / WebSocket / TLS and require zero inbound ports. The 6 callback receivers (`webhook` `127.0.0.1:18791`, `wecom` `127.0.0.1:18792`, `line` `127.0.0.1:18793`, `whatsapp` `127.0.0.1:18794`, `teams` `127.0.0.1:18795`, `googlechat` `127.0.0.1:18796`) and `HealthServer` (`127.0.0.1:18790` with `/healthz` liveness + `/readyz` readiness + `/status`) are disabled or loopback-only by default.
+- **Signed &amp; Anti-Replay Callbacks**: Inbound HTTP callbacks are verified before dispatch — `webhook` (Bearer + HMAC-SHA256 with `X-Webhook-Timestamp`/`X-Webhook-Id` anti-replay and optional `WEBHOOK_FIXED_SENDER`), `googlechat` (native RS256 OIDC Bearer JWT via `GOOGLECHAT_AUDIENCE` + Google JWKS), `wecom` (SHA1 + AES-256-CBC WXBizMsgCrypt), `line` (`X-Line-Signature` HMAC-SHA256), `whatsapp` (`X-Hub-Signature-256` HMAC-SHA256), and `teams` (`Authorization: HMAC`).
+- **Fail-Closed Auth, Durable State &amp; Secret Audit**: Default-deny DM pairing (8-char unambiguous code, 1h TTL, 5-attempt lockout) across all 20 channels, cross-process store locking with automatic `.bak` corruption recovery, outbound `MEDIA:<path>` guard against `.env*`/`.ssh`/private keys, global IDE `file:///` link sanitization on every channel, and `pnpm audit:secrets` + CodeQL in CI.
 
 ---
 

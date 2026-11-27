@@ -1,0 +1,60 @@
+name: Antigravity Gateway Notify
+description: >-
+  Send an HMAC-signed message through an Antigravity Gateway webhook
+  (/v1/messages) with anti-replay headers, and optionally wait for replies.
+
+inputs:
+  url:
+    description: Gateway webhook endpoint, e.g. https://gateway.example.com/v1/messages
+    required: true
+  chat-id:
+    description: Target chat identifier understood by the receiving channel.
+    required: true
+  text:
+    description: Message body to deliver.
+    required: true
+  sender-id:
+    description: Optional sender identifier (defaults to the chat id on the gateway).
+    required: false
+    default: ''
+  token:
+    description: Optional Bearer token for gateways that authenticate inbound HTTP.
+    required: false
+    default: ''
+  secret:
+    description: Optional HMAC signing secret matching WEBHOOK_SECRET on the gateway.
+    required: false
+    default: ''
+  wait:
+    description: '"true" to wait for the agent reply payload instead of fire-and-forget.'
+    required: false
+    default: 'false'
+  timeout-ms:
+    description: Request timeout in milliseconds (also the wait budget when wait is true).
+    required: false
+    default: '30000'
+
+outputs:
+  message-id:
+    description: Gateway message id returned by /v1/messages.
+    value: ${{ steps.send.outputs.message-id }}
+  replies-json:
+    description: JSON array of replies when wait is "true" (empty array otherwise).
+    value: ${{ steps.send.outputs.replies-json }}
+
+runs:
+  using: composite
+  steps:
+    - name: Send webhook notification
+      id: send
+      shell: bash
+      run: node "${{ github.action_path }}/send.mjs"
+      env:
+        GATEWAY_URL: ${{ inputs.url }}
+        GATEWAY_CHAT_ID: ${{ inputs.chat-id }}
+        GATEWAY_TEXT: ${{ inputs.text }}
+        GATEWAY_SENDER_ID: ${{ inputs.sender-id }}
+        GATEWAY_TOKEN: ${{ inputs.token }}
+        GATEWAY_SECRET: ${{ inputs.secret }}
+        GATEWAY_WAIT: ${{ inputs.wait }}
+        GATEWAY_TIMEOUT_MS: ${{ inputs.timeout-ms }}

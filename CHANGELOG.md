@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## [0.2.0] - 2026-11-26
+
+### Security & Reliability
+
+- **Subprocess environment isolation**: `buildChildProcessEnv` now strips credentials and configuration keys for all 20 IM channel families (plus internal gateway tokens) before spawning `agy acp`, while preserving OS runtime variables and supporting an explicit `AGY_PASSTHROUGH_ENV` allowlist.
+- **Requester-bound group approvals & admin-gated `/yolo`**: Pending tool permissions now record `requesterSenderId`. In group chats, only the originating requester or a configured `ADMIN_SENDERS` member can `/approve` or `/deny` (non-requesters are rejected without cancelling the pending prompt), and `/yolo` is restricted to `ADMIN_SENDERS` in groups.
+- **Google Chat OIDC RS256 JWT verification**: Added native `node:crypto` RS256 Bearer JWT verification (`GOOGLECHAT_AUDIENCE` + cached Google JWKS with automatic key-rotation refresh), retaining static token support only for legacy/dev configurations.
+- **Webhook anti-replay & sender pinning**: Added `X-Webhook-Timestamp` freshness validation (`WEBHOOK_REPLAY_WINDOW_SEC`, default `300s`), `X-Webhook-Id` delivery deduplication (`409` on replay after auth), optional strict enforcement (`WEBHOOK_REQUIRE_TIMESTAMP=true`), and `WEBHOOK_FIXED_SENDER` to override client-supplied `senderId`.
+- **Store cross-process lock, `.bak` recovery & schema migration**: `GatewayStore` now coordinates writes via an exclusive lockfile with stale-PID recovery, rolls the previous `state.json` to `state.json.bak` before atomic replacement, quarantines corrupt JSON files while auto-recovering from `.bak`, and validates/migrates schema versions.
+- **Reminder retry without silent loss**: One-shot `/remind` tasks now retry transient delivery failures with exponential backoff (up to 3 attempts) instead of deleting the job on the first send error; permanent dead targets stop cleanly.
+- **Liveness vs readiness health split**: `GET /healthz` now returns `200` while the gateway is ready and at least one configured channel is connected (preventing single-channel outages from causing container restart loops), while `GET /readyz` strictly requires all channels connected.
+
+### Architecture & CI/CD
+
+- **Modular slash-command architecture**: Extracted `/help`, `/channels`, `/progress`, session/model/approval commands, loop/reminder commands, and Photon native commands into dedicated modules under `src/gateway/commands/`, reducing `src/gateway/router.ts` by over 1,000 lines.
+- **Expanded CI, security scanning & release automation**: Added `windows-latest` Node 24 verification and Docker build checks to `.github/workflows/ci.yml`, CodeQL + secret/dependency scanning in `.github/workflows/security.yml`, Dependabot updates (`.github/dependabot.yml`), automated `v*.*.*` release publishing to GHCR (`linux/amd64` + `linux/arm64`) and GitHub Release tarballs with `SHA256SUMS.txt` (`.github/workflows/release.yml`), and a reusable anti-replay signed `.github/actions/notify` composite action.
+
 ### Added
 
 #### Wave 10 — Cross-platform Markdown rendering, live progress & Photon 1.0

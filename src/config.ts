@@ -200,9 +200,11 @@ const envSchema = z.object({
   SPECTRUM_PROJECT_ID: optionalString,
   SPECTRUM_PROJECT_SECRET: optionalString,
   ALLOWED_SENDERS: z.string().optional(),
+  ADMIN_SENDERS: optionalString,
   ALLOW_GROUPS: z.string().optional(),
   GROUP_MENTION_PATTERNS: z.string().optional(),
   AGY_BIN: z.string().trim().min(1).default("agy"),
+  AGY_PASSTHROUGH_ENV: optionalString,
   DEFAULT_CWD: z.string().trim().optional(),
   APPROVAL_MODE: z.enum(["auto", "interactive", "sandbox"]).default("interactive"),
   DEFAULT_MODEL: z.string().trim().optional(),
@@ -264,6 +266,9 @@ const envSchema = z.object({
   WEBHOOK_TOKEN: optionalString,
   WEBHOOK_SECRET: optionalString,
   WEBHOOK_CALLBACK_URL: optionalString,
+  WEBHOOK_FIXED_SENDER: optionalString,
+  WEBHOOK_REQUIRE_TIMESTAMP: optionalString,
+  WEBHOOK_REPLAY_WINDOW_SEC: numberEnv(5, 3600, 300),
   WEBHOOK_ALLOWED_USERS: optionalString,
 
   WECOM_CORP_ID: optionalString,
@@ -347,6 +352,8 @@ const envSchema = z.object({
   GOOGLECHAT_WEBHOOK_URL: optionalString,
   GOOGLECHAT_ACCESS_TOKEN: optionalString,
   GOOGLECHAT_VERIFICATION_TOKEN: optionalString,
+  GOOGLECHAT_AUDIENCE: optionalString,
+  GOOGLECHAT_JWKS_URL: optionalString,
   GOOGLECHAT_WEBHOOK_HOST: optionalString,
   GOOGLECHAT_WEBHOOK_PORT: numberEnv(1, 65535, 18796),
   GOOGLECHAT_WEBHOOK_PATH: optionalString,
@@ -407,6 +414,12 @@ export interface WebhookConfig {
   token?: string;
   secret?: string;
   callbackUrl?: string;
+  /** Optional fixed senderId overriding client-supplied body.senderId for shared-secret callers. */
+  fixedSenderId?: string;
+  /** When true, require X-Webhook-Timestamp + X-Webhook-Id signed replay headers on POST /v1/messages. */
+  requireTimestamp?: boolean;
+  /** Replay freshness window in seconds when timestamp headers are verified (default 300). */
+  replayWindowSec?: number;
   allowedUsers: Set<string>;
 }
 
@@ -517,6 +530,10 @@ export interface GoogleChatConfig {
   webhookUrl: string;
   accessToken: string;
   verificationToken: string;
+  /** Expected `aud` claim (project number or endpoint URL) for Google Chat OIDC RS256 Bearer JWT verification. */
+  audience?: string;
+  /** Optional JWKS URL override for Google Chat OIDC verification. */
+  jwksUrl?: string;
   webhookHost: string;
   webhookPort: number;
   webhookPath: string;
@@ -526,9 +543,13 @@ export interface GoogleChatConfig {
 export interface GatewayConfig {
   /** Global allowlist: photon phone/email entries, or `<channel>:<userId>` for other channels. */
   allowedSenders: Set<string>;
+  /** Optional elevated admin senders allowed to override group approvals and toggle /yolo in groups. */
+  adminSenders?: Set<string>;
   allowGroups: boolean;
   groupMentionPatterns: string[];
   agyBin: string;
+  /** Optional extra environment variable names explicitly passed through to the `agy` subprocess. */
+  agyPassthroughEnv?: string[];
   defaultCwd: string;
   /** Optional per-IM-channel default workspace (`<CHANNEL>_CWD`), keyed by channel name. */
   channelDefaultCwds: Partial<Record<ChannelName, string>>;
@@ -719,8 +740,13 @@ export function loadConfig(
   const googlechatWebhookUrl = cleanEnv(parsed.GOOGLECHAT_WEBHOOK_URL) ?? "";
   const googlechatAccessToken = cleanEnv(parsed.GOOGLECHAT_ACCESS_TOKEN) ?? "";
   const googlechatVerificationToken = cleanEnv(parsed.GOOGLECHAT_VERIFICATION_TOKEN) ?? "";
+  const googlechatAudience = cleanEnv(parsed.GOOGLECHAT_AUDIENCE);
+  const googlechatJwksUrl = cleanEnv(parsed.GOOGLECHAT_JWKS_URL);
   const googlechatEnabled = Boolean(
-    googlechatWebhookUrl || googlechatAccessToken || googlechatVerificationToken,
+    googlechatWebhookUrl ||
+      googlechatAccessToken ||
+      googlechatVerificationToken ||
+      googlechatAudience,
   );
 
   if (onebotUrl && !/^wss?:\/\//i.test(onebotUrl)) {
@@ -732,17 +758,20 @@ export function loadConfig(
     parsed.WEBHOOK_TOKEN,
     parsed.WEBHOOK_SECRET,
     parsed.WEBHOOK_CALLBACK_URL,
+    parsed.WEBHOOK_FIXED_SENDER,
     parsed.WEBHOOK_ALLOWED_USERS,
   ].some((v) => cleanEnv(v) !== undefined);
 
   return {
     allowedSenders: parseAllowedSenders(parsed.ALLOWED_SENDERS),
+    adminSenders: parseAllowedSenders(parsed.ADMIN_SENDERS),
     allowGroups: parseBoolEnv(parsed.ALLOW_GROUPS, false),
     groupMentionPatterns: parseListEnv(parsed.GROUP_MENTION_PATTERNS, [
       "@agy",
       "@antigravity",
     ]),
     agyBin: parsed.AGY_BIN,
+    agyPassthroughEnv: parseListEnv(parsed.AGY_PASSTHROUGH_ENV, []),
     defaultCwd,
     channelDefaultCwds,
     approvalMode: parsed.APPROVAL_MODE,
@@ -823,6 +852,9 @@ export function loadConfig(
           token: cleanEnv(parsed.WEBHOOK_TOKEN),
           secret: cleanEnv(parsed.WEBHOOK_SECRET),
           callbackUrl: cleanEnv(parsed.WEBHOOK_CALLBACK_URL),
+          fixedSenderId: cleanEnv(parsed.WEBHOOK_FIXED_SENDER),
+          requireTimestamp: parseBoolEnv(parsed.WEBHOOK_REQUIRE_TIMESTAMP, false),
+          replayWindowSec: parsed.WEBHOOK_REPLAY_WINDOW_SEC,
           allowedUsers: parseAllowedUsers(parsed.WEBHOOK_ALLOWED_USERS),
         }
       : undefined,
@@ -954,6 +986,8 @@ export function loadConfig(
           webhookUrl: googlechatWebhookUrl,
           accessToken: googlechatAccessToken,
           verificationToken: googlechatVerificationToken,
+          audience: googlechatAudience,
+          jwksUrl: googlechatJwksUrl,
           webhookHost: cleanEnv(parsed.GOOGLECHAT_WEBHOOK_HOST) ?? "127.0.0.1",
           webhookPort: parsed.GOOGLECHAT_WEBHOOK_PORT,
           webhookPath: cleanEnv(parsed.GOOGLECHAT_WEBHOOK_PATH) ?? "/googlechat/events",

@@ -1,12 +1,43 @@
 {
   "name": "antigravity-gateway",
-  "version": "0.1.0",
-  "description": "Dedicated iMessage (Photon Spectrum) gateway for Google Antigravity CLI (agy acp).",
+  "version": "0.2.0",
+  "description": "Universal 20-channel messaging gateway (Photon iMessage, Telegram, Discord, Slack, and more) for Google Antigravity CLI (agy acp).",
   "type": "module",
   "license": "MIT",
   "engines": {
     "node": ">=22.0.0"
   },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Relogys/Antigravity-gateway.git"
+  },
+  "homepage": "https://github.com/Relogys/Antigravity-gateway#readme",
+  "bugs": {
+    "url": "https://github.com/Relogys/Antigravity-gateway/issues"
+  },
+  "keywords": [
+    "antigravity",
+    "acp",
+    "gateway",
+    "imessage",
+    "photon",
+    "telegram",
+    "discord",
+    "slack",
+    "chatbot",
+    "agent"
+  ],
+  "files": [
+    "dist",
+    "scripts/audit-secrets.mjs",
+    "scripts/start-gateway.ps1",
+    "docs",
+    ".env.example",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "SECURITY.md"
+  ],
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "bin": {

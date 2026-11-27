@@ -12,6 +12,7 @@ import type {
 } from "../types.js";
 import { BaseChannelAdapter, type InboundHandler } from "./base.js";
 import {
+  BoundedDedupeCache,
   closeHttpServer,
   configureHttpServerTimeouts,
   errorMessage,
@@ -44,6 +45,8 @@ export interface WebhookAdapterOptions {
   settleMs?: number;
   maxBodyBytes?: number;
   mediaDir?: string;
+  /** Clock injection for replay/timestamp checks (default `Date.now`). */
+  nowFn?: () => number;
 }
 
 export interface WebhookReply {
@@ -86,6 +89,40 @@ export function signWebhookBody(secret: string, body: string | Buffer): string {
   return `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`;
 }
 
+/**
+ * `sha256=<hex>` replay-resistant signature over `<timestamp>.<deliveryId>.<body>`.
+ * Falls back to {@link signWebhookBody} when no timestamp is supplied.
+ */
+export function signWebhookRequest(
+  secret: string,
+  body: string | Buffer,
+  timestamp?: string | number,
+  deliveryId?: string,
+): string {
+  const ts = timestamp === undefined ? "" : String(timestamp).trim();
+  if (!ts) {
+    return signWebhookBody(secret, body);
+  }
+  const bodyBuf = Buffer.isBuffer(body) ? body : Buffer.from(body, "utf8");
+  const prefix = Buffer.from(`${ts}.${deliveryId ?? ""}.`, "utf8");
+  return `sha256=${createHmac("sha256", secret)
+    .update(Buffer.concat([prefix, bodyBuf]))
+    .digest("hex")}`;
+}
+
+/** Parse a `x-webhook-timestamp` value (Unix seconds or milliseconds) into milliseconds. */
+function parseTimestampMs(raw: string): number | undefined {
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) {
+    return undefined;
+  }
+  const value = Number(trimmed);
+  if (!Number.isFinite(value) || value <= 0) {
+    return undefined;
+  }
+  return value < 1e12 ? value * 1000 : value;
+}
+
 class HttpError extends Error {
   constructor(
     readonly status: number,
@@ -113,6 +150,11 @@ export class WebhookChannelAdapter extends BaseChannelAdapter {
   private readonly sseClients = new Set<SseClient>();
   private readonly fetchImpl: typeof fetch;
   private readonly mediaDir: string;
+  private readonly nowFn: () => number;
+  private readonly replayCache = new BoundedDedupeCache({
+    maxEntries: 5000,
+    ttlMs: 15 * 60 * 1000,
+  });
 
   constructor(
     private readonly config: GatewayConfig,
@@ -121,6 +163,7 @@ export class WebhookChannelAdapter extends BaseChannelAdapter {
     super();
     this.fetchImpl = options.fetchImpl ?? ((...args) => fetch(...args));
     this.mediaDir = options.mediaDir ?? path.join(config.dataDir, "media");
+    this.nowFn = options.nowFn ?? Date.now;
   }
 
   getPort(): number | null {
@@ -210,17 +253,68 @@ export class WebhookChannelAdapter extends BaseChannelAdapter {
     return Boolean(m) && safeEqual((m as RegExpExecArray)[1].trim(), token);
   }
 
-  private checkSignature(req: http.IncomingMessage, body: Buffer): boolean {
-    const secret = this.config.webhook?.secret;
-    if (!secret) {
-      return true;
+  private headerValue(req: http.IncomingMessage, name: string): string | undefined {
+    const raw = req.headers[name];
+    const value = Array.isArray(raw) ? raw[0] : raw;
+    const trimmed = value?.trim();
+    return trimmed ? trimmed : undefined;
+  }
+
+  /**
+   * Verify signature, timestamp freshness, and (last) replay uniqueness.
+   * Throws `HttpError` on failure; a `true` return means the request is authenticated.
+   */
+  private verifyInboundAuth(
+    req: http.IncomingMessage,
+    body: Buffer,
+    isMessages: boolean,
+  ): void {
+    const cfg = this.config.webhook;
+    const secret = cfg?.secret;
+    const rawTimestamp = this.headerValue(req, "x-webhook-timestamp");
+    const deliveryId =
+      this.headerValue(req, "x-webhook-id") ?? this.headerValue(req, "x-webhook-nonce");
+
+    if (secret) {
+      const provided = this.headerValue(req, "x-webhook-signature")?.toLowerCase();
+      if (!provided) {
+        throw new HttpError(401, "unauthorized");
+      }
+      const expected =
+        rawTimestamp !== undefined
+          ? signWebhookRequest(secret, body, rawTimestamp, deliveryId ?? "")
+          : signWebhookBody(secret, body);
+      if (!safeEqual(provided, expected)) {
+        throw new HttpError(401, "unauthorized");
+      }
     }
-    const header = req.headers["x-webhook-signature"];
-    const provided = (Array.isArray(header) ? header[0] : header)?.trim().toLowerCase();
-    if (!provided) {
-      return false;
+
+    // Presence/format enforcement for strict mode (POST only; SSE subscribes never need it).
+    if (isMessages && cfg?.requireTimestamp === true) {
+      const tsMs = rawTimestamp === undefined ? undefined : parseTimestampMs(rawTimestamp);
+      if (rawTimestamp === undefined || tsMs === undefined || deliveryId === undefined) {
+        throw new HttpError(401, "timestamp and delivery id required");
+      }
     }
-    return safeEqual(provided, signWebhookBody(secret, body));
+
+    // Freshness applies whenever a timestamp is supplied.
+    if (rawTimestamp !== undefined) {
+      const tsMs = parseTimestampMs(rawTimestamp);
+      const windowMs = (cfg?.replayWindowSec ?? 300) * 1000;
+      if (tsMs === undefined || Math.abs(this.nowFn() - tsMs) > windowMs) {
+        throw new HttpError(401, "webhook timestamp outside allowed window");
+      }
+    }
+
+    if (!isMessages) {
+      return;
+    }
+
+    // Only record the delivery id once auth + freshness passed, so spoofed requests
+    // cannot poison the replay cache for the legitimate sender.
+    if (deliveryId !== undefined && this.replayCache.seen(deliveryId, this.nowFn())) {
+      throw new HttpError(409, "duplicate webhook delivery");
+    }
   }
 
   private async readBody(req: http.IncomingMessage): Promise<Buffer> {
@@ -251,9 +345,7 @@ export class WebhookChannelAdapter extends BaseChannelAdapter {
       throw new HttpError(401, "unauthorized");
     }
     const body = isMessages ? await this.readBody(req) : Buffer.alloc(0);
-    if (!this.checkSignature(req, body)) {
-      throw new HttpError(401, "unauthorized");
-    }
+    this.verifyInboundAuth(req, body, isMessages);
 
     if (isEvents) {
       this.openEventStream(req, res, url.searchParams.get("chatId") ?? undefined);
@@ -319,8 +411,12 @@ export class WebhookChannelAdapter extends BaseChannelAdapter {
       throw new HttpError(400, "chatId is required (string, max 256 chars)");
     }
     const text = typeof body.text === "string" ? body.text : "";
-    const senderId =
-      typeof body.senderId === "string" && body.senderId.trim() ? body.senderId.trim() : chatId;
+    const fixedSenderId = this.config.webhook?.fixedSenderId?.trim();
+    const senderId = fixedSenderId
+      ? fixedSenderId
+      : typeof body.senderId === "string" && body.senderId.trim()
+        ? body.senderId.trim()
+        : chatId;
     const hasAttachments = Array.isArray(body.attachments) && body.attachments.length > 0;
     if (!text.trim() && !hasAttachments) {
       throw new HttpError(400, "text or attachments required");

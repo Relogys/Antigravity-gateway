@@ -15,7 +15,12 @@ import type {
   TurnActivitySnapshot,
 } from "../types.js";
 import { AgyAcpClient, type AcpPermissionHandler, type NewSessionInfo } from "./client.js";
-import { PermissionManager, type PermissionDecision } from "./permissions.js";
+import {
+  PermissionManager,
+  type PermissionDecision,
+  type PermissionResolveActor,
+  type PermissionResolveResult,
+} from "./permissions.js";
 
 export interface AgyAcpClientLike {
   ensureStarted(): Promise<unknown>;
@@ -302,6 +307,7 @@ export class AgyAgentBackend implements AgentBackend {
         defaultCwd: config.defaultCwd,
         approvalMode: config.approvalMode,
         geminiApiKey: config.geminiApiKey,
+        passthroughEnv: config.agyPassthroughEnv,
       });
     this.permissions = options.permissionManager ?? new PermissionManager();
     this.permissionNotifier = options.permissionNotifier;
@@ -407,8 +413,20 @@ export class AgyAgentBackend implements AgentBackend {
     return this.permissions.getPending(chatId);
   }
 
-  resolvePermission(chatId: string, decision: PermissionDecision): boolean {
-    return this.permissions.resolve(chatId, decision);
+  resolvePermission(
+    chatId: string,
+    decision: PermissionDecision,
+    actor?: PermissionResolveActor,
+  ): boolean {
+    return this.permissions.resolve(chatId, decision, actor);
+  }
+
+  resolvePermissionWithResult(
+    chatId: string,
+    decision: PermissionDecision,
+    actor?: PermissionResolveActor,
+  ): PermissionResolveResult {
+    return this.permissions.resolveWithResult(chatId, decision, actor);
   }
 
   getAvailableModels(): string[] {
@@ -573,6 +591,7 @@ export class AgyAgentBackend implements AgentBackend {
         toolCallId: req.toolCall.toolCallId,
         title: req.toolCall.title ?? req.toolCall.toolCallId,
         kind: req.toolCall.kind ?? undefined,
+        requesterSenderId: input.requesterSenderId,
         options: req.options.map((o) => ({
           optionId: o.optionId,
           name: o.name,

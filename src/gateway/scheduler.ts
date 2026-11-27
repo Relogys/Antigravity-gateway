@@ -25,7 +25,13 @@ export interface LoopSchedulerDeps {
   channel: ChannelAdapter;
   runPrompt?: (job: StoredLoopJob) => Promise<string | void>;
   deadTargets?: DeadTargetRegistry;
+  /** Transient delivery retries for one-shot jobs/reminders before cleanup (default 3). */
+  maxOneShotRetries?: number;
+  /** Backoff schedule for one-shot retries; the last value repeats (default 30s/2m/10m). */
+  oneShotRetryDelaysMs?: number[];
 }
+
+const DEFAULT_ONE_SHOT_RETRY_DELAYS_MS = [30_000, 120_000, 600_000];
 
 const UNIT_MS: Record<string, number> = {
   s: 1000,
@@ -179,6 +185,8 @@ export class LoopScheduler {
   private readonly channel: ChannelAdapter;
   private readonly deadTargets: DeadTargetRegistry;
   private runPrompt?: (job: StoredLoopJob) => Promise<string | void>;
+  private readonly maxOneShotRetries: number;
+  private readonly oneShotRetryDelaysMs: number[];
   private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly inFlight = new Set<string>();
   private started = false;
@@ -188,6 +196,9 @@ export class LoopScheduler {
     this.channel = deps.channel;
     this.deadTargets = deps.deadTargets ?? new DeadTargetRegistry();
     this.runPrompt = deps.runPrompt;
+    this.maxOneShotRetries = Math.max(0, deps.maxOneShotRetries ?? 3);
+    const delays = deps.oneShotRetryDelaysMs ?? DEFAULT_ONE_SHOT_RETRY_DELAYS_MS;
+    this.oneShotRetryDelaysMs = delays.length > 0 ? [...delays] : [...DEFAULT_ONE_SHOT_RETRY_DELAYS_MS];
   }
 
   getDeadTargetRegistry(): DeadTargetRegistry {
@@ -356,7 +367,9 @@ export class LoopScheduler {
         this.scheduleJob(job);
         return;
       }
-      void this.executeJob(job.id);
+      // Timer callbacks outlive the caller: a rejected store write must not
+      // become an unhandled rejection that takes down the process.
+      void this.executeJob(job.id).catch(() => {});
     }, delay);
 
     this.timers.set(job.id, timer);
@@ -374,10 +387,15 @@ export class LoopScheduler {
 
     this.inFlight.add(id);
     const runAt = Date.now();
+    let delivered = false;
+    let permanentFailure = false;
+    let lastErrorMessage: string | undefined;
 
     try {
       // A dead target is skipped entirely: no AI call and no platform send.
-      if (!this.deadTargets.isDead(job.chatId).dead) {
+      if (this.deadTargets.isDead(job.chatId).dead) {
+        permanentFailure = true;
+      } else {
         try {
           if (job.kind === "remind") {
             await this.channel.sendMessage({
@@ -385,6 +403,7 @@ export class LoopScheduler {
               text: `⏰ Reminder: ${job.prompt}`,
             });
             this.deadTargets.markAlive(job.chatId);
+            delivered = true;
           } else if (this.runPrompt) {
             const result = await this.runPrompt(job);
             if (typeof result === "string" && result.trim().length > 0) {
@@ -395,15 +414,20 @@ export class LoopScheduler {
               });
               this.deadTargets.markAlive(job.chatId);
             }
+            delivered = true;
+          } else {
+            delivered = true;
           }
         } catch (err) {
-          const permanent = this.deadTargets.recordError(job.chatId, err);
-          if (!permanent) {
-            const msg = err instanceof Error ? err.message : String(err);
+          lastErrorMessage = err instanceof Error ? err.message : String(err);
+          permanentFailure = this.deadTargets.recordError(job.chatId, err);
+          // Never retry-notify a reminder that failed to reach its channel; for
+          // recurring loops keep the best-effort failure notice.
+          if (!permanentFailure && job.kind !== "remind") {
             await this.channel
               .sendMessage({
                 chatId: job.chatId,
-                text: `Loop [${job.id}] failed: ${msg}`,
+                text: `Loop [${job.id}] failed: ${lastErrorMessage}`,
               })
               .catch(() => {});
           }
@@ -420,7 +444,33 @@ export class LoopScheduler {
     }
 
     if (latest.oneShot || latest.kind === "remind") {
-      await this.store.deleteLoop(id);
+      if (delivered || permanentFailure) {
+        await this.store.deleteLoop(id);
+        return;
+      }
+
+      // Transient failure: keep the reminder and retry with backoff instead of
+      // silently dropping it from the store.
+      const attempts = (latest.failedAttempts ?? 0) + 1;
+      if (attempts > this.maxOneShotRetries) {
+        await this.store.deleteLoop(id);
+        return;
+      }
+
+      const delays = this.oneShotRetryDelaysMs;
+      const retryDelay = delays[Math.min(attempts - 1, delays.length - 1)]!;
+      const updated: StoredLoopJob = {
+        ...latest,
+        failedAttempts: attempts,
+        lastError: lastErrorMessage,
+        nextRunAt: Date.now() + retryDelay,
+      };
+      // Arm the retry before awaiting the store write so a slow disk never
+      // delays or drops the retry.
+      if (this.started && updated.enabled) {
+        this.scheduleJob(updated);
+      }
+      await this.store.upsertLoop(updated);
       return;
     }
 
@@ -433,10 +483,11 @@ export class LoopScheduler {
       ...latest,
       lastRunAt: runAt,
       nextRunAt: nextRunAt ?? undefined,
+      ...(delivered ? { failedAttempts: 0, lastError: undefined } : {}),
     };
-    await this.store.upsertLoop(updated);
     if (this.started && updated.enabled) {
       this.scheduleJob(updated);
     }
+    await this.store.upsertLoop(updated);
   }
 }

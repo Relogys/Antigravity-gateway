@@ -13,6 +13,21 @@ export interface PermissionRequestInput {
   title: string;
   kind?: string;
   options: PermissionOption[];
+  /** Canonical sender key of the user whose turn triggered this request (binds group approvals). */
+  requesterSenderId?: string;
+}
+
+export interface PermissionResolveActor {
+  senderId?: string;
+  isGroup?: boolean;
+  isAdmin?: boolean;
+}
+
+export interface PermissionResolveResult {
+  ok: boolean;
+  reason?: "none" | "requester_mismatch";
+  requesterSenderId?: string;
+  permissionId?: string;
 }
 
 export type PermissionNotifyCallback = (
@@ -122,6 +137,7 @@ export class PermissionManager {
         toolCallId: req.toolCallId,
         title: req.title,
         kind: req.kind,
+        requesterSenderId: req.requesterSenderId,
         options: req.options,
         createdAt: Date.now(),
         resolve: finish,
@@ -140,10 +156,41 @@ export class PermissionManager {
     });
   }
 
-  resolve(chatId: string, decision: PermissionDecision): boolean {
+  resolve(
+    chatId: string,
+    decision: PermissionDecision,
+    actor?: PermissionResolveActor,
+  ): boolean {
+    return this.resolveWithResult(chatId, decision, actor).ok;
+  }
+
+  resolveWithResult(
+    chatId: string,
+    decision: PermissionDecision,
+    actor?: PermissionResolveActor,
+  ): PermissionResolveResult {
     const entry = this.pending.get(chatId);
     if (!entry || entry.settled) {
-      return false;
+      return { ok: false, reason: "none" };
+    }
+
+    // In group chats, only the original requester (or an admin) may settle the
+    // request. A mismatched actor leaves the pending request alive for the
+    // real requester instead of silently denying another user's turn.
+    const requester = entry.perm.requesterSenderId;
+    if (
+      actor?.isGroup &&
+      !actor.isAdmin &&
+      requester &&
+      actor.senderId &&
+      actor.senderId.toLowerCase() !== requester.toLowerCase()
+    ) {
+      return {
+        ok: false,
+        reason: "requester_mismatch",
+        requesterSenderId: requester,
+        permissionId: entry.perm.id,
+      };
     }
 
     const { options } = entry.perm;
@@ -157,7 +204,7 @@ export class PermissionManager {
     }
 
     entry.perm.resolve(optionId);
-    return true;
+    return { ok: true, permissionId: entry.perm.id };
   }
 
   getPending(chatId: string): PendingPermission | undefined {

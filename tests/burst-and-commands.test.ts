@@ -370,12 +370,15 @@ describe("Router burst integration", () => {
     );
 
     expect(backend.turnCalls).toHaveLength(0);
-    await delay(200);
-
-    expect(backend.turnCalls).toHaveLength(1);
+    await vi.waitFor(
+      () => {
+        expect(backend.turnCalls).toHaveLength(1);
+        expect(channel.texts().at(-1)).toContain("Echo: first fragment\nsecond fragment");
+      },
+      { timeout: 2000 },
+    );
     expect(backend.turnCalls[0]!.text).toBe("first fragment\nsecond fragment");
     expect(backend.turnCalls[0]!.attachments).toHaveLength(1);
-    expect(channel.texts().at(-1)).toContain("Echo: first fragment\nsecond fragment");
     router.stop();
   });
 

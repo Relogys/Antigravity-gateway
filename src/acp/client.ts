@@ -29,18 +29,82 @@ const WINDOWS_RUNTIME_ENV_KEYS = [
 ] as const;
 
 /**
- * Build a child-process env that keeps Windows runtime variables intact.
- * Dropping SYSTEMROOT/TEMP makes Python agents fail with WinError 10106.
+ * Gateway/channel credential and internal-config variable families that must
+ * never leak into the spawned agent process (it can log its env to telemetry).
+ */
+const SENSITIVE_ENV_PREFIXES = [
+  "SPECTRUM_",
+  "PHOTON_",
+  "TELEGRAM_",
+  "DISCORD_",
+  "SLACK_",
+  "FEISHU_",
+  "DINGTALK_",
+  "ONEBOT_",
+  "WEBHOOK_",
+  "WECOM_",
+  "QQBOT_",
+  "MATRIX_",
+  "MATTERMOST_",
+  "LINE_",
+  "IRC_",
+  "WHATSAPP_",
+  "ZULIP_",
+  "ROCKETCHAT_",
+  "SIGNAL_",
+  "TEAMS_",
+  "GOOGLECHAT_",
+  "HEALTH_",
+  "TOOL_PROGRESS_",
+  "PROGRESS_SILENCE_",
+  "SESSION_STALL_",
+] as const;
+
+const SENSITIVE_ENV_EXACT_KEYS = new Set([
+  "ANTIGRAVITY_CSRF_TOKEN",
+  "ANTIGRAVITY_LS_ADDRESS",
+  "ALLOWED_SENDERS",
+  "ADMIN_SENDERS",
+  "ALLOW_GROUPS",
+  "GROUP_MENTION_PATTERNS",
+  "AGY_PASSTHROUGH_ENV",
+  "QUOTA_WARN_THRESHOLD",
+  "TURN_MAX_RETRIES",
+  "INGRESS_DEBOUNCE_MS",
+  "AUTO_BOOTSTRAP_CHANNEL_SESSION",
+]);
+
+/** True for any gateway/channel credential or internal config env variable. */
+export function isSensitiveGatewayEnvKey(key: string): boolean {
+  const upper = key.toUpperCase();
+  if (SENSITIVE_ENV_EXACT_KEYS.has(upper)) {
+    return true;
+  }
+  return SENSITIVE_ENV_PREFIXES.some((prefix) => upper.startsWith(prefix));
+}
+
+/**
+ * Build a child-process env that strips gateway/channel credentials and keeps
+ * Windows runtime variables intact. Dropping SYSTEMROOT/TEMP makes Python
+ * agents fail with WinError 10106. Keys in `passthroughKeys` (case-insensitive)
+ * opt back in even when they match a sensitive family.
  */
 export function buildChildProcessEnv(
   baseEnv: NodeJS.ProcessEnv,
   overrides: Record<string, string | undefined> = {},
+  passthroughKeys: readonly string[] = [],
 ): NodeJS.ProcessEnv {
+  const passthrough = new Set(passthroughKeys.map((key) => key.toUpperCase()));
   const env: NodeJS.ProcessEnv = {};
+
   for (const [key, value] of Object.entries(baseEnv)) {
-    if (value !== undefined) {
-      env[key] = value;
+    if (value === undefined) {
+      continue;
     }
+    if (isSensitiveGatewayEnvKey(key) && !passthrough.has(key.toUpperCase())) {
+      continue;
+    }
+    env[key] = value;
   }
 
   for (const key of WINDOWS_RUNTIME_ENV_KEYS) {
@@ -70,6 +134,8 @@ export interface AgyAcpClientOptions {
   clientName?: string;
   clientVersion?: string;
   onStderr?: (line: string) => void;
+  /** Gateway env keys to forward to the child despite the sensitive-key filter. */
+  passthroughEnv?: string[];
 }
 
 export interface SessionConfigOption {
@@ -229,9 +295,11 @@ export class AgyAcpClient {
       args.push(...this.options.extraArgs);
     }
 
-    const env = buildChildProcessEnv(process.env, {
-      GEMINI_API_KEY: this.options.geminiApiKey,
-    });
+    const env = buildChildProcessEnv(
+      process.env,
+      { GEMINI_API_KEY: this.options.geminiApiKey },
+      this.options.passthroughEnv,
+    );
 
     const proc = spawn(this.options.agyBin, args, {
       cwd: this.options.defaultCwd,

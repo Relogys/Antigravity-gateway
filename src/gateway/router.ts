@@ -1,13 +1,15 @@
-import fs from "node:fs";
-import path from "node:path";
 import type { ConversationGroupSync } from "../acp/conversation-sync.js";
-import { fetchAgyQuota, formatQuotaSummary } from "../acp/quota.js";
+import type {
+  PermissionResolveActor,
+  PermissionResolveResult,
+} from "../acp/permissions.js";
+import { fetchAgyQuota } from "../acp/quota.js";
 import { stripIdeFileLinks } from "../channels/format.js";
 import { splitQualifiedChatId } from "../channels/hub.js";
 import {
-  CHANNEL_NAMES,
   getChannelAllowedUsers,
   isPhotonChannel,
+  normalizeSenderId,
   normalizeUserId,
   senderKeyFor,
   type ChannelName,
@@ -33,25 +35,27 @@ import type {
   TurnActivitySnapshot,
 } from "../types.js";
 import { IngressBurstCoalescer, type ReplyQuoteMetadata } from "./burst.js";
+import { handleLoopCommand } from "./commands/loop.js";
 import { handlePhotonNativeCommand } from "./commands/photon.js";
+import { handleSessionCommand } from "./commands/session.js";
+import {
+  formatUptime,
+  handleSystemCommand,
+  type RouterCommandContext,
+  type VerbosityLevel,
+} from "./commands/system.js";
 import { BotLoopGuard } from "./guards.js";
 import { LiveProgressTracker, sanitizeToolTitle } from "./progress.js";
-import {
-  LoopScheduler,
-  formatDurationMs,
-  parseDurationMs,
-} from "./scheduler.js";
+import { LoopScheduler } from "./scheduler.js";
 import type { GatewayStore } from "./store.js";
 
 const DEFAULT_TYPING_INTERVAL_MS = 5000;
 const DEFAULT_PROGRESS_POLL_INTERVAL_MS = 15_000;
 const QUOTA_CHECK_INTERVAL_MS = 5 * 60 * 1000;
-const GATEWAY_VERSION = "0.1.0";
+const GATEWAY_VERSION = "0.2.0";
 const MAX_SESSION_LIST_CACHE = 500;
 const MAX_LAST_PROMPTS = 500;
 const REPLY_QUOTE_SNIPPET_MAX = 500;
-
-type VerbosityLevel = "off" | "brief" | "full";
 
 export interface ExtendedAgentBackend extends AgentBackend {
   getBusyMode?(chatId: string): BusyMode;
@@ -79,7 +83,13 @@ export interface ExtendedAgentBackend extends AgentBackend {
   resolvePermission?(
     chatId: string,
     decision: "once" | "session" | "always" | "deny",
+    actor?: PermissionResolveActor,
   ): boolean;
+  resolvePermissionWithResult?(
+    chatId: string,
+    decision: "once" | "session" | "always" | "deny",
+    actor?: PermissionResolveActor,
+  ): PermissionResolveResult;
   getStats?(): {
     activeSessions: number;
     activeTurns: number;
@@ -183,72 +193,8 @@ const SLOW_SLASH_COMMANDS = new Set([
   "mode",
 ]);
 
-const HELP_TEXT = [
-  "Antigravity Gateway Commands:",
-  "Always available (even while busy):",
-  "• /stop — Cancel active turn",
-  "• /new [title] (/reset) — Start a fresh session (optionally titled)",
-  "• /status — Show session, model, busy & queue state",
-  "• /ping — Health check (uptime & connection state)",
-  "• /usage — Check Antigravity quota (0 tokens)",
-  "• /queue (/q) [prompt|list|clear] — Manage prompt queue",
-  "• /steer (/s) <prompt> — Interrupt & redirect active turn",
-  "• /busy [queue|interrupt|steer] — Set busy-turn policy",
-  "• /approve [once|session|always] | /deny — Resolve tool permission",
-  "• /yolo — Toggle auto-approval mode",
-  "• /verbose [off|brief|full] — Progress-pulse verbosity",
-  "• /progress [auto|edit|silence|off|keep|delete] — Live tool-call progress & cleanup policy",
-  "• /sethome — Set this chat as the recovery home",
-  "• /channels — Show active channels & connection state",
-  "• /whoami | /version | /help",
-  "",
-  "Session & Config (when idle):",
-  "• /retry — Re-run the last prompt in this chat",
-  "• /model [slug] — View or switch model",
-  "• /effort [low|medium|high|xhigh] — Set reasoning effort",
-  "• /mode [default|accept-edits|auto|plan] — Set ACP mode",
-  "• /approvals [auto|interactive|sandbox] — Set permission mode",
-  "• /sessions [channel|all] — List sessions (defaults to this channel group)",
-  "• /groups — Summarize every IM channel session group",
-  "• /resume [id|index] — Resume a saved session",
-  "• /title [name] — View or rename session",
-  "• /compact (/compress) — Summarize & compact context",
-  "• /cwd [path] — View or change working directory",
-  "• /discard — Discard session & queue",
-  "• /loop [list|add <dur> <prompt>|rm <id>|pause <id>|resume <id>]",
-  "• /remind <dur> <text> — One-way reminder push",
-  "",
-  "Photon iMessage native:",
-  "• /poll <q> | <opt1> | <opt2> — Create native iMessage poll",
-  "• /bg [preset|clear|list] — Set or clear chat background (24 presets)",
-  "• /unsend — Retract bot's last iMessage (~2m window)",
-  "• /card — Share native bot contact card",
-].join("\n");
-
-function formatUptime(ms: number): string {
-  const totalSec = Math.max(0, Math.floor(ms / 1000));
-  const days = Math.floor(totalSec / 86400);
-  const hours = Math.floor((totalSec % 86400) / 3600);
-  const mins = Math.floor((totalSec % 3600) / 60);
-  const secs = totalSec % 60;
-  if (days > 0) return `${days}d ${hours}h ${mins}m`;
-  if (hours > 0) return `${hours}h ${mins}m`;
-  if (mins > 0) return `${mins}m ${secs}s`;
-  return `${secs}s`;
-}
-
 function escapeRegExp(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-/** True for `-h`, `--h`, `--help`, `help`, `?` (case-insensitive). */
-function isHelpFlag(s: string): boolean {
-  return /^(?:-h|--h|--help|help|\?)$/i.test(s.trim());
-}
-
-/** True for `list` / `ls` (case-insensitive). */
-function isListFlag(s: string): boolean {
-  return /^(?:list|ls)$/i.test(s.trim());
 }
 
 function isCancellationError(err: unknown): boolean {
@@ -349,6 +295,9 @@ export class GatewayRouter {
   ): Promise<void> {
     const lines = [
       `⚠️ Permission requested: ${perm.title}${perm.kind ? ` (${perm.kind})` : ""}`,
+      ...(perm.requesterSenderId
+        ? [`Requested by: ${perm.requesterSenderId}`]
+        : []),
       "Reply with:",
       "• /approve (once)",
       "• /approve session",
@@ -545,6 +494,55 @@ export class GatewayRouter {
     return undefined;
   }
 
+  /**
+   * True when the sender is listed in `ADMIN_SENDERS`, using the same keys as
+   * `ALLOWED_SENDERS`: photon uses bare phone/email, other channels use
+   * `<channel>:<userId>` (all case-insensitive).
+   */
+  private isAdminSender(
+    channel: string,
+    rawSender: string,
+    canonicalSenderId: string,
+  ): boolean {
+    const admins = this.config.adminSenders;
+    if (!admins || admins.size === 0) {
+      return false;
+    }
+
+    const candidates = new Set<string>();
+    const canonical = canonicalSenderId.trim().toLowerCase();
+    if (canonical) {
+      candidates.add(canonical);
+    }
+    const senderKey = senderKeyFor(channel, rawSender);
+    if (senderKey) {
+      candidates.add(senderKey.toLowerCase());
+    }
+    const raw = rawSender.trim();
+    if (raw) {
+      candidates.add(raw.toLowerCase());
+      if (isPhotonChannel(channel)) {
+        const normalized = normalizeSenderId(raw);
+        if (normalized) {
+          candidates.add(normalized);
+        }
+      } else {
+        const normalized = normalizeUserId(raw);
+        if (normalized) {
+          candidates.add(normalized);
+          candidates.add(`${channel.toLowerCase()}:${normalized}`);
+        }
+      }
+    }
+
+    for (const candidate of candidates) {
+      if (admins.has(candidate)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   private readReceiptsEnabled(channel: string): boolean {
     return isPhotonChannel(channel) ? (this.config.photon?.readReceipts ?? true) : true;
   }
@@ -650,33 +648,6 @@ export class GatewayRouter {
         ? "previous assistant message"
         : "quoted message";
     return `[Replying to ${label}: "${snippet}"]\n\n${text}`;
-  }
-
-  private formatChannelsReport(currentChannel: string): string {
-    const entries = Object.values(this.getChannelStatuses());
-    if (entries.length === 0) {
-      return "No channels registered.";
-    }
-    const now = Date.now();
-    const ago = (ts?: number) => (ts ? `${formatUptime(now - ts)} ago` : "never");
-    const lines = entries.map((c) => {
-      const parts = [
-        `${c.connected ? "✅" : "❌"} ${c.name}${c.name === currentChannel ? " (this chat)" : ""} — ${c.connected ? "connected" : "disconnected"}`,
-        `in ${ago(c.lastInboundAt)}`,
-        `out ${ago(c.lastOutboundAt)}`,
-      ];
-      if (c.lastHeartbeatAt !== undefined) {
-        const streamTag = c.heartbeatStream ? ` [${c.heartbeatStream}]` : "";
-        parts.push(`hb ${ago(c.lastHeartbeatAt)}${streamTag}`);
-      } else if (c.heartbeatStream) {
-        parts.push(`hb [${c.heartbeatStream}]`);
-      }
-      if (c.lastError && !c.connected) {
-        parts.push(`error: ${c.lastError.slice(0, 100)}`);
-      }
-      return `• ${parts.join(" | ")}`;
-    });
-    return `Channels (${entries.length}):\n${lines.join("\n")}`;
   }
 
   private stripGroupMention(text: string, isGroup: boolean): string {
@@ -941,1117 +912,125 @@ export class GatewayRouter {
     args: string,
     busy: boolean,
   ): Promise<void> {
-    const { chatId } = msg;
+    const ctx = this.createCommandContext(msg, senderId, cmd, args, busy);
 
-    switch (cmd) {
-      case "help":
-      case "commands":
-        await this.sendReply(chatId, HELP_TEXT, msg.id);
-        return;
-
-      case "channels":
-        await this.sendReply(chatId, this.formatChannelsReport(msg.channel), msg.id);
-        return;
-
-      case "version":
-      case "v":
-        await this.sendReply(
-          chatId,
-          `antigravity-gateway v${this.version} | Node ${process.version}`,
-          msg.id,
-        );
-        return;
-
-      case "whoami": {
-        const source =
-          this.resolveAuthSource(msg.channel, msg.senderId || msg.rawSenderId || "", senderId) ??
-          "unknown";
-        await this.sendReply(
-          chatId,
-          [
-            `Sender: ${senderId}`,
-            `Channel: ${msg.channel}`,
-            `Chat: ${chatId} (${msg.isGroup ? "group" : "dm"})`,
-            `Service: ${msg.service ?? "unknown"}`,
-            `Auth: ${source}`,
-          ].join("\n"),
-          msg.id,
-        );
-        return;
-      }
-
-      case "ping": {
-        if (isHelpFlag(args)) {
-          await this.sendReply(
-            chatId,
-            "Usage: /ping — Report gateway uptime and channel connection state.",
-            msg.id,
-          );
-          return;
-        }
-        await this.sendReply(
-          chatId,
-          `🏓 Pong! channel=${msg.channel} | uptime=${formatUptime(Date.now() - this.startedAt)} | connected=${this.channel.isConnected()}`,
-          msg.id,
-        );
-        return;
-      }
-
-      case "sethome": {
-        if (isHelpFlag(args)) {
-          await this.sendReply(
-            chatId,
-            "Usage: /sethome — Set this conversation as the recovery home chat.",
-            msg.id,
-          );
-          return;
-        }
-        await this.store.setHomeChatId(chatId);
-        await this.sendReply(
-          chatId,
-          `🏠 Home chat set to this conversation (${chatId}).`,
-          msg.id,
-        );
-        return;
-      }
-
-      case "verbose": {
-        const current = this.getChatVerbosity(chatId);
-        if (!args || isHelpFlag(args)) {
-          await this.sendReply(
-            chatId,
-            [
-              `Verbosity: ${current}`,
-              "Usage: /verbose [off|brief|full]",
-              "off — silence periodic progress pulses (stall alerts stay on)",
-              "brief — concise progress pulses (default)",
-              "full — add tool count, model, effort & retry detail",
-            ].join("\n"),
-            msg.id,
-          );
-          return;
-        }
-        const next = args.toLowerCase();
-        if (next !== "off" && next !== "brief" && next !== "full") {
-          await this.sendReply(
-            chatId,
-            "Invalid verbosity. Use: /verbose [off|brief|full]",
-            msg.id,
-          );
-          return;
-        }
-        this.verbosityByChatId.set(chatId, next);
-        await this.sendReply(chatId, `Verbosity set to: ${next}`, msg.id);
-        return;
-      }
-
-      case "progress": {
-        const usage = "Usage: /progress [auto|edit|silence|off|keep|delete]";
-        const mode = this.getChatToolProgressMode(chatId);
-        const keep = this.getChatToolProgressKeep(chatId);
-        const liveEdit = this.shouldUseLiveProgressEdit(chatId, msg.channel);
-        const interval = this.config.toolProgressEditIntervalMs ?? 1500;
-
-        if (!args || isHelpFlag(args)) {
-          await this.sendReply(
-            chatId,
-            [
-              `Tool progress: mode=${mode} | live-edit=${liveEdit ? "yes" : "no — silence pulses"} | on-finish=${keep ? "keep" : "delete"}`,
-              `Edit interval: ${interval}ms`,
-              usage,
-              "auto — edit in place on editable channels, silence pulses on iMessage",
-              "edit — always edit a single live message in place",
-              "silence — periodic silence pulses only",
-              "off — no progress (stall alerts stay on)",
-              "keep / delete — keep or delete the final tool summary",
-            ].join("\n"),
-            msg.id,
-          );
-          return;
-        }
-
-        const tokens = args.toLowerCase().split(/\s+/).filter(Boolean);
-        const validModes = new Set<ToolProgressMode>(["auto", "edit", "silence", "off"]);
-        let nextMode: ToolProgressMode | undefined;
-        let nextKeep: boolean | undefined;
-        for (const token of tokens) {
-          if (validModes.has(token as ToolProgressMode)) {
-            nextMode = token as ToolProgressMode;
-          } else if (token === "keep") {
-            nextKeep = true;
-          } else if (token === "delete" || token === "clean") {
-            nextKeep = false;
-          } else {
-            await this.sendReply(chatId, `Invalid option: ${token}\n${usage}`, msg.id);
-            return;
-          }
-        }
-
-        if (nextMode) {
-          this.toolProgressModeByChatId.set(chatId, nextMode);
-        }
-        if (nextKeep !== undefined) {
-          this.toolProgressKeepByChatId.set(chatId, nextKeep);
-        }
-
-        const effectiveMode = this.getChatToolProgressMode(chatId);
-        const effectiveKeep = this.getChatToolProgressKeep(chatId);
-        await this.sendReply(
-          chatId,
-          `⚙️ Tool progress updated: mode=${effectiveMode} | on-finish=${effectiveKeep ? "keep" : "delete"}`,
-          msg.id,
-        );
-        return;
-      }
-
-      case "poll":
-      case "bg":
-      case "unsend":
-      case "card": {
-        const { adapter, rawChatId } = this.resolveNativeAdapter(chatId, msg.channel);
-        await handlePhotonNativeCommand({
-          cmd,
-          args,
-          chatId,
-          rawChatId,
-          channelName: msg.channel,
-          replyToMessageId: msg.id,
-          adapter,
-          sendReply: (to, text, replyTo) => this.sendReply(to, text, replyTo),
-        });
-        return;
-      }
-
-      case "retry": {
-        if (isHelpFlag(args)) {
-          await this.sendReply(
-            chatId,
-            "Usage: /retry — Re-run the last prompt sent in this chat.",
-            msg.id,
-          );
-          return;
-        }
-        const lastPrompt = this.lastPromptByChatId.get(chatId);
-        if (!lastPrompt) {
-          await this.sendReply(
-            chatId,
-            "No previous prompt to retry in this chat.",
-            msg.id,
-          );
-          return;
-        }
-        await this.handleUserPrompt(msg, lastPrompt, []);
-        return;
-      }
-
-      case "stop":
-      case "cancel": {
-        this.cancelledByUser.add(chatId);
-        this.stopDrainChats.add(chatId);
-        const stopped = await this.backend.cancelTurn(chatId);
-        if (!stopped) {
-          this.cancelledByUser.delete(chatId);
-          this.stopDrainChats.delete(chatId);
-        }
-        await this.sendReply(
-          chatId,
-          stopped ? "⏹️ Stopped active turn." : "No active turn is running.",
-          msg.id,
-        );
-        return;
-      }
-
-      case "new":
-      case "reset": {
-        if (isHelpFlag(args)) {
-          await this.sendReply(
-            chatId,
-            "Usage: /new [title] — Start a fresh session, optionally titled within this channel group.",
-            msg.id,
-          );
-          return;
-        }
-        this.bumpSessionGeneration(chatId);
-        this.clearChatQueue(chatId);
-        this.stopDrainChats.delete(chatId);
-        if (busy) {
-          this.cancelledByUser.add(chatId);
-          await this.backend.cancelTurn(chatId);
-        }
-        const prev = this.store.getSession(chatId);
-        await this.backend.resetSession(chatId);
-        await this.store.deleteSession(chatId);
-        const freshTitle = args.trim()
-          ? `[${this.resolveChannelGroup(chatId)}] ${args.trim()}`
-          : undefined;
-        if (freshTitle) {
-          await this.ensureSessionRecord(chatId, {
-            sessionId: "",
-            ...(prev ? {
-              cwd: prev.cwd,
-              model: prev.model,
-              effort: prev.effort,
-              mode: prev.mode,
-              approvalMode: prev.approvalMode,
-              busyMode: prev.busyMode,
-            } : {}),
-            title: freshTitle,
-          });
-        } else if (prev && prev.cwd !== this.config.defaultCwd) {
-          await this.ensureSessionRecord(chatId, {
-            sessionId: "",
-            cwd: prev.cwd,
-            model: prev.model,
-            effort: prev.effort,
-            mode: prev.mode,
-            approvalMode: prev.approvalMode,
-            busyMode: prev.busyMode,
-            title: undefined,
-          });
-        }
-        await this.sendReply(
-          chatId,
-          freshTitle ? `🆕 Started a fresh session: ${freshTitle}` : "🆕 Started a fresh session.",
-          msg.id,
-        );
-        return;
-      }
-
-      case "discard": {
-        this.bumpSessionGeneration(chatId);
-        this.clearChatQueue(chatId);
-        this.stopDrainChats.delete(chatId);
-        this.sessionListCache.delete(chatId);
-        this.fallbackBusyModes.delete(chatId);
-        this.fallbackApprovalModes.delete(chatId);
-        this.hydratedChats.delete(chatId);
-        if (busy) {
-          this.cancelledByUser.add(chatId);
-          await this.backend.cancelTurn(chatId);
-        }
-        await this.backend.resetSession(chatId);
-        await this.store.deleteSession(chatId);
-        await this.sendReply(chatId, "🗑️ Discarded session and queue.", msg.id);
-        return;
-      }
-
-      case "status": {
-        const stored = this.store.getSession(chatId);
-        const live = this.backend.getSessionInfo?.(chatId);
-        const sessionId = live?.sessionId || stored?.sessionId || "(none)";
-        const model = live?.model || stored?.model || this.config.defaultModel || "default";
-        const effort = live?.effort || stored?.effort || this.config.defaultEffort || "default";
-        const mode = live?.mode || stored?.mode || "default";
-        const cwd = live?.cwd || stored?.cwd || this.config.defaultCwd;
-        const queueLen = this.getChatQueue(chatId).length;
-        const pendingPerm = this.backend.getPendingPermission?.(chatId);
-        const snap = this.getHealthSnapshot();
-        await this.sendReply(
-          chatId,
-          [
-            `Status: ${snap.status} (uptime ${formatUptime(snap.uptimeMs)})`,
-            `Turn: ${busy ? "busy" : "idle"} | Queue: ${queueLen}`,
-            `Session: ${sessionId === "(none)" ? "(none)" : sessionId.slice(0, 12)}`,
-            stored?.title ? `Title: ${stored.title}` : undefined,
-            `Model: ${model} | Effort: ${effort} | Mode: ${mode}`,
-            `Approvals: ${this.getChatApprovalMode(chatId)} | Busy policy: ${this.getChatBusyMode(chatId)}`,
-            `CWD: ${cwd}`,
-            `Active loops: ${snap.activeLoops}${pendingPerm ? ` | Pending approval: ${pendingPerm.title}` : ""}`,
-          ]
-            .filter(Boolean)
-            .join("\n"),
-          msg.id,
-        );
-        return;
-      }
-
-      case "usage": {
-        const summary = await this.quotaFetcher();
-        this.cachedQuota = summary;
-        await this.sendReply(chatId, formatQuotaSummary(summary), msg.id);
-        return;
-      }
-
-      case "queue":
-      case "q": {
-        if (isHelpFlag(args)) {
-          await this.sendReply(
-            chatId,
-            "Usage: /queue [list|clear] or /queue <prompt> — inspect, clear, or enqueue prompts.",
-            msg.id,
-          );
-          return;
-        }
-        if (!args || args.toLowerCase() === "list") {
-          const q = this.getChatQueue(chatId);
-          if (q.length === 0) {
-            await this.sendReply(chatId, "Queue is empty.", msg.id);
-          } else {
-            const lines = q.map((item, idx) => `${idx + 1}. ${item.slice(0, 120)}`);
-            await this.sendReply(chatId, `Queued prompts (${q.length}):\n${lines.join("\n")}`, msg.id);
-          }
-          return;
-        }
-        if (args.toLowerCase() === "clear") {
-          const cleared = this.clearChatQueue(chatId);
-          await this.sendReply(chatId, `Cleared ${cleared} queued prompt(s).`, msg.id);
-          return;
-        }
-        if (busy) {
-          const pos = this.enqueueChatPrompt(chatId, args);
-          await this.sendReply(chatId, `Queued at #${pos}.`, msg.id);
-        } else {
-          await this.handleUserPrompt(msg, args, []);
-        }
-        return;
-      }
-
-      case "steer":
-      case "s": {
-        if (isHelpFlag(args)) {
-          await this.sendReply(
-            chatId,
-            "Usage: /steer <prompt> — Interrupt & redirect the active turn.",
-            msg.id,
-          );
-          return;
-        }
-        if (!args) {
-          await this.sendReply(chatId, "Usage: /steer <prompt>", msg.id);
-          return;
-        }
-        if (!busy) {
-          await this.handleUserPrompt(msg, args, []);
-          return;
-        }
-        this.clearChatQueue(chatId);
-        this.enqueueChatPrompt(chatId, args);
-        this.cancelledByUser.add(chatId);
-        await this.backend.cancelTurn(chatId);
-        await this.sendReply(chatId, "↪️ Redirecting active turn...", msg.id);
-        return;
-      }
-
-      case "busy": {
-        if (isHelpFlag(args)) {
-          await this.sendReply(
-            chatId,
-            "Usage: /busy [queue|interrupt|steer] — Set the busy-turn policy.",
-            msg.id,
-          );
-          return;
-        }
-        if (!args) {
-          await this.sendReply(
-            chatId,
-            `Current busy mode: ${this.getChatBusyMode(chatId)} (options: queue, interrupt, steer)`,
-            msg.id,
-          );
-          return;
-        }
-        const next = args.toLowerCase();
-        if (next !== "queue" && next !== "interrupt" && next !== "steer") {
-          await this.sendReply(
-            chatId,
-            "Invalid busy mode. Use: /busy [queue|interrupt|steer]",
-            msg.id,
-          );
-          return;
-        }
-        await this.setChatBusyMode(chatId, next);
-        await this.sendReply(chatId, `Busy mode set to: ${next}`, msg.id);
-        return;
-      }
-
-      case "approve": {
-        const arg = (args || "once").toLowerCase();
-        if (arg !== "once" && arg !== "session" && arg !== "always") {
-          await this.sendReply(
-            chatId,
-            "Usage: /approve [once|session|always]",
-            msg.id,
-          );
-          return;
-        }
-        const resolved = this.backend.resolvePermission?.(chatId, arg) ?? false;
-        await this.sendReply(
-          chatId,
-          resolved ? `✅ Approved (${arg}).` : "No pending permission request.",
-          msg.id,
-        );
-        return;
-      }
-
-      case "deny": {
-        const resolved = this.backend.resolvePermission?.(chatId, "deny") ?? false;
-        await this.sendReply(
-          chatId,
-          resolved
-            ? `❌ Denied${args ? `: ${args}` : "."}`
-            : "No pending permission request.",
-          msg.id,
-        );
-        return;
-      }
-
-      case "yolo": {
-        const current = this.getChatApprovalMode(chatId);
-        const next: ApprovalMode = current === "auto" ? "interactive" : "auto";
-        await this.setChatApprovalMode(chatId, next);
-        await this.sendReply(
-          chatId,
-          next === "auto"
-            ? "⚡ Approval mode set to auto (YOLO enabled for this chat)."
-            : "🛡️ Approval mode restored to interactive.",
-          msg.id,
-        );
-        return;
-      }
-
-      case "model": {
-        const liveInfo = this.backend.getSessionInfo?.(chatId);
-        const current =
-          liveInfo?.model ??
-          this.store.getSession(chatId)?.model ??
-          this.config.defaultModel ??
-          "(server default)";
-        const currentEffort =
-          liveInfo?.effort ??
-          this.store.getSession(chatId)?.effort ??
-          this.config.defaultEffort ??
-          "default";
-
-        if (!args || isHelpFlag(args) || isListFlag(args)) {
-          let catalog: ModelCatalogEntry[];
-          const live = await this.backend.getModelCatalog?.();
-          if (live && live.length > 0) {
-            catalog = live;
-          } else {
-            catalog = (this.backend.getAvailableModels?.() ?? []).map((id) => ({
-              id,
-              name: id,
-            }));
-          }
-
-          const currentEntry = catalog.find((m) => m.id === current);
-          const currentLabel =
-            currentEntry && currentEntry.name !== currentEntry.id
-              ? `${currentEntry.name} (${current})`
-              : current;
-
-          const lines: string[] = [
-            `🧠 Current model: ${currentLabel} | effort: ${currentEffort}`,
-          ];
-          if (catalog.length > 0) {
-            lines.push("", `Available models (${catalog.length}):`);
-            catalog.forEach((m, idx) => {
-              lines.push(
-                `${idx + 1}. ${m.name}${m.name !== m.id ? ` (${m.id})` : ""}`,
-              );
-            });
-          }
-          lines.push(
-            "",
-            "Switch by number: /model 4",
-            "Switch by keyword + effort: /model hydrogen xhigh",
-            "Switch by full ID: /model gemini-4-neon-high",
-            "Change effort only: /effort [low|medium|high|xhigh]",
-          );
-          await this.sendReply(chatId, lines.join("\n"), msg.id);
-          return;
-        }
-
-        try {
-          if (this.backend.setModel) {
-            const updated = await this.backend.setModel(chatId, args);
-            await this.ensureSessionRecord(chatId, {
-              model: updated.model,
-              ...(updated.effort ? { effort: updated.effort } : {}),
-            });
-            const hasLabel =
-              Boolean(updated.label) && updated.label !== updated.model;
-            const modelLine = hasLabel
-              ? `Model set to: ${updated.label} (${updated.model})`
-              : `Model set to: ${updated.model}`;
-            const effortSuffix = updated.effort
-              ? hasLabel
-                ? ` | effort: ${updated.effort}`
-                : ` (effort: ${updated.effort})`
-              : "";
-            await this.sendReply(chatId, `${modelLine}${effortSuffix}`, msg.id);
-          } else if (this.backend.setConfigOption) {
-            await this.backend.setConfigOption(chatId, "model", args);
-            await this.ensureSessionRecord(chatId, { model: args });
-            await this.sendReply(chatId, `Model set to: ${args}`, msg.id);
-          } else {
-            await this.ensureSessionRecord(chatId, { model: args });
-            await this.sendReply(chatId, `Model set to: ${args}`, msg.id);
-          }
-        } catch (err) {
-          const reason = err instanceof Error ? err.message : String(err);
-          await this.sendReply(
-            chatId,
-            `⚠️ Couldn't switch model: ${reason}\nSend /model to see the numbered list.`,
-            msg.id,
-          );
-        }
-        return;
-      }
-
-      case "effort": {
-        const current =
-          this.backend.getSessionInfo?.(chatId)?.effort ??
-          this.store.getSession(chatId)?.effort ??
-          this.config.defaultEffort ??
-          "(default)";
-        if (isHelpFlag(args)) {
-          await this.sendReply(
-            chatId,
-            `Usage: /effort [low|medium|high|xhigh] — Set reasoning effort. Current: ${current}`,
-            msg.id,
-          );
-          return;
-        }
-        if (!args) {
-          const available = this.backend.getAvailableEfforts?.() ?? [
-            "low",
-            "medium",
-            "high",
-            "xhigh",
-          ];
-          await this.sendReply(
-            chatId,
-            `Current effort: ${current}\nAvailable: ${available.join(", ")}`,
-            msg.id,
-          );
-          return;
-        }
-        const level = args.toLowerCase();
-        if (!["low", "medium", "high", "xhigh"].includes(level)) {
-          await this.sendReply(
-            chatId,
-            "Invalid effort. Use: /effort [low|medium|high|xhigh]",
-            msg.id,
-          );
-          return;
-        }
-        if (this.backend.setEffort) {
-          await this.backend.setEffort(chatId, level);
-        } else if (this.backend.setConfigOption) {
-          await this.backend.setConfigOption(chatId, "thought_level", level);
-        }
-        await this.ensureSessionRecord(chatId, { effort: level });
-        await this.sendReply(chatId, `Effort set to: ${level}`, msg.id);
-        return;
-      }
-
-      case "mode": {
-        const current =
-          this.backend.getSessionInfo?.(chatId)?.mode ??
-          this.store.getSession(chatId)?.mode ??
-          "default";
-        if (isHelpFlag(args)) {
-          await this.sendReply(
-            chatId,
-            `Usage: /mode [default|accept-edits|auto|plan] — Set ACP mode. Current: ${current}`,
-            msg.id,
-          );
-          return;
-        }
-        if (!args) {
-          const available = this.backend.getAvailableModes?.() ?? [
-            "default",
-            "accept-edits",
-            "auto",
-            "plan",
-          ];
-          await this.sendReply(
-            chatId,
-            `Current mode: ${current}\nAvailable: ${available.join(", ")}`,
-            msg.id,
-          );
-          return;
-        }
-        const nextMode = args.toLowerCase();
-        if (!["default", "accept-edits", "auto", "plan"].includes(nextMode)) {
-          await this.sendReply(
-            chatId,
-            "Invalid mode. Use: /mode [default|accept-edits|auto|plan]",
-            msg.id,
-          );
-          return;
-        }
-        if (this.backend.setMode) {
-          await this.backend.setMode(chatId, nextMode);
-        } else if (this.backend.setConfigOption) {
-          await this.backend.setConfigOption(chatId, "mode", nextMode);
-        }
-        await this.ensureSessionRecord(chatId, { mode: nextMode });
-        await this.sendReply(chatId, `Mode set to: ${nextMode}`, msg.id);
-        return;
-      }
-
-      case "approvals": {
-        if (isHelpFlag(args)) {
-          await this.sendReply(
-            chatId,
-            "Usage: /approvals [auto|interactive|sandbox] — Set permission mode.",
-            msg.id,
-          );
-          return;
-        }
-        if (!args) {
-          await this.sendReply(
-            chatId,
-            `Current approval mode: ${this.getChatApprovalMode(chatId)} (options: auto, interactive, sandbox)`,
-            msg.id,
-          );
-          return;
-        }
-        const next = args.toLowerCase();
-        if (next !== "auto" && next !== "interactive" && next !== "sandbox") {
-          await this.sendReply(
-            chatId,
-            "Invalid approval mode. Use: /approvals [auto|interactive|sandbox]",
-            msg.id,
-          );
-          return;
-        }
-        await this.setChatApprovalMode(chatId, next);
-        await this.sendReply(chatId, `Approval mode set to: ${next}`, msg.id);
-        return;
-      }
-
-      case "groups": {
-        if (isHelpFlag(args)) {
-          await this.sendReply(
-            chatId,
-            "Usage: /groups — Summarize every IM channel session group and its session count.",
-            msg.id,
-          );
-          return;
-        }
-        const currentGroup = this.resolveChannelGroup(chatId).toLowerCase();
-        const groups = new Set<string>();
-        for (const record of this.store.getBoundChannels()) {
-          groups.add((record.groupName || record.channel).toLowerCase());
-        }
-        for (const session of this.store.listSessions()) {
-          groups.add(
-            (session.channelGroup ?? this.resolveChannelGroup(session.chatId)).toLowerCase(),
-          );
-        }
-        groups.add(currentGroup);
-
-        const lines = [...groups].sort().map((group) => {
-          const count = this.store.listSessionsByChannel(group).length;
-          const cwd = this.config.channelDefaultCwds?.[group as ChannelName];
-          const cwdHint = cwd ? ` | cwd: ${cwd}` : "";
-          const marker = group === currentGroup ? " (this channel)" : "";
-          return `📂 ${group}${marker} — ${count} session(s)${cwdHint}`;
-        });
-        await this.sendReply(chatId, ["Session groups:", ...lines].join("\n"), msg.id);
-        return;
-      }
-
-      case "sessions": {
-        if (isHelpFlag(args)) {
-          await this.sendReply(
-            chatId,
-            "Usage: /sessions [channel|all] — List saved sessions (defaults to this channel's group; 'all' lists every group).",
-            msg.id,
-          );
-          return;
-        }
-        const currentGroup = this.resolveChannelGroup(chatId).toLowerCase();
-        const cwd = this.resolveDefaultCwd(chatId);
-        const list = await this.backend.listSessions(cwd);
-        const sliced = list.slice(0, 10);
-        this.cacheSessionList(chatId, sliced);
-
-        const argLower = args.trim().toLowerCase();
-        const knownGroups = new Set<string>();
-        for (const record of this.store.getBoundChannels()) {
-          knownGroups.add((record.groupName || record.channel).toLowerCase());
-        }
-        for (const session of this.store.listSessions()) {
-          knownGroups.add(
-            (session.channelGroup ?? this.resolveChannelGroup(session.chatId)).toLowerCase(),
-          );
-        }
-
-        const lines: string[] = [];
-        const appendStored = (sessions: SessionInfo[]) => {
-          for (const session of sessions) {
-            const title = session.title ? ` — ${session.title}` : "";
-            lines.push(`  • ${session.chatId}${title}`);
-          }
-        };
-        const appendAcp = () => {
-          if (sliced.length === 0) {
-            return;
-          }
-          if (lines.length > 0) {
-            lines.push("");
-          }
-          lines.push("ACP sessions (use /resume <index|id>):");
-          sliced.forEach((s, idx) => {
-            const shortId = s.sessionId.slice(0, 10);
-            const label = s.title ? ` — ${s.title}` : "";
-            lines.push(`${idx + 1}. ${shortId}${label}`);
-          });
-        };
-
-        if (!argLower) {
-          const stored = this.store.listSessionsByChannel(currentGroup);
-          if (stored.length === 0) {
-            lines.push(`📂 ${currentGroup}: no sessions yet.`);
-          } else {
-            lines.push(`📂 ${currentGroup}`);
-            appendStored(stored);
-          }
-          appendAcp();
-          lines.push(
-            "",
-            "Use /sessions all to list all channel groups, or /groups for summary.",
-          );
-        } else if (argLower === "all") {
-          const stored = this.store.listSessions();
-          if (stored.length === 0) {
-            lines.push("No gateway sessions yet.");
-          } else {
-            const grouped = new Map<string, SessionInfo[]>();
-            for (const session of stored) {
-              const group = (
-                session.channelGroup ?? this.resolveChannelGroup(session.chatId)
-              ).toLowerCase();
-              const bucket = grouped.get(group);
-              if (bucket) {
-                bucket.push(session);
-              } else {
-                grouped.set(group, [session]);
-              }
-            }
-            for (const [group, sessions] of grouped) {
-              lines.push(`📂 ${group}`);
-              appendStored(sessions);
-            }
-          }
-          appendAcp();
-        } else {
-          const target = argLower;
-          const isKnown =
-            (CHANNEL_NAMES as readonly string[]).includes(target) ||
-            knownGroups.has(target);
-          if (!isKnown) {
-            await this.sendReply(
-              chatId,
-              `Unknown channel group: ${args}. Send /groups to see available groups.`,
-              msg.id,
-            );
-            return;
-          }
-          const stored = this.store.listSessionsByChannel(target);
-          lines.push(`📂 ${target}`);
-          if (stored.length === 0) {
-            lines.push("  (no sessions)");
-          } else {
-            appendStored(stored);
-          }
-          if (target === currentGroup) {
-            appendAcp();
-          }
-        }
-
-        await this.sendReply(chatId, lines.join("\n"), msg.id);
-        return;
-      }
-
-      case "resume": {
-        if (isHelpFlag(args)) {
-          await this.sendReply(
-            chatId,
-            "Usage: /resume <id|index> — Resume a saved session (send /sessions to list).",
-            msg.id,
-          );
-          return;
-        }
-        if (!args) {
-          await this.sendReply(chatId, "Usage: /resume <id|index>", msg.id);
-          return;
-        }
-        const cwd = this.resolveDefaultCwd(chatId);
-        let targetId = args;
-        let targetCwd = cwd;
-        let targetTitle: string | undefined;
-
-        if (/^\d+$/.test(args)) {
-          let cached = this.sessionListCache.get(chatId);
-          if (!cached) {
-            cached = (await this.backend.listSessions(cwd)).slice(0, 10);
-            this.cacheSessionList(chatId, cached);
-          }
-          const idx = Number.parseInt(args, 10) - 1;
-          const picked = cached[idx];
-          if (!picked) {
-            await this.sendReply(chatId, `Session index ${args} not found.`, msg.id);
-            return;
-          }
-          targetId = picked.sessionId;
-          targetCwd = picked.cwd || cwd;
-          targetTitle = picked.title;
-        }
-
-        if (this.backend.attachSession) {
-          await this.backend.attachSession(chatId, targetId, targetCwd);
-        }
-        await this.ensureSessionRecord(chatId, {
-          sessionId: targetId,
-          cwd: targetCwd,
-          ...(targetTitle ? { title: targetTitle } : {}),
-        });
-        await this.sendReply(
-          chatId,
-          `Resumed session ${targetId.slice(0, 12)}.`,
-          msg.id,
-        );
-        return;
-      }
-
-      case "title": {
-        if (isHelpFlag(args)) {
-          await this.sendReply(
-            chatId,
-            "Usage: /title [name] — View or rename this session.",
-            msg.id,
-          );
-          return;
-        }
-        const stored = this.store.getSession(chatId);
-        if (!args) {
-          await this.sendReply(
-            chatId,
-            stored?.title ? `Session title: ${stored.title}` : "No session title set.",
-            msg.id,
-          );
-          return;
-        }
-        await this.ensureSessionRecord(chatId, { title: args });
-        await this.sendReply(chatId, `Session title updated: ${args}`, msg.id);
-        return;
-      }
-
-      case "compact":
-      case "compress": {
-        const stored = this.store.getSession(chatId);
-        if (!stored?.sessionId) {
-          await this.sendReply(chatId, "No active session to compact.", msg.id);
-          return;
-        }
-        await this.handleUserPrompt(
-          msg,
-          "Concisely summarize our conversation, key decisions, and open tasks so far so context remains compact.",
-          [],
-        );
-        return;
-      }
-
-      case "cwd": {
-        if (isHelpFlag(args)) {
-          await this.sendReply(
-            chatId,
-            "Usage: /cwd [path] — View or change the working directory.",
-            msg.id,
-          );
-          return;
-        }
-        const currentCwd = this.resolveDefaultCwd(chatId);
-        if (!args) {
-          await this.sendReply(chatId, `Current working directory: ${currentCwd}`, msg.id);
-          return;
-        }
-        const resolved = path.resolve(currentCwd, args);
-        try {
-          const stat = fs.statSync(resolved);
-          if (!stat.isDirectory()) {
-            await this.sendReply(chatId, `Not a directory: ${resolved}`, msg.id);
-            return;
-          }
-        } catch {
-          await this.sendReply(chatId, `Directory does not exist: ${resolved}`, msg.id);
-          return;
-        }
-        this.bumpSessionGeneration(chatId);
-        await this.ensureSessionRecord(chatId, { cwd: resolved, sessionId: "" });
-        await this.backend.resetSession(chatId);
-        await this.sendReply(
-          chatId,
-          `Working directory set to: ${resolved} (new session will start here).`,
-          msg.id,
-        );
-        return;
-      }
-
-      case "loop": {
-        await this.handleLoopCommand(msg, args);
-        return;
-      }
-
-      case "remind": {
-        if (isHelpFlag(args)) {
-          await this.sendReply(
-            chatId,
-            "Usage: /remind <duration> <text> — One-way reminder push (e.g. /remind 15m stand up).",
-            msg.id,
-          );
-          return;
-        }
-        const m = /^(\S+)\s+([\s\S]+)$/.exec(args);
-        if (!m) {
-          await this.sendReply(chatId, "Usage: /remind <duration> <text>", msg.id);
-          return;
-        }
-        const durationMs = parseDurationMs(m[1]);
-        const text = m[2].trim();
-        if (!durationMs || !text) {
-          await this.sendReply(
-            chatId,
-            "Invalid duration. Examples: 30s, 15m, 2h, 1d.",
-            msg.id,
-          );
-          return;
-        }
-        const job = await this.scheduler.addReminder(chatId, durationMs, text);
-        await this.sendReply(
-          chatId,
-          `⏰ Reminder [${job.id}] scheduled in ${formatDurationMs(durationMs)}.`,
-          msg.id,
-        );
-        return;
-      }
-
-      default:
-        await this.sendReply(
-          chatId,
-          `Unknown command: /${cmd}. Send /help for available commands.`,
-          msg.id,
-        );
-    }
-  }
-
-  private async handleLoopCommand(
-    msg: InboundMessage,
-    args: string,
-  ): Promise<void> {
-    const { chatId } = msg;
-    if (isHelpFlag(args)) {
-      await this.sendReply(
-        chatId,
-        "Usage: /loop [list|add <dur> <prompt>|rm <id>|pause <id>|resume <id>]",
-        msg.id,
-      );
+    if (await handleSystemCommand(ctx, cmd)) {
       return;
     }
-    if (!args || args.toLowerCase() === "list") {
-      const jobs = this.scheduler.listJobs(chatId);
-      if (jobs.length === 0) {
-        await this.sendReply(chatId, "No scheduled loops for this chat.", msg.id);
-        return;
-      }
-      const lines = jobs.map((job) => {
-        const sched = job.intervalMs
-          ? `every ${formatDurationMs(job.intervalMs)}`
-          : job.cron
-            ? `cron ${job.cron}`
-            : "scheduled";
-        const state = job.enabled ? "active" : "paused";
-        const kindTag = job.kind === "remind" ? "[remind]" : "[loop]";
-        return `• ${job.id} ${kindTag} (${state}, ${sched}): ${job.prompt.slice(0, 80)}`;
+    if (await handleSessionCommand(ctx, cmd)) {
+      return;
+    }
+    if (await handleLoopCommand(ctx, cmd)) {
+      return;
+    }
+
+    if (cmd === "poll" || cmd === "bg" || cmd === "unsend" || cmd === "card") {
+      const { adapter, rawChatId } = ctx.resolveNativeAdapter();
+      await handlePhotonNativeCommand({
+        cmd,
+        args,
+        chatId: msg.chatId,
+        rawChatId,
+        channelName: msg.channel,
+        replyToMessageId: msg.id,
+        adapter,
+        sendReply: (to, text, replyTo) => this.sendReply(to, text, replyTo),
       });
-      await this.sendReply(chatId, `Loops:\n${lines.join("\n")}`, msg.id);
-      return;
-    }
-
-    const parts = args.split(/\s+/);
-    const sub = parts[0].toLowerCase();
-
-    if (sub === "add" || sub === "every") {
-      const m = /^(?:add|every)\s+(\S+)\s+([\s\S]+)$/i.exec(args);
-      if (!m) {
-        await this.sendReply(
-          chatId,
-          "Usage: /loop add <duration> <prompt>",
-          msg.id,
-        );
-        return;
-      }
-      const intervalMs = parseDurationMs(m[1]);
-      const prompt = m[2].trim();
-      if (!intervalMs || !prompt) {
-        await this.sendReply(
-          chatId,
-          "Invalid duration or empty prompt. Examples: 30m, 2h, 1d.",
-          msg.id,
-        );
-        return;
-      }
-      const cwd = this.resolveDefaultCwd(chatId);
-      const job = await this.scheduler.addLoop({
-        chatId,
-        prompt,
-        intervalMs,
-        cwd,
-      });
-      await this.sendReply(
-        chatId,
-        `🔁 Loop [${job.id}] added: every ${formatDurationMs(intervalMs)}.`,
-        msg.id,
-      );
-      return;
-    }
-
-    if (sub === "rm" || sub === "del" || sub === "delete" || sub === "remove") {
-      const id = parts[1];
-      if (!id) {
-        await this.sendReply(chatId, "Usage: /loop rm <id>", msg.id);
-        return;
-      }
-      const owned = this.scheduler.listJobs(chatId).some((j) => j.id === id);
-      const removed = owned ? await this.scheduler.removeLoop(id) : false;
-      await this.sendReply(
-        chatId,
-        removed ? `Removed loop [${id}].` : `Loop [${id}] not found.`,
-        msg.id,
-      );
-      return;
-    }
-
-    if (sub === "pause" || sub === "resume") {
-      const id = parts[1];
-      if (!id) {
-        await this.sendReply(chatId, `Usage: /loop ${sub} <id>`, msg.id);
-        return;
-      }
-      const enabled = sub === "resume";
-      const owned = this.scheduler.listJobs(chatId).some((j) => j.id === id);
-      const updated = owned ? await this.scheduler.toggleLoop(id, enabled) : null;
-      await this.sendReply(
-        chatId,
-        updated
-          ? `${enabled ? "Resumed" : "Paused"} loop [${id}].`
-          : `Loop [${id}] not found.`,
-        msg.id,
-      );
       return;
     }
 
     await this.sendReply(
-      chatId,
-      "Usage: /loop [list|add <dur> <prompt>|rm <id>|pause <id>|resume <id>]",
+      msg.chatId,
+      `Unknown command: /${cmd}. Send /help for available commands.`,
       msg.id,
     );
   }
 
+  private createCommandContext(
+    msg: InboundMessage,
+    senderId: string,
+    cmd: string,
+    args: string,
+    busy: boolean,
+  ): RouterCommandContext {
+    const chatId = msg.chatId;
+    const channel = msg.channel || this.channel.name;
+    const rawSender = msg.senderId || msg.rawSenderId || "";
+
+    return {
+      config: this.config,
+      store: this.store,
+      backend: this.backend,
+      scheduler: this.scheduler,
+      msg,
+      chatId,
+      senderId,
+      cmd,
+      args,
+      busy,
+      version: this.version,
+      startedAt: this.startedAt,
+      sendReply: (to, text, replyTo) => this.sendReply(to, text, replyTo),
+      handleUserPrompt: (m, text, attachments) =>
+        this.handleUserPrompt(m, text, attachments),
+      isChannelConnected: () => this.channel.isConnected(),
+      getChannelStatuses: () => this.getChannelStatuses(),
+      resolveAuthSource: () =>
+        this.resolveAuthSource(channel, rawSender, senderId),
+      resolveNativeAdapter: () => this.resolveNativeAdapter(chatId, channel),
+      isAdminSender: () => this.isAdminSender(channel, rawSender, senderId),
+      getVerbosity: () => this.getChatVerbosity(chatId),
+      setVerbosity: (level) => this.verbosityByChatId.set(chatId, level),
+      getToolProgressMode: () => this.getChatToolProgressMode(chatId),
+      setToolProgressMode: (mode) =>
+        this.toolProgressModeByChatId.set(chatId, mode),
+      getToolProgressKeep: () => this.getChatToolProgressKeep(chatId),
+      setToolProgressKeep: (keep) =>
+        this.toolProgressKeepByChatId.set(chatId, keep),
+      shouldUseLiveProgressEdit: () =>
+        this.shouldUseLiveProgressEdit(chatId, channel),
+      getApprovalMode: () => this.getChatApprovalMode(chatId),
+      setApprovalMode: (mode) => this.setChatApprovalMode(chatId, mode),
+      getBusyMode: () => this.getChatBusyMode(chatId),
+      setBusyMode: (mode) => this.setChatBusyMode(chatId, mode),
+      getQueue: () => this.getChatQueue(chatId),
+      enqueuePrompt: (prompt) => this.enqueueChatPrompt(chatId, prompt),
+      clearQueue: () => this.clearChatQueue(chatId),
+      getPendingPermission: () => this.backend.getPendingPermission?.(chatId),
+      getHealthSnapshot: () => this.getHealthSnapshot(),
+      getLastPrompt: () => this.lastPromptByChatId.get(chatId),
+      resolveChannelGroup: () => this.resolveChannelGroup(chatId),
+      resolveChannelGroupFor: (id) => this.resolveChannelGroup(id),
+      resolveDefaultCwd: () => this.resolveDefaultCwd(chatId),
+      ensureSessionRecord: (patch) => this.ensureSessionRecord(chatId, patch),
+      bumpSessionGeneration: () => this.bumpSessionGeneration(chatId),
+      forgetChatState: () => {
+        this.sessionListCache.delete(chatId);
+        this.fallbackBusyModes.delete(chatId);
+        this.fallbackApprovalModes.delete(chatId);
+        this.hydratedChats.delete(chatId);
+      },
+      markCancelled: () => {
+        this.cancelledByUser.add(chatId);
+      },
+      unmarkCancelled: () => {
+        this.cancelledByUser.delete(chatId);
+      },
+      markStopDrain: () => {
+        this.stopDrainChats.add(chatId);
+      },
+      unmarkStopDrain: () => {
+        this.stopDrainChats.delete(chatId);
+      },
+      getCachedSessionList: () => this.sessionListCache.get(chatId),
+      cacheSessionList: (list) => this.cacheSessionList(chatId, list),
+      fetchQuota: async () => {
+        const summary = await this.quotaFetcher();
+        this.cachedQuota = summary;
+        return summary;
+      },
+    };
+  }
   private async handleUserPrompt(
     msg: InboundMessage,
     text: string,
@@ -2274,6 +1253,13 @@ export class GatewayRouter {
         progressTimer.unref?.();
       }
 
+      const requesterSenderId = options.isLoop
+        ? undefined
+        : senderKeyFor(
+            msg.channel || this.channel.name,
+            msg.senderId || msg.rawSenderId || "",
+          ) || undefined;
+
       const result = await this.backend.sendTurn({
         chatId,
         sessionId: stored?.sessionId || undefined,
@@ -2283,6 +1269,7 @@ export class GatewayRouter {
         model,
         effort,
         approvalMode,
+        requesterSenderId,
         callbacks: liveProgress
           ? { onToolCall: (event) => liveProgress.onToolCall(event) }
           : undefined,

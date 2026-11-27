@@ -1,7 +1,8 @@
 # Antigravity Gateway — loopback-only Docker Compose deployment.
 #
 #   1. cp .env.example .env     # fill in at least one channel
-#   2. docker compose up -d --build
+#   2. docker compose pull && docker compose up -d       # published GHCR image
+#      or: docker compose up -d --build                  # build from local source
 #   3. curl http://127.0.0.1:18790/healthz
 #
 # `agy` is not bundled in the image: mount an existing `agy` binary and its
@@ -16,7 +17,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: antigravity-gateway:latest
+    image: ghcr.io/relogys/antigravity-gateway:latest
     container_name: antigravity-gateway
     restart: unless-stopped
 

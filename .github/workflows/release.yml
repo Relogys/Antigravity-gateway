@@ -1,0 +1,281 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing stable tag to release (vX.Y.Z). Defaults to the current ref or package.json version.'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify-and-pack:
+    name: Verify & pack
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 12
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Resolve release tag and verify version match
+        id: meta
+        shell: bash
+        env:
+          RELEASE_TAG_INPUT: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="${RELEASE_TAG_INPUT:-}"
+          if [ -z "$tag" ] && [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            tag="$GITHUB_REF_NAME"
+          fi
+          if [ -z "$tag" ]; then
+            tag="v$(node -p "require('./package.json').version")"
+          fi
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Tag '$tag' is not a stable vX.Y.Z semver tag"
+            exit 1
+          fi
+          version="${tag#v}"
+          pkg_version="$(node -p "require('./package.json').version")"
+          if [ "$version" != "$pkg_version" ]; then
+            echo "::error::Tag $tag does not match package.json version $pkg_version"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Releasing $tag (package.json $pkg_version)"
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Build
+        run: pnpm build
+
+      - name: Test
+        run: pnpm test
+
+      - name: Audit for leaked secrets
+        run: pnpm audit:secrets
+
+      - name: Pack npm tarball
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf release-assets
+          mkdir -p release-assets
+          pnpm pack --pack-destination release-assets
+          expected="release-assets/antigravity-gateway-${VERSION}.tgz"
+          if [ ! -f "$expected" ]; then
+            echo "::error::Expected tarball $expected was not produced"
+            ls -l release-assets
+            exit 1
+          fi
+
+      - name: Verify tarball contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          tgz="$(ls release-assets/*.tgz)"
+          echo "Inspecting $tgz"
+          tar -tzf "$tgz"
+          if tar -tzf "$tgz" | grep -Eq '(^|/)\.env(\.(local|development|production|staging|test))?$'; then
+            echo "::error::Tarball contains a .env file"
+            exit 1
+          fi
+          if tar -tzf "$tgz" | grep -Eq '(^|/)(id_rsa|id_ed25519|\.npmrc|\.netrc)$|\.(pem|key|p12|pfx)$'; then
+            echo "::error::Tarball contains a key or credential file"
+            exit 1
+          fi
+
+      - name: Generate SHA256SUMS.txt
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+          for file in *.tgz; do
+            sha256sum "$file"
+          done > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: release-assets/
+          retention-days: 14
+          if-no-files-found: error
+
+  docker-publish:
+    name: Publish container image
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: verify-and-pack
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify-and-pack.outputs.tag }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: docker-meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/antigravity-gateway
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.verify-and-pack.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.verify-and-pack.outputs.tag }}
+            type=raw,value=latest,enable=${{ !contains(needs.verify-and-pack.outputs.tag, '-') }}
+
+      - name: Build and push multi-arch image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.docker-meta.outputs.tags }}
+          labels: ${{ steps.docker-meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  github-release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [verify-and-pack, docker-publish]
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify-and-pack.outputs.tag }}
+
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: release-assets
+
+      - name: Extract CHANGELOG section
+        id: notes
+        shell: bash
+        env:
+          VERSION: ${{ needs.verify-and-pack.outputs.version }}
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require("node:fs");
+
+          const version = process.env.VERSION;
+          const lines = fs.existsSync("CHANGELOG.md")
+            ? fs.readFileSync("CHANGELOG.md", "utf8").split(/\r?\n/)
+            : [];
+          const escaped = version.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+          const heading = new RegExp(`^##\\s+\\[?v?${escaped}\\]?(?:\\s|$)`);
+
+          let start = -1;
+          for (let i = 0; i < lines.length; i += 1) {
+            if (heading.test(lines[i].trim())) {
+              start = i;
+              break;
+            }
+          }
+
+          let body = "";
+          if (start !== -1) {
+            for (let i = start + 1; i < lines.length; i += 1) {
+              if (/^##\s+/.test(lines[i])) break;
+              body += `${lines[i]}\n`;
+            }
+          }
+          body = body.trim();
+
+          fs.appendFileSync(
+            process.env.GITHUB_OUTPUT,
+            `has_changelog=${body ? "true" : "false"}\n`,
+          );
+          if (body) {
+            fs.writeFileSync("release-notes.md", `${body}\n`);
+            console.log(`Found CHANGELOG section for ${version}`);
+          } else {
+            console.log(`No CHANGELOG section for ${version}; using generated notes`);
+          }
+          NODE
+
+      - name: Create or update GitHub Release (changelog)
+        if: steps.notes.outputs.has_changelog == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.verify-and-pack.outputs.tag }}
+          name: ${{ needs.verify-and-pack.outputs.tag }}
+          body_path: release-notes.md
+          files: |
+            release-assets/*.tgz
+            release-assets/SHA256SUMS.txt
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: false
+
+      - name: Create or update GitHub Release (generated notes)
+        if: steps.notes.outputs.has_changelog != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.verify-and-pack.outputs.tag }}
+          name: ${{ needs.verify-and-pack.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            release-assets/*.tgz
+            release-assets/SHA256SUMS.txt
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: false

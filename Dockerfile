@@ -57,7 +57,11 @@ ENV HEALTH_ENABLED=true \
 # Drop privileges: the gateway and logger run as the unprivileged `node` user.
 USER node
 
-# Healthy only when the gateway reports status "ok" (HTTP 200).
+# Liveness probe on /healthz: returns 200 while at least one channel is live
+# (status "ok", or "degraded" with a connected channel), so a single flapping
+# channel in a multi-channel deployment cannot crash-loop the whole gateway.
+# Total outage or startup returns 503. Use /readyz for strict readiness that
+# requires every channel to be fully up before routing traffic.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:18790/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
