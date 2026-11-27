@@ -64,7 +64,9 @@ jobs:
   verify:
     name: Node ${{ matrix.node }}
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    # No job-level `if` here: a skipped matrix job reports as the unexpanded
+    # "Node ${{ matrix.node }}", so the required "Node 24" check would never
+    # report. The job runs for a few seconds and skips its steps instead.
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -72,33 +74,45 @@ jobs:
       matrix:
         node: [22, 24]
     steps:
+      - name: Docs-only change, nothing to verify
+        if: needs.changes.outputs.code != 'true'
+        run: echo "Docs-only change; skipping build and tests."
+
       - name: Checkout
+        if: needs.changes.outputs.code == 'true'
         uses: actions/checkout@v7
 
       - name: Set up pnpm
+        if: needs.changes.outputs.code == 'true'
         uses: pnpm/action-setup@v6
         with:
           version: 12
 
       - name: Set up Node.js
+        if: needs.changes.outputs.code == 'true'
         uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}
           cache: pnpm
 
       - name: Install dependencies
+        if: needs.changes.outputs.code == 'true'
         run: pnpm install --frozen-lockfile
 
       - name: Typecheck
+        if: needs.changes.outputs.code == 'true'
         run: pnpm typecheck
 
       - name: Build
+        if: needs.changes.outputs.code == 'true'
         run: pnpm build
 
       - name: Test
+        if: needs.changes.outputs.code == 'true'
         run: pnpm test
 
       - name: Audit for leaked secrets
+        if: needs.changes.outputs.code == 'true'
         run: pnpm audit:secrets
 
   verify-windows:
