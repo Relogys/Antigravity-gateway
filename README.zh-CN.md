@@ -218,18 +218,21 @@ pnpm build && pnpm cli doctor && pnpm cli start
 开发时需要热重载，请用 `pnpm dev`。
 </details>
 
-### 从 Release 安装（校验和验证安装脚本）
+### 从 Release 安装（固定到版本标签的安装脚本）
 
-安装脚本会从 GitHub Releases 下载发布包和 `SHA256SUMS.txt`，校验 SHA-256 后再执行 `npm install -g`。
+安装脚本会从 GitHub Releases 下载发布包和 `SHA256SUMS.txt`，校验发布包的 SHA-256 后再执行 `npm install -g`。这个校验只覆盖发布包，不覆盖安装脚本本身。因此请从版本标签（不要用 `main`）下载安装脚本，先阅读内容再运行。
 
 ```bash
-# macOS / Linux
-curl -fsSL https://raw.githubusercontent.com/Relogys/Antigravity-gateway/main/scripts/install.sh | bash
-curl -fsSL https://raw.githubusercontent.com/Relogys/Antigravity-gateway/main/scripts/install.sh | bash -s -- --version v0.4.2
+# macOS / Linux：从版本标签下载，检查后再运行
+curl -fsSLO https://raw.githubusercontent.com/Relogys/Antigravity-gateway/v0.4.2/scripts/install.sh
+less install.sh
+bash install.sh --version v0.4.2
 ```
 
 ```powershell
-# Windows: download scripts/install.ps1, then
+# Windows（PowerShell）：从版本标签下载，检查后再运行
+Invoke-WebRequest https://raw.githubusercontent.com/Relogys/Antigravity-gateway/v0.4.2/scripts/install.ps1 -OutFile install.ps1
+notepad .\install.ps1
 powershell -ExecutionPolicy Bypass -File .\install.ps1 -Version v0.4.2
 ```
 

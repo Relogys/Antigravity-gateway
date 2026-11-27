@@ -217,18 +217,21 @@ pnpm build && pnpm cli doctor && pnpm cli start
 For hot reload during development, use `pnpm dev`.
 </details>
 
-### From a release (checksum-verified installer)
+### From a release (installer pinned to a tag)
 
-The installers download the release tarball and `SHA256SUMS.txt` from GitHub Releases, verify the SHA-256 checksum, then run `npm install -g`.
+The installer downloads the release tarball and `SHA256SUMS.txt` from GitHub Releases, verifies the tarball's SHA-256 checksum, then runs `npm install -g`. That checksum covers the tarball only, not the installer script itself. So download the installer from a release tag (never from `main`), read it, and only then run it.
 
 ```bash
-# macOS / Linux
-curl -fsSL https://raw.githubusercontent.com/Relogys/Antigravity-gateway/main/scripts/install.sh | bash
-curl -fsSL https://raw.githubusercontent.com/Relogys/Antigravity-gateway/main/scripts/install.sh | bash -s -- --version v0.4.2
+# macOS / Linux: download from the release tag, inspect, then run
+curl -fsSLO https://raw.githubusercontent.com/Relogys/Antigravity-gateway/v0.4.2/scripts/install.sh
+less install.sh
+bash install.sh --version v0.4.2
 ```
 
 ```powershell
-# Windows: download scripts/install.ps1, then
+# Windows (PowerShell): download from the release tag, inspect, then run
+Invoke-WebRequest https://raw.githubusercontent.com/Relogys/Antigravity-gateway/v0.4.2/scripts/install.ps1 -OutFile install.ps1
+notepad .\install.ps1
 powershell -ExecutionPolicy Bypass -File .\install.ps1 -Version v0.4.2
 ```
 

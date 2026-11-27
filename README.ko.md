@@ -218,18 +218,21 @@ pnpm build && pnpm cli doctor && pnpm cli start
 개발 중 핫 리로드가 필요하면 `pnpm dev`를 사용하세요.
 </details>
 
-### 릴리스에서 설치(체크섬 검증 설치 스크립트)
+### 릴리스에서 설치(태그에 고정된 설치 스크립트)
 
-설치 스크립트는 GitHub Releases에서 릴리스 tarball과 `SHA256SUMS.txt`를 내려받아 SHA-256 체크섬을 검증한 뒤 `npm install -g`를 실행합니다.
+설치 스크립트는 GitHub Releases에서 릴리스 tarball과 `SHA256SUMS.txt`를 내려받아 tarball의 SHA-256 체크섬을 검증한 뒤 `npm install -g`를 실행합니다. 이 체크섬은 tarball만 검증하며 설치 스크립트 자체는 검증하지 않습니다. 따라서 설치 스크립트는 `main`이 아닌 릴리스 태그에서 내려받고, 내용을 확인한 뒤 실행하세요.
 
 ```bash
-# macOS / Linux
-curl -fsSL https://raw.githubusercontent.com/Relogys/Antigravity-gateway/main/scripts/install.sh | bash
-curl -fsSL https://raw.githubusercontent.com/Relogys/Antigravity-gateway/main/scripts/install.sh | bash -s -- --version v0.4.2
+# macOS / Linux: 릴리스 태그에서 내려받아 확인한 뒤 실행
+curl -fsSLO https://raw.githubusercontent.com/Relogys/Antigravity-gateway/v0.4.2/scripts/install.sh
+less install.sh
+bash install.sh --version v0.4.2
 ```
 
 ```powershell
-# Windows: download scripts/install.ps1, then
+# Windows (PowerShell): 릴리스 태그에서 내려받아 확인한 뒤 실행
+Invoke-WebRequest https://raw.githubusercontent.com/Relogys/Antigravity-gateway/v0.4.2/scripts/install.ps1 -OutFile install.ps1
+notepad .\install.ps1
 powershell -ExecutionPolicy Bypass -File .\install.ps1 -Version v0.4.2
 ```
 
