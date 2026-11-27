@@ -1,12 +1,15 @@
 import fs from "node:fs";
 import path from "node:path";
+import type { ConversationGroupSync } from "../acp/conversation-sync.js";
 import { fetchAgyQuota, formatQuotaSummary } from "../acp/quota.js";
 import { splitQualifiedChatId } from "../channels/hub.js";
 import {
+  CHANNEL_NAMES,
   getChannelAllowedUsers,
   isPhotonChannel,
   normalizeUserId,
   senderKeyFor,
+  type ChannelName,
   type GatewayConfig,
 } from "../config.js";
 import { extractOutboundMedia } from "../photon/format.js";
@@ -27,6 +30,8 @@ import type {
   SessionInfo,
   TurnActivitySnapshot,
 } from "../types.js";
+import { IngressBurstCoalescer, type ReplyQuoteMetadata } from "./burst.js";
+import { BotLoopGuard } from "./guards.js";
 import {
   LoopScheduler,
   formatDurationMs,
@@ -39,6 +44,10 @@ const DEFAULT_PROGRESS_POLL_INTERVAL_MS = 15_000;
 const QUOTA_CHECK_INTERVAL_MS = 5 * 60 * 1000;
 const GATEWAY_VERSION = "0.1.0";
 const MAX_SESSION_LIST_CACHE = 500;
+const MAX_LAST_PROMPTS = 500;
+const REPLY_QUOTE_SNIPPET_MAX = 500;
+
+type VerbosityLevel = "off" | "brief" | "full";
 
 export interface ExtendedAgentBackend extends AgentBackend {
   getBusyMode?(chatId: string): BusyMode;
@@ -88,10 +97,18 @@ export interface GatewayRouterDeps {
   scheduler: LoopScheduler;
   quotaFetcher?: () => Promise<QuotaSummary>;
   version?: string;
+  /** Optional best-effort bridge mirroring session groups into the Antigravity sidebar. */
+  conversationSync?: ConversationGroupSync;
+  /** Per-chat circuit breaker for group-chat bursts (defaults to a new BotLoopGuard). */
+  loopGuard?: BotLoopGuard;
   /** Typing refresh cadence during long ACP turns (default 5000ms; 0 disables). */
   typingIntervalMs?: number;
   /** How often the silence/stall watchdog samples turn activity (default 15000ms). */
   progressPollIntervalMs?: number;
+  /** Rapid-fire bubble coalescing window; 0 disables coalescing (default 0). */
+  burstDebounceMs?: number;
+  /** Hard ceiling from the first buffered bubble before a coalesced flush (default 1000ms). */
+  burstHardCapMs?: number;
 }
 
 const ALWAYS_DISPATCHABLE_COMMANDS = new Set([
@@ -111,11 +128,27 @@ const ALWAYS_DISPATCHABLE_COMMANDS = new Set([
   "yolo",
   "whoami",
   "channels",
+  "groups",
   "help",
   "commands",
   "version",
   "v",
+  "ping",
+  "sethome",
+  "verbose",
 ]);
+
+/** Slash commands that wipe/inspect pending work must also drop buffered burst fragments. */
+const BURST_DISCARD_COMMANDS = new Set([
+  "stop",
+  "cancel",
+  "new",
+  "reset",
+  "discard",
+]);
+
+/** @deprecated Wave 8A optional metadata, read defensively. */
+type InboundWithQuote = InboundMessage & ReplyQuoteMetadata;
 
 /** Slash commands that may take a while (network / agent work) get a 👀 working receipt. */
 const SLOW_SLASH_COMMANDS = new Set([
@@ -133,23 +166,29 @@ const HELP_TEXT = [
   "Antigravity Gateway Commands:",
   "Always available (even while busy):",
   "• /stop — Cancel active turn",
-  "• /new (/reset) — Start a fresh session",
+  "• /new [title] (/reset) — Start a fresh session (optionally titled)",
   "• /status — Show session, model, busy & queue state",
+  "• /ping — Health check (uptime & connection state)",
   "• /usage — Check Antigravity quota (0 tokens)",
   "• /queue (/q) [prompt|list|clear] — Manage prompt queue",
   "• /steer (/s) <prompt> — Interrupt & redirect active turn",
   "• /busy [queue|interrupt|steer] — Set busy-turn policy",
   "• /approve [once|session|always] | /deny — Resolve tool permission",
   "• /yolo — Toggle auto-approval mode",
+  "• /verbose [off|brief|full] — Progress-pulse verbosity",
+  "• /sethome — Set this chat as the recovery home",
   "• /channels — Show active channels & connection state",
   "• /whoami | /version | /help",
   "",
   "Session & Config (when idle):",
+  "• /retry — Re-run the last prompt in this chat",
   "• /model [slug] — View or switch model",
   "• /effort [low|medium|high|xhigh] — Set reasoning effort",
   "• /mode [default|accept-edits|auto|plan] — Set ACP mode",
   "• /approvals [auto|interactive|sandbox] — Set permission mode",
-  "• /sessions | /resume [id|index] — List or resume sessions",
+  "• /sessions [channel|all] — List sessions (defaults to this channel group)",
+  "• /groups — Summarize every IM channel session group",
+  "• /resume [id|index] — Resume a saved session",
   "• /title [name] — View or rename session",
   "• /compact (/compress) — Summarize & compact context",
   "• /cwd [path] — View or change working directory",
@@ -203,6 +242,10 @@ export class GatewayRouter {
   private readonly version: string;
   private readonly typingIntervalMs: number;
   private readonly progressPollIntervalMs: number;
+  private readonly burstDebounceMs: number;
+  private readonly burstCoalescer: IngressBurstCoalescer;
+  private readonly conversationSync?: ConversationGroupSync;
+  private readonly loopGuard: BotLoopGuard;
 
   private readonly startedAt = Date.now();
   private ready = false;
@@ -219,6 +262,8 @@ export class GatewayRouter {
   private readonly fallbackApprovalModes = new Map<string, ApprovalMode>();
   private readonly hydratedChats = new Set<string>();
   private readonly sessionListCache = new Map<string, AcpSessionSummary[]>();
+  private readonly verbosityByChatId = new Map<string, VerbosityLevel>();
+  private readonly lastPromptByChatId = new Map<string, string>();
   private cachedQuota?: QuotaSummary;
 
   constructor(deps: GatewayRouterDeps) {
@@ -232,6 +277,15 @@ export class GatewayRouter {
       deps.typingIntervalMs ?? DEFAULT_TYPING_INTERVAL_MS;
     this.progressPollIntervalMs =
       deps.progressPollIntervalMs ?? DEFAULT_PROGRESS_POLL_INTERVAL_MS;
+    this.burstDebounceMs = deps.burstDebounceMs ?? 0;
+    this.conversationSync = deps.conversationSync;
+    this.loopGuard = deps.loopGuard ?? new BotLoopGuard();
+    this.burstCoalescer = new IngressBurstCoalescer({
+      debounceMs: this.burstDebounceMs,
+      hardCapMs: deps.burstHardCapMs ?? 1000,
+      onFlush: (merged) =>
+        this.handleUserPrompt(merged, merged.text, merged.attachments),
+    });
     this.quotaFetcher =
       deps.quotaFetcher ??
       (() =>
@@ -249,6 +303,11 @@ export class GatewayRouter {
 
   markReady(): void {
     this.ready = true;
+  }
+
+  /** Stops pending burst timers so buffered fragments never fire after shutdown. */
+  stop(): void {
+    this.burstCoalescer.stop();
   }
 
   /**
@@ -285,6 +344,10 @@ export class GatewayRouter {
       if (!authorized || !groupsAllowed || !msg.mentionsBot) {
         return;
       }
+      const verdict = this.loopGuard.checkAndRecord(msg.chatId);
+      if (!verdict.allowed) {
+        return;
+      }
     } else if (!authorized) {
       if (senderId) {
         const pairing = await this.store.createOrGetPairing(senderId);
@@ -315,11 +378,26 @@ export class GatewayRouter {
       if (cmdMatch) {
         const cmd = cmdMatch[1].toLowerCase();
         const args = (cmdMatch[2] ?? "").trim();
+        // Commands never wait behind the coalescer; destructive ones also drop stale fragments.
+        if (BURST_DISCARD_COMMANDS.has(cmd)) {
+          this.burstCoalescer.discard(msg.chatId);
+        }
         await this.handleSlashCommand(msg, senderId, cmd, args);
         return;
       }
 
       if (!bodyText && msg.attachments.length === 0) {
+        return;
+      }
+
+      // Malformed slash input must bypass coalescing as well.
+      if (bodyText.startsWith("/")) {
+        await this.handleUserPrompt(msg, bodyText, msg.attachments);
+        return;
+      }
+
+      if (this.burstDebounceMs > 0) {
+        this.burstCoalescer.enqueue({ ...msg, text: bodyText });
         return;
       }
 
@@ -343,8 +421,7 @@ export class GatewayRouter {
       attachments: [],
       timestamp: Date.now(),
     };
-    const existing = this.store.getSession(job.chatId);
-    const cwd = job.cwd ?? existing?.cwd ?? this.config.defaultCwd;
+    const cwd = job.cwd ?? this.resolveDefaultCwd(job.chatId);
     if (this.isChatBusy(job.chatId)) {
       this.enqueueChatPrompt(job.chatId, job.prompt);
       return;
@@ -444,6 +521,43 @@ export class GatewayRouter {
 
   private reactionsEnabled(channel: string): boolean {
     return isPhotonChannel(channel) ? (this.config.photon?.reactions ?? true) : true;
+  }
+
+  private getChatVerbosity(chatId: string): VerbosityLevel {
+    return this.verbosityByChatId.get(chatId) ?? "brief";
+  }
+
+  private rememberLastPrompt(chatId: string, text: string): void {
+    if (!text.trim()) {
+      return;
+    }
+    this.lastPromptByChatId.delete(chatId);
+    this.lastPromptByChatId.set(chatId, text);
+    while (this.lastPromptByChatId.size > MAX_LAST_PROMPTS) {
+      const oldest = this.lastPromptByChatId.keys().next().value;
+      if (oldest === undefined) {
+        break;
+      }
+      this.lastPromptByChatId.delete(oldest);
+    }
+  }
+
+  /**
+   * Prepends reply-quote context so the agent can resolve "this"/"that" references.
+   * Wave 8A adds these optional fields to InboundMessage; read them defensively.
+   */
+  private withReplyQuote(msg: InboundMessage, text: string): string {
+    const quote = msg as InboundWithQuote;
+    const raw = typeof quote.replyToText === "string" ? quote.replyToText.trim() : "";
+    if (!raw) {
+      return text;
+    }
+    const snippet = raw.slice(0, REPLY_QUOTE_SNIPPET_MAX);
+    const label =
+      quote.replyToIsOwnMessage === true
+        ? "previous assistant message"
+        : "quoted message";
+    return `[Replying to ${label}: "${snippet}"]\n\n${text}`;
   }
 
   private formatChannelsReport(currentChannel: string): string {
@@ -622,13 +736,14 @@ export class GatewayRouter {
     );
   }
 
-  /** Number of active channels (used to decide whether `/sessions` can flatten groups). */
-  private channelCount(): number {
-    const snapshots = this.channel.getChannelSnapshots?.();
-    if (snapshots) {
-      return Object.keys(snapshots).length;
-    }
-    return 1;
+  /** Resolve this chat's working directory: stored cwd, then per-channel default, then global default. */
+  private resolveDefaultCwd(chatId: string): string {
+    const channelGroup = this.resolveChannelGroup(chatId);
+    return (
+      this.store.getSession(chatId)?.cwd ??
+      this.config.channelDefaultCwds?.[channelGroup as ChannelName] ??
+      this.config.defaultCwd
+    );
   }
 
   private async ensureSessionRecord(
@@ -651,7 +766,10 @@ export class GatewayRouter {
     const merged: SessionInfo = {
       chatId,
       sessionId: existing?.sessionId ?? "",
-      cwd: existing?.cwd ?? this.config.defaultCwd,
+      cwd:
+        existing?.cwd ??
+        this.config.channelDefaultCwds?.[channelGroup as ChannelName] ??
+        this.config.defaultCwd,
       model: existing?.model ?? this.config.defaultModel,
       effort: existing?.effort ?? this.config.defaultEffort,
       mode: existing?.mode,
@@ -666,6 +784,17 @@ export class GatewayRouter {
     };
     await this.store.upsertSession(merged);
     await this.store.ensureChannelBinding(channelGroup);
+
+    if (merged.sessionId) {
+      this.conversationSync
+        ?.syncSessionGroup({
+          sessionId: merged.sessionId,
+          channelGroup: merged.channelGroup ?? this.resolveChannelGroup(chatId),
+          title: merged.title,
+        })
+        .catch(() => {});
+    }
+
     return merged;
   }
 
@@ -753,6 +882,93 @@ export class GatewayRouter {
         return;
       }
 
+      case "ping": {
+        if (isHelpFlag(args)) {
+          await this.sendReply(
+            chatId,
+            "Usage: /ping — Report gateway uptime and channel connection state.",
+            msg.id,
+          );
+          return;
+        }
+        await this.sendReply(
+          chatId,
+          `🏓 Pong! channel=${msg.channel} | uptime=${formatUptime(Date.now() - this.startedAt)} | connected=${this.channel.isConnected()}`,
+          msg.id,
+        );
+        return;
+      }
+
+      case "sethome": {
+        if (isHelpFlag(args)) {
+          await this.sendReply(
+            chatId,
+            "Usage: /sethome — Set this conversation as the recovery home chat.",
+            msg.id,
+          );
+          return;
+        }
+        await this.store.setHomeChatId(chatId);
+        await this.sendReply(
+          chatId,
+          `🏠 Home chat set to this conversation (${chatId}).`,
+          msg.id,
+        );
+        return;
+      }
+
+      case "verbose": {
+        const current = this.getChatVerbosity(chatId);
+        if (!args || isHelpFlag(args)) {
+          await this.sendReply(
+            chatId,
+            [
+              `Verbosity: ${current}`,
+              "Usage: /verbose [off|brief|full]",
+              "off — silence periodic progress pulses (stall alerts stay on)",
+              "brief — concise progress pulses (default)",
+              "full — add tool count, model, effort & retry detail",
+            ].join("\n"),
+            msg.id,
+          );
+          return;
+        }
+        const next = args.toLowerCase();
+        if (next !== "off" && next !== "brief" && next !== "full") {
+          await this.sendReply(
+            chatId,
+            "Invalid verbosity. Use: /verbose [off|brief|full]",
+            msg.id,
+          );
+          return;
+        }
+        this.verbosityByChatId.set(chatId, next);
+        await this.sendReply(chatId, `Verbosity set to: ${next}`, msg.id);
+        return;
+      }
+
+      case "retry": {
+        if (isHelpFlag(args)) {
+          await this.sendReply(
+            chatId,
+            "Usage: /retry — Re-run the last prompt sent in this chat.",
+            msg.id,
+          );
+          return;
+        }
+        const lastPrompt = this.lastPromptByChatId.get(chatId);
+        if (!lastPrompt) {
+          await this.sendReply(
+            chatId,
+            "No previous prompt to retry in this chat.",
+            msg.id,
+          );
+          return;
+        }
+        await this.handleUserPrompt(msg, lastPrompt, []);
+        return;
+      }
+
       case "stop":
       case "cancel": {
         this.cancelledByUser.add(chatId);
@@ -772,6 +988,14 @@ export class GatewayRouter {
 
       case "new":
       case "reset": {
+        if (isHelpFlag(args)) {
+          await this.sendReply(
+            chatId,
+            "Usage: /new [title] — Start a fresh session, optionally titled within this channel group.",
+            msg.id,
+          );
+          return;
+        }
         this.bumpSessionGeneration(chatId);
         this.clearChatQueue(chatId);
         this.stopDrainChats.delete(chatId);
@@ -782,7 +1006,23 @@ export class GatewayRouter {
         const prev = this.store.getSession(chatId);
         await this.backend.resetSession(chatId);
         await this.store.deleteSession(chatId);
-        if (prev && prev.cwd !== this.config.defaultCwd) {
+        const freshTitle = args.trim()
+          ? `[${this.resolveChannelGroup(chatId)}] ${args.trim()}`
+          : undefined;
+        if (freshTitle) {
+          await this.ensureSessionRecord(chatId, {
+            sessionId: "",
+            ...(prev ? {
+              cwd: prev.cwd,
+              model: prev.model,
+              effort: prev.effort,
+              mode: prev.mode,
+              approvalMode: prev.approvalMode,
+              busyMode: prev.busyMode,
+            } : {}),
+            title: freshTitle,
+          });
+        } else if (prev && prev.cwd !== this.config.defaultCwd) {
           await this.ensureSessionRecord(chatId, {
             sessionId: "",
             cwd: prev.cwd,
@@ -794,7 +1034,11 @@ export class GatewayRouter {
             title: undefined,
           });
         }
-        await this.sendReply(chatId, "🆕 Started a fresh session.", msg.id);
+        await this.sendReply(
+          chatId,
+          freshTitle ? `🆕 Started a fresh session: ${freshTitle}` : "🆕 Started a fresh session.",
+          msg.id,
+        );
         return;
       }
 
@@ -1203,52 +1447,75 @@ export class GatewayRouter {
         return;
       }
 
-      case "sessions": {
+      case "groups": {
         if (isHelpFlag(args)) {
           await this.sendReply(
             chatId,
-            "Usage: /sessions [all] — List saved sessions grouped by channel (send /resume <index|id> to resume).",
+            "Usage: /groups — Summarize every IM channel session group and its session count.",
             msg.id,
           );
           return;
         }
-        const cwd = this.store.getSession(chatId)?.cwd ?? this.config.defaultCwd;
+        const currentGroup = this.resolveChannelGroup(chatId).toLowerCase();
+        const groups = new Set<string>();
+        for (const record of this.store.getBoundChannels()) {
+          groups.add((record.groupName || record.channel).toLowerCase());
+        }
+        for (const session of this.store.listSessions()) {
+          groups.add(
+            (session.channelGroup ?? this.resolveChannelGroup(session.chatId)).toLowerCase(),
+          );
+        }
+        groups.add(currentGroup);
+
+        const lines = [...groups].sort().map((group) => {
+          const count = this.store.listSessionsByChannel(group).length;
+          const cwd = this.config.channelDefaultCwds?.[group as ChannelName];
+          const cwdHint = cwd ? ` | cwd: ${cwd}` : "";
+          const marker = group === currentGroup ? " (this channel)" : "";
+          return `📂 ${group}${marker} — ${count} session(s)${cwdHint}`;
+        });
+        await this.sendReply(chatId, ["Session groups:", ...lines].join("\n"), msg.id);
+        return;
+      }
+
+      case "sessions": {
+        if (isHelpFlag(args)) {
+          await this.sendReply(
+            chatId,
+            "Usage: /sessions [channel|all] — List saved sessions (defaults to this channel's group; 'all' lists every group).",
+            msg.id,
+          );
+          return;
+        }
+        const currentGroup = this.resolveChannelGroup(chatId).toLowerCase();
+        const cwd = this.resolveDefaultCwd(chatId);
         const list = await this.backend.listSessions(cwd);
         const sliced = list.slice(0, 10);
         this.cacheSessionList(chatId, sliced);
 
-        const currentGroup = this.resolveChannelGroup(chatId);
-        const showAll =
-          args.toLowerCase() === "all" || this.channelCount() <= 1;
-        const stored = showAll
-          ? this.store.listSessions()
-          : this.store.listSessionsByChannel(currentGroup);
-
-        const lines: string[] = [];
-        if (stored.length === 0) {
-          lines.push(`📂 ${currentGroup}: no gateway sessions yet.`);
-        } else {
-          const groups = new Map<string, SessionInfo[]>();
-          for (const session of stored) {
-            const group = session.channelGroup ?? currentGroup;
-            const bucket = groups.get(group);
-            if (bucket) {
-              bucket.push(session);
-            } else {
-              groups.set(group, [session]);
-            }
-          }
-          lines.push(`📂 Saved sessions${showAll ? " (all groups)" : ""}:`);
-          for (const [group, sessions] of groups) {
-            lines.push(`📂 ${group}`);
-            for (const session of sessions) {
-              const title = session.title ? ` — ${session.title}` : "";
-              lines.push(`  • ${session.chatId}${title}`);
-            }
-          }
+        const argLower = args.trim().toLowerCase();
+        const knownGroups = new Set<string>();
+        for (const record of this.store.getBoundChannels()) {
+          knownGroups.add((record.groupName || record.channel).toLowerCase());
+        }
+        for (const session of this.store.listSessions()) {
+          knownGroups.add(
+            (session.channelGroup ?? this.resolveChannelGroup(session.chatId)).toLowerCase(),
+          );
         }
 
-        if (sliced.length > 0) {
+        const lines: string[] = [];
+        const appendStored = (sessions: SessionInfo[]) => {
+          for (const session of sessions) {
+            const title = session.title ? ` — ${session.title}` : "";
+            lines.push(`  • ${session.chatId}${title}`);
+          }
+        };
+        const appendAcp = () => {
+          if (sliced.length === 0) {
+            return;
+          }
           if (lines.length > 0) {
             lines.push("");
           }
@@ -1258,6 +1525,67 @@ export class GatewayRouter {
             const label = s.title ? ` — ${s.title}` : "";
             lines.push(`${idx + 1}. ${shortId}${label}`);
           });
+        };
+
+        if (!argLower) {
+          const stored = this.store.listSessionsByChannel(currentGroup);
+          if (stored.length === 0) {
+            lines.push(`📂 ${currentGroup}: no sessions yet.`);
+          } else {
+            lines.push(`📂 ${currentGroup}`);
+            appendStored(stored);
+          }
+          appendAcp();
+          lines.push(
+            "",
+            "Use /sessions all to list all channel groups, or /groups for summary.",
+          );
+        } else if (argLower === "all") {
+          const stored = this.store.listSessions();
+          if (stored.length === 0) {
+            lines.push("No gateway sessions yet.");
+          } else {
+            const grouped = new Map<string, SessionInfo[]>();
+            for (const session of stored) {
+              const group = (
+                session.channelGroup ?? this.resolveChannelGroup(session.chatId)
+              ).toLowerCase();
+              const bucket = grouped.get(group);
+              if (bucket) {
+                bucket.push(session);
+              } else {
+                grouped.set(group, [session]);
+              }
+            }
+            for (const [group, sessions] of grouped) {
+              lines.push(`📂 ${group}`);
+              appendStored(sessions);
+            }
+          }
+          appendAcp();
+        } else {
+          const target = argLower;
+          const isKnown =
+            (CHANNEL_NAMES as readonly string[]).includes(target) ||
+            knownGroups.has(target);
+          if (!isKnown) {
+            await this.sendReply(
+              chatId,
+              `Unknown channel group: ${args}. Send /groups to see available groups.`,
+              msg.id,
+            );
+            return;
+          }
+          const stored = this.store.listSessionsByChannel(target);
+          lines.push(`📂 ${target}`);
+          if (stored.length === 0) {
+            lines.push("  (no sessions)");
+          } else {
+            appendStored(stored);
+          }
+          if (target === currentGroup) {
+            appendAcp();
+          }
         }
 
         await this.sendReply(chatId, lines.join("\n"), msg.id);
@@ -1277,7 +1605,7 @@ export class GatewayRouter {
           await this.sendReply(chatId, "Usage: /resume <id|index>", msg.id);
           return;
         }
-        const cwd = this.store.getSession(chatId)?.cwd ?? this.config.defaultCwd;
+        const cwd = this.resolveDefaultCwd(chatId);
         let targetId = args;
         let targetCwd = cwd;
         let targetTitle: string | undefined;
@@ -1362,8 +1690,7 @@ export class GatewayRouter {
           );
           return;
         }
-        const currentCwd =
-          this.store.getSession(chatId)?.cwd ?? this.config.defaultCwd;
+        const currentCwd = this.resolveDefaultCwd(chatId);
         if (!args) {
           await this.sendReply(chatId, `Current working directory: ${currentCwd}`, msg.id);
           return;
@@ -1493,7 +1820,7 @@ export class GatewayRouter {
         );
         return;
       }
-      const cwd = this.store.getSession(chatId)?.cwd ?? this.config.defaultCwd;
+      const cwd = this.resolveDefaultCwd(chatId);
       const job = await this.scheduler.addLoop({
         chatId,
         prompt,
@@ -1588,11 +1915,14 @@ export class GatewayRouter {
     options: { overrideCwd?: string; isLoop?: boolean } = {},
   ): Promise<void> {
     const { chatId } = msg;
+    if (!options.isLoop) {
+      this.rememberLastPrompt(chatId, text);
+    }
     this.activeTurnChats.add(chatId);
 
     try {
       let currentMsg = msg;
-      let currentText = text;
+      let currentText = options.isLoop ? text : this.withReplyQuote(msg, text);
       let currentAttachments = attachments;
       let currentOptions = options;
 
@@ -1665,18 +1995,19 @@ export class GatewayRouter {
     }
 
     const stored = this.store.getSession(chatId);
-    const cwd = options.overrideCwd ?? stored?.cwd ?? this.config.defaultCwd;
+    const cwd = options.overrideCwd ?? this.resolveDefaultCwd(chatId);
     const approvalMode = this.getChatApprovalMode(chatId);
     const model = stored?.model ?? this.config.defaultModel;
     const effort = stored?.effort ?? this.config.defaultEffort;
 
     try {
-      // Hermes-grade silence progress & stall watchdog (interactive turns only).
+      // Silence progress & stall watchdog (interactive turns only).
       if (
         !options.isLoop &&
         (this.config.progressSilenceMs > 0 ||
           this.config.sessionStallTimeoutMs > 0)
       ) {
+        const verbosity = this.getChatVerbosity(chatId);
         const turnStartedAt = Date.now();
         let lastProgressNotifyAt = turnStartedAt;
         let stallNotified = false;
@@ -1703,6 +2034,11 @@ export class GatewayRouter {
               return;
             }
 
+            // `off` silences periodic pulses but never the stall alert above.
+            if (verbosity === "off") {
+              return;
+            }
+
             if (
               this.config.progressSilenceMs > 0 &&
               now - lastProgressNotifyAt >= this.config.progressSilenceMs
@@ -1724,6 +2060,18 @@ export class GatewayRouter {
                   ? `，已重试 ${activity.retryCount} 次`
                   : "";
                 progressText = `⏳ [${modelLabel}] 思考/处理中（已耗时 ${elapsed}${toolNote}${retryNote}）。发送 /stop 可取消。`;
+              }
+              if (verbosity === "full") {
+                const detail = [
+                  `模型 ${modelLabel}`,
+                  activity?.effort ? `effort ${activity.effort}` : "",
+                  `阶段 ${activity?.phase ?? "thinking"}`,
+                  `工具 ${activity?.toolCount ?? 0} 次`,
+                  `重试 ${activity?.retryCount ?? 0}/${activity?.maxRetries ?? 0}`,
+                ]
+                  .filter(Boolean)
+                  .join(" | ");
+                progressText += `\n📊 ${detail}`;
               }
               void this.sendReply(chatId, progressText).catch(() => {});
             }
@@ -1788,7 +2136,7 @@ export class GatewayRouter {
         .join("\n\n");
       const emptyResult = !combinedText && mediaPaths.length === 0;
 
-      // Hermes pattern: drop typing + stop the watchdog BEFORE the final reply.
+      // Stop typing and watchdog before sending the final reply.
       if (progressTimer) {
         clearInterval(progressTimer);
         progressTimer = undefined;

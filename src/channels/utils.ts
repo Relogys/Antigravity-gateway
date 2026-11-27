@@ -6,10 +6,132 @@ import path from "node:path";
 /** Default cap for inline media downloads (20 MiB). */
 export const MAX_INLINE_MEDIA_BYTES = 20 * 1024 * 1024;
 
+/** Newline + closing fence appended when a chunk ends inside an open code block. */
+const FENCE_CLOSE = "\n```";
+/** Below this limit we skip fence repair; there isn't enough room for balanced fences. */
+const MIN_FENCE_LIMIT = 32;
+
+/**
+ * Pick a split point at most `limit` characters in, preferring paragraph, line,
+ * sentence, then word boundaries; hard-splits (surrogate-safe) when none exists.
+ */
+function chooseCut(rest: string, limit: number): number {
+  const window = rest.slice(0, limit + 1);
+  for (const sep of ["\n\n", "\n", ". ", " "]) {
+    const idx = window.lastIndexOf(sep, limit);
+    // Require a boundary past the first 30% so we don't emit tiny chunks.
+    if (idx >= Math.floor(limit * 0.3)) {
+      return idx + (sep === ". " ? 1 : 0);
+    }
+  }
+  let cut = limit;
+  const code = rest.charCodeAt(cut - 1);
+  if (code >= 0xd800 && code <= 0xdbff && cut > 1) {
+    cut -= 1; // keep surrogate pair together
+  }
+  return cut;
+}
+
+/**
+ * Nudge `cut` out of a short inline `` `code` `` span when a nearby space can
+ * carry the boundary instead. Never splits a fenced block (runs of 3+ ticks).
+ */
+function avoidInlineBacktickSplit(rest: string, cut: number, limit: number): number {
+  const head = rest.slice(0, cut);
+  if (!head.includes("`") || /^\s*`{3,}/m.test(head)) {
+    return cut;
+  }
+  let inInline = false;
+  let openIdx = -1;
+  let i = 0;
+  while (i < head.length) {
+    if (head[i] === "`") {
+      let j = i;
+      while (j < head.length && head[j] === "`") {
+        j += 1;
+      }
+      if (j - i === 1) {
+        inInline = !inInline;
+        if (inInline) {
+          openIdx = i;
+        }
+      }
+      i = j;
+    } else {
+      i += 1;
+    }
+  }
+  if (!inInline || openIdx < 0) {
+    return cut;
+  }
+  const boundary = Math.max(rest.lastIndexOf(" ", openIdx), rest.lastIndexOf("\n", openIdx));
+  if (boundary >= Math.floor(limit * 0.3) && boundary > 0) {
+    return boundary;
+  }
+  const closeIdx = rest.indexOf("`", cut);
+  if (closeIdx > cut && closeIdx + 1 <= limit) {
+    return closeIdx + 1;
+  }
+  return cut;
+}
+
+interface FenceLine {
+  /** Offset just past the fence delimiter line (its newline, or end of input). */
+  endOffset: number;
+  /** Info string of the delimiter (language tag for an opening fence). */
+  lang: string;
+}
+
+/** Record every triple-backtick delimiter line with its offset, in one O(n) pass. */
+function collectFenceLines(input: string): FenceLine[] {
+  const lines: FenceLine[] = [];
+  let start = 0;
+  for (;;) {
+    const nl = input.indexOf("\n", start);
+    const end = nl === -1 ? input.length : nl;
+    const match = /^\s*`{3,}(.*)$/.exec(input.slice(start, end));
+    if (match) {
+      lines.push({ endOffset: end, lang: match[1].trim() });
+    }
+    if (nl === -1) {
+      break;
+    }
+    start = nl + 1;
+  }
+  return lines;
+}
+
+/**
+ * Language of the fenced code block open at `offset`, or `undefined` when the
+ * offset is outside any fence. Delimiter lines count once fully read.
+ */
+function openFenceLangAt(lines: FenceLine[], offset: number): string | undefined {
+  let lo = 0;
+  let hi = lines.length - 1;
+  let read = 0;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (lines[mid].endOffset <= offset) {
+      read = mid + 1;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  if (read % 2 === 1) {
+    return lines[read - 1].lang;
+  }
+  return undefined;
+}
+
 /**
  * Split text into chunks of at most `maxLen` characters, preferring paragraph,
  * line, sentence, then word boundaries; hard-splits only when no boundary exists.
  * Never splits inside a UTF-16 surrogate pair. Returns `[]` for blank input.
+ *
+ * Triple-backtick code fences are tracked across chunks: a boundary inside an
+ * open fence closes the chunk with ``\n``` `` and reopens the next one with
+ * ```` ```lang\n ```` (same language tag) when `maxLen` leaves room for it.
  */
 export function chunkText(text: string, maxLen: number): string[] {
   const limit = Math.max(1, Math.floor(maxLen));
@@ -21,34 +143,65 @@ export function chunkText(text: string, maxLen: number): string[] {
     return [input];
   }
 
+  const fenceLines = collectFenceLines(input);
   const chunks: string[] = [];
   let rest = input;
-  while (rest.length > limit) {
-    const window = rest.slice(0, limit + 1);
-    let cut = -1;
-    for (const sep of ["\n\n", "\n", ". ", " "]) {
-      const idx = window.lastIndexOf(sep, limit);
-      // Require a boundary past the first 30% so we don't emit tiny chunks.
-      if (idx >= Math.floor(limit * 0.3)) {
-        cut = idx + (sep === ". " ? 1 : 0);
-        break;
+  let pos = 0; // original offset of rest[0]
+  let pendingPrefix = ""; // reopened fence prepended to the next chunk
+
+  while (rest.length + pendingPrefix.length > limit) {
+    const effectiveLimit = limit - pendingPrefix.length;
+    if (effectiveLimit <= 0) {
+      // A pathological language tag consumed the budget; split without a prefix.
+      const cut = Math.max(1, Math.min(rest.length, limit));
+      const piece = rest.slice(0, cut).trimEnd();
+      if (piece) {
+        chunks.push(piece);
       }
+      pos += cut;
+      rest = rest.slice(cut).trimStart();
+      pendingPrefix = "";
+      continue;
     }
+
+    let cut = chooseCut(rest, effectiveLimit);
+    let fenceLang = openFenceLangAt(fenceLines, pos + cut);
+
+    if (fenceLang === undefined && pendingPrefix === "") {
+      cut = avoidInlineBacktickSplit(rest, cut, effectiveLimit);
+      fenceLang = openFenceLangAt(fenceLines, pos + cut);
+    }
+
+    const fenceRoom = limit >= MIN_FENCE_LIMIT && effectiveLimit - FENCE_CLOSE.length > 0;
+    if (fenceLang !== undefined && fenceRoom) {
+      // Reserve room for the closing fence before re-picking the boundary.
+      cut = chooseCut(rest, effectiveLimit - FENCE_CLOSE.length);
+      fenceLang = openFenceLangAt(fenceLines, pos + cut);
+    }
+
+    const willClose = fenceRoom && fenceLang !== undefined;
+    const body = rest.slice(0, cut).trimEnd();
+    if (body) {
+      chunks.push(`${pendingPrefix}${body}${willClose ? FENCE_CLOSE : ""}`);
+    }
+
+    const tail = rest.slice(cut);
+    const trimmedTail = tail.trimStart();
+    pos += cut + (tail.length - trimmedTail.length);
+    rest = trimmedTail;
+    pendingPrefix = willClose && fenceLang !== undefined ? `\`\`\`${fenceLang}\n` : "";
+
     if (cut <= 0) {
-      cut = limit;
-      const code = rest.charCodeAt(cut - 1);
-      if (code >= 0xd800 && code <= 0xdbff && cut > 1) {
-        cut -= 1; // keep surrogate pair together
-      }
+      // Guarantee progress on degenerate input.
+      const forced = Math.min(limit, rest.length);
+      rest = rest.slice(forced);
+      pos += forced;
+      pendingPrefix = "";
     }
-    const piece = rest.slice(0, cut).trimEnd();
-    if (piece) {
-      chunks.push(piece);
-    }
-    rest = rest.slice(cut).trimStart();
   }
+
   if (rest) {
-    chunks.push(rest);
+    chunks.push(pendingPrefix ? `${pendingPrefix}${rest}` : rest);
   }
   return chunks;
 }

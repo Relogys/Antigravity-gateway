@@ -177,7 +177,7 @@ The container runs as the non-root `node` user, reads `./.env` read-only, persis
 
 ### What you get out of the box / 开箱即用的体验
 
-- **Hermes-grade read receipts &amp; emoji reaction lifecycle**: an inbound message is marked read (**已读**) → reacts **👀** while `agy` works → **👍** on success / **👎** on error. Typing indicators refresh periodically during long turns.
+- **Read receipts &amp; emoji reaction lifecycle**: an inbound message is marked read (**已读**) → reacts **👀** while `agy` works → **👍** on success / **👎** on error. Typing indicators refresh periodically during long turns.
 - **Photon dual-layer heartbeat**: a transport heartbeat watchdog plus an application-level probe (`PHOTON_HEARTBEAT_TIMEOUT_MS=180000`, `PHOTON_PROBE_SPACE_ID`) detects half-open iMessage streams and reconnects automatically after hours of idle time.
 - **Cross-channel inbound image vision**: photos from Photon, Telegram, Discord, WhatsApp, and Matrix are downloaded, cached, and forwarded to `agy` as native image attachments.
 - **Daemon CLI**: `pnpm cli start`, `stop`, `restart`, `logs`, and `status` with a PID lock and graceful shutdown — plus the crash-backoff supervisor in [`scripts/start-gateway.ps1`](scripts/start-gateway.ps1).

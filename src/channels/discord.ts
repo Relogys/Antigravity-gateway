@@ -57,12 +57,18 @@ export interface DiscordMessageLike {
   };
   react?(emoji: string): Promise<unknown>;
   edit?(content: string): Promise<unknown>;
+  channel?: {
+    messages?: { cache?: { get?(id: string): DiscordMessageLike | undefined } };
+  };
 }
 
 export interface DiscordSendableChannel {
   send(options: Record<string, unknown>): Promise<{ id: string }>;
   sendTyping?(): Promise<unknown>;
-  messages?: { fetch(id: string): Promise<DiscordMessageLike> };
+  messages?: {
+    fetch(id: string): Promise<DiscordMessageLike>;
+    cache?: { get?(id: string): DiscordMessageLike | undefined };
+  };
 }
 
 export interface DiscordClientLike {
@@ -386,6 +392,11 @@ export class DiscordChannelAdapter extends BaseChannelAdapter {
       return;
     }
 
+    const replyToMessageId = message.reference?.messageId ?? undefined;
+    const referenced = replyToMessageId
+      ? this.resolveReferencedMessage(message, replyToMessageId)
+      : undefined;
+
     const inbound: InboundMessage = {
       id: message.id,
       channel: this.name,
@@ -394,7 +405,9 @@ export class DiscordChannelAdapter extends BaseChannelAdapter {
       isGroup,
       text,
       attachments,
-      replyToMessageId: message.reference?.messageId ?? undefined,
+      replyToMessageId,
+      replyToText: referenced?.content?.trim() || undefined,
+      replyToIsOwnMessage: referenced ? Boolean(referenced.author?.bot) : undefined,
       timestamp: message.createdTimestamp ?? Date.now(),
       mentionsBot,
       raw: message,
@@ -482,6 +495,18 @@ export class DiscordChannelAdapter extends BaseChannelAdapter {
       throw new Error(`Discord channel ${chatId} does not support message lookup`);
     }
     return channel.messages.fetch(messageId);
+  }
+
+  /** Resolve a replied-to message from the inbound cache or the channel's message cache. */
+  private resolveReferencedMessage(
+    message: DiscordMessageLike,
+    messageId: string,
+  ): DiscordMessageLike | undefined {
+    const cached = this.recentMessages.get(messageId)?.message;
+    if (cached) {
+      return cached;
+    }
+    return message.channel?.messages?.cache?.get?.(messageId);
   }
 
   private cacheRecentMessage(message: DiscordMessageLike, lastReaction?: string): void {

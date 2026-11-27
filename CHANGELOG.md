@@ -29,7 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Discord, WhatsApp, and Matrix are downloaded, cached, and forwarded to `agy`
   as native image attachments; the outbound media guard still blocks
   `.env*`/`.ssh`/private-key paths.
-- Hermes-grade **reaction lifecycle and read receipts**: `已读` (read) → `👀`
+- Native **reaction lifecycle and read receipts**: `已读` (read) → `👀`
   while working → `👍` on success / `👎` on error, with periodically refreshed
   typing indicators during long turns.
 - Interactive first-run onboarding wizard entry point (`pnpm setup`, alias

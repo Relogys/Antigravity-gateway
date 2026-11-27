@@ -292,7 +292,7 @@ async function setupRouter() {
   return { channel, backend, router, scheduler };
 }
 
-describe("GatewayRouter Hermes feedback", () => {
+describe("GatewayRouter reaction & read-receipt feedback", () => {
   it("marks read and transitions 👀 -> 👍 on prompt success", async () => {
     const { channel, router, scheduler } = await setupRouter();
 

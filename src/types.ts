@@ -28,6 +28,10 @@ export interface InboundMessage {
   text: string;
   attachments: InboundAttachment[];
   replyToMessageId?: string;
+  /** Text of the message this one replies to, when the platform or hub can resolve it. */
+  replyToText?: string;
+  /** True when the replied-to message was sent by the gateway itself. */
+  replyToIsOwnMessage?: boolean;
   timestamp: number;
   service?: "iMessage" | "SMS" | "RCS" | "unknown";
   mentionsBot?: boolean;

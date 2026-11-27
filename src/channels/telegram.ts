@@ -67,12 +67,18 @@ interface TgMessage {
   from?: TgUser;
   text?: string;
   caption?: string;
+  quote?: { text?: string };
   photo?: TgFileRef[];
   document?: TgFileRef;
   voice?: TgFileRef;
   audio?: TgFileRef;
   video?: TgFileRef;
-  reply_to_message?: { message_id: number; from?: TgUser };
+  reply_to_message?: {
+    message_id: number;
+    from?: TgUser;
+    text?: string;
+    caption?: string;
+  };
 }
 
 interface TgUpdate {
@@ -363,6 +369,10 @@ export class TelegramChannelAdapter extends BaseChannelAdapter {
       }
     }
 
+    const replyTarget = message.reply_to_message;
+    const replyToText =
+      message.quote?.text ?? replyTarget?.text ?? replyTarget?.caption;
+
     return {
       id: String(message.message_id),
       channel: this.name,
@@ -371,9 +381,9 @@ export class TelegramChannelAdapter extends BaseChannelAdapter {
       isGroup,
       text: text.trim(),
       attachments,
-      replyToMessageId: message.reply_to_message
-        ? String(message.reply_to_message.message_id)
-        : undefined,
+      replyToMessageId: replyTarget ? String(replyTarget.message_id) : undefined,
+      replyToText: replyToText?.trim() || undefined,
+      replyToIsOwnMessage: replyTarget?.from?.is_bot,
       timestamp: (message.date ?? Math.floor(Date.now() / 1000)) * 1000,
       mentionsBot,
       raw: message,

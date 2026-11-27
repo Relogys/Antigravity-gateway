@@ -217,6 +217,7 @@ const envSchema = z.object({
   PROGRESS_SILENCE_MS: numberEnv(0, 3_600_000, 120_000),
   SESSION_STALL_TIMEOUT_MS: numberEnv(0, 3_600_000, 300_000),
   TURN_MAX_RETRIES: numberEnv(0, 5, 2),
+  INGRESS_DEBOUNCE_MS: numberEnv(0, 10_000, 350),
   AUTO_BOOTSTRAP_CHANNEL_SESSION: optionalString,
   DATA_DIR: z.string().trim().optional(),
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
@@ -520,6 +521,8 @@ export interface GatewayConfig {
   groupMentionPatterns: string[];
   agyBin: string;
   defaultCwd: string;
+  /** Optional per-IM-channel default workspace (`<CHANNEL>_CWD`), keyed by channel name. */
+  channelDefaultCwds: Partial<Record<ChannelName, string>>;
   approvalMode: ApprovalMode;
   defaultModel?: string;
   defaultEffort?: string;
@@ -531,6 +534,7 @@ export interface GatewayConfig {
   progressSilenceMs: number;
   sessionStallTimeoutMs: number;
   turnMaxRetries: number;
+  ingressDebounceMs: number;
   autoBootstrapChannelSession: boolean;
   dataDir: string;
   logLevel: LogLevel;
@@ -639,6 +643,14 @@ export function loadConfig(
     ? path.resolve(parsed.DATA_DIR)
     : path.resolve(process.cwd(), "data");
 
+  const channelDefaultCwds: Partial<Record<ChannelName, string>> = {};
+  for (const name of CHANNEL_NAMES) {
+    const raw = cleanEnv(env[`${name.toUpperCase()}_CWD`]);
+    if (raw) {
+      channelDefaultCwds[name] = path.resolve(raw);
+    }
+  }
+
   const spectrumId = cleanEnv(parsed.SPECTRUM_PROJECT_ID);
   const spectrumSecret = cleanEnv(parsed.SPECTRUM_PROJECT_SECRET);
   const photon: PhotonConfig | undefined =
@@ -716,6 +728,7 @@ export function loadConfig(
     ]),
     agyBin: parsed.AGY_BIN,
     defaultCwd,
+    channelDefaultCwds,
     approvalMode: parsed.APPROVAL_MODE,
     defaultModel: parsed.DEFAULT_MODEL || undefined,
     defaultEffort: parsed.DEFAULT_EFFORT || undefined,
@@ -727,6 +740,7 @@ export function loadConfig(
     progressSilenceMs: parsed.PROGRESS_SILENCE_MS,
     sessionStallTimeoutMs: parsed.SESSION_STALL_TIMEOUT_MS,
     turnMaxRetries: parsed.TURN_MAX_RETRIES,
+    ingressDebounceMs: parsed.INGRESS_DEBOUNCE_MS,
     autoBootstrapChannelSession: parseBoolEnv(
       parsed.AUTO_BOOTSTRAP_CHANNEL_SESSION,
       true,

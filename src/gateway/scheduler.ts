@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import type { ChannelAdapter, LoopJob } from "../types.js";
+import { DeadTargetRegistry } from "./guards.js";
 import type { GatewayStore } from "./store.js";
 
 const MAX_TIMEOUT_MS = 2_147_483_647;
@@ -23,6 +24,7 @@ export interface LoopSchedulerDeps {
   store: GatewayStore;
   channel: ChannelAdapter;
   runPrompt?: (job: StoredLoopJob) => Promise<string | void>;
+  deadTargets?: DeadTargetRegistry;
 }
 
 const UNIT_MS: Record<string, number> = {
@@ -175,6 +177,7 @@ export function parseScheduleSpec(input: string): ParsedScheduleSpec | null {
 export class LoopScheduler {
   private readonly store: GatewayStore;
   private readonly channel: ChannelAdapter;
+  private readonly deadTargets: DeadTargetRegistry;
   private runPrompt?: (job: StoredLoopJob) => Promise<string | void>;
   private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly inFlight = new Set<string>();
@@ -183,7 +186,12 @@ export class LoopScheduler {
   constructor(deps: LoopSchedulerDeps) {
     this.store = deps.store;
     this.channel = deps.channel;
+    this.deadTargets = deps.deadTargets ?? new DeadTargetRegistry();
     this.runPrompt = deps.runPrompt;
+  }
+
+  getDeadTargetRegistry(): DeadTargetRegistry {
+    return this.deadTargets;
   }
 
   setPromptRunner(fn: (job: StoredLoopJob) => Promise<string | void>): void {
@@ -368,29 +376,39 @@ export class LoopScheduler {
     const runAt = Date.now();
 
     try {
-      if (job.kind === "remind") {
-        await this.channel.sendMessage({
-          chatId: job.chatId,
-          text: `⏰ Reminder: ${job.prompt}`,
-        });
-      } else if (this.runPrompt) {
-        const result = await this.runPrompt(job);
-        if (typeof result === "string" && result.trim().length > 0) {
-          await this.channel.sendMessage({
-            chatId: job.chatId,
-            text: result,
-            markdown: true,
-          });
+      // A dead target is skipped entirely: no AI call and no platform send.
+      if (!this.deadTargets.isDead(job.chatId).dead) {
+        try {
+          if (job.kind === "remind") {
+            await this.channel.sendMessage({
+              chatId: job.chatId,
+              text: `⏰ Reminder: ${job.prompt}`,
+            });
+            this.deadTargets.markAlive(job.chatId);
+          } else if (this.runPrompt) {
+            const result = await this.runPrompt(job);
+            if (typeof result === "string" && result.trim().length > 0) {
+              await this.channel.sendMessage({
+                chatId: job.chatId,
+                text: result,
+                markdown: true,
+              });
+              this.deadTargets.markAlive(job.chatId);
+            }
+          }
+        } catch (err) {
+          const permanent = this.deadTargets.recordError(job.chatId, err);
+          if (!permanent) {
+            const msg = err instanceof Error ? err.message : String(err);
+            await this.channel
+              .sendMessage({
+                chatId: job.chatId,
+                text: `Loop [${job.id}] failed: ${msg}`,
+              })
+              .catch(() => {});
+          }
         }
       }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      await this.channel
-        .sendMessage({
-          chatId: job.chatId,
-          text: `Loop [${job.id}] failed: ${msg}`,
-        })
-        .catch(() => {});
     } finally {
       this.inFlight.delete(id);
     }

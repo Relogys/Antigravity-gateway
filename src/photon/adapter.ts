@@ -50,6 +50,13 @@ const DEFAULT_HEARTBEAT_TIMEOUT_MS = 180 * 1000;
 
 const URL_RE = /https?:\/\/\S+/i;
 
+/** Unicode Object Replacement Character iMessage inserts for unsupported bubbles. */
+const OBJECT_REPLACEMENT_RE = /\uFFFC/g;
+
+function stripPlaceholders(value: string): string {
+  return value.replace(OBJECT_REPLACEMENT_RE, "");
+}
+
 function parsePositiveIntEnv(raw: string | undefined): number | undefined {
   if (!raw) {
     return undefined;
@@ -509,6 +516,8 @@ export class PhotonChannelAdapter implements ChannelAdapter {
     textParts: string[];
     attachments: InboundAttachment[];
     replyToMessageId?: string;
+    replyToText?: string;
+    replyToIsOwnMessage?: boolean;
     ignored: boolean;
   }> {
     if (rawContent.type === "reply") {
@@ -517,9 +526,15 @@ export class PhotonChannelAdapter implements ChannelAdapter {
         rawContent.content as Content,
         now,
       );
+      const target = rawContent.target;
+      const targetText = target ? this.extractPlainText(target.content) : "";
       return {
         ...nested,
-        replyToMessageId: rawContent.target.id,
+        replyToMessageId: target?.id ?? nested.replyToMessageId,
+        replyToText: nested.replyToText ?? (targetText || undefined),
+        replyToIsOwnMessage:
+          nested.replyToIsOwnMessage ??
+          (target?.direction === "outbound" ? true : undefined),
       };
     }
 
@@ -550,11 +565,16 @@ export class PhotonChannelAdapter implements ChannelAdapter {
 
     switch (rawContent.type) {
       case "text": {
-        if (URL_RE.test(rawContent.text)) {
+        const text = stripPlaceholders(rawContent.text);
+        if (!text.trim()) {
+          // Lone \ufffc placeholder bubbles carry no user content.
+          return { textParts: [], attachments: [], ignored: true };
+        }
+        if (URL_RE.test(text)) {
           this.rememberChatEntry(this.lastUrlAtByChatId, chatId, now);
         }
         return {
-          textParts: [rawContent.text],
+          textParts: [text],
           attachments: [],
           ignored: false,
         };
@@ -626,6 +646,41 @@ export class PhotonChannelAdapter implements ChannelAdapter {
       }
       default:
         return { textParts: [], attachments: [], ignored: true };
+    }
+  }
+
+  /** Best-effort plain text of a content tree, used to quote a replied-to message. */
+  private extractPlainText(content: Content | undefined): string {
+    if (!content) {
+      return "";
+    }
+    switch (content.type) {
+      case "text":
+        return stripPlaceholders(content.text).trim();
+      case "richlink":
+        return content.url?.trim() ?? "";
+      case "contact": {
+        const label =
+          content.name?.formatted ||
+          content.phones?.[0]?.value ||
+          content.emails?.[0]?.value ||
+          "";
+        return label.trim();
+      }
+      case "group": {
+        const parts: string[] = [];
+        for (const item of content.items) {
+          const text = this.extractPlainText(item.content as Content);
+          if (text) {
+            parts.push(text);
+          }
+        }
+        return parts.join("\n").trim();
+      }
+      case "reply":
+        return this.extractPlainText(content.content as Content);
+      default:
+        return "";
     }
   }
 
@@ -708,6 +763,8 @@ export class PhotonChannelAdapter implements ChannelAdapter {
       text: bodyText,
       attachments: extracted.attachments,
       replyToMessageId: extracted.replyToMessageId,
+      replyToText: extracted.replyToText,
+      replyToIsOwnMessage: extracted.replyToIsOwnMessage,
       timestamp: message.timestamp.getTime(),
       service,
       mentionsBot: isGroup ? this.matchesGroupMention(bodyText) : true,

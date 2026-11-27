@@ -120,7 +120,7 @@ PHOTON_PROBE_SPACE_ID=<a-photon-space-where-the-bot-is-active>
 What you get / 体验：
 
 - **Dual-layer heartbeat**: a transport heartbeat watchdog plus an application-level probe that catches half-open gRPC streams (see [FAQ](#photon-stops-replying-after-hours-idle--photon-闲置数小时后不再回复)).
-- **Hermes-grade lifecycle**: the inbound message is marked read (**已读**) → reacts **👀** while `agy` is working → **👍** on success / **👎** on error. Typing indicators refresh periodically on long turns.
+- **Read receipts & reactions**: the inbound message is marked read (**已读**) → reacts **👀** while `agy` is working → **👍** on success / **👎** on error. Typing indicators refresh periodically on long turns.
 - Images sent to the bot are downloaded and forwarded to `agy` as native image attachments.
 
 ### 2) Telegram (easiest, 0 public domain / 最简单)

@@ -16,6 +16,51 @@ const INIT_TIMEOUT_MS = 30_000;
 const STOP_GRACE_MS = 1500;
 const EFFORT_TOKENS = new Set(["low", "medium", "high", "xhigh", "max"]);
 
+const WINDOWS_RUNTIME_ENV_KEYS = [
+  "SYSTEMROOT",
+  "SystemRoot",
+  "COMSPEC",
+  "TEMP",
+  "TMP",
+  "PATHEXT",
+  "WINDIR",
+  "PATH",
+  "Path",
+] as const;
+
+/**
+ * Build a child-process env that keeps Windows runtime variables intact.
+ * Dropping SYSTEMROOT/TEMP makes Python agents fail with WinError 10106.
+ */
+export function buildChildProcessEnv(
+  baseEnv: NodeJS.ProcessEnv,
+  overrides: Record<string, string | undefined> = {},
+): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(baseEnv)) {
+    if (value !== undefined) {
+      env[key] = value;
+    }
+  }
+
+  for (const key of WINDOWS_RUNTIME_ENV_KEYS) {
+    const value = baseEnv[key];
+    if (value !== undefined) {
+      env[key] = value;
+    }
+  }
+
+  env.PYTHONUTF8 = baseEnv.PYTHONUTF8 ?? "1";
+
+  for (const [key, value] of Object.entries(overrides)) {
+    if (value !== undefined) {
+      env[key] = value;
+    }
+  }
+
+  return env;
+}
+
 export interface AgyAcpClientOptions {
   agyBin: string;
   defaultCwd: string;
@@ -184,10 +229,9 @@ export class AgyAcpClient {
       args.push(...this.options.extraArgs);
     }
 
-    const env: NodeJS.ProcessEnv = { ...process.env };
-    if (this.options.geminiApiKey) {
-      env.GEMINI_API_KEY = this.options.geminiApiKey;
-    }
+    const env = buildChildProcessEnv(process.env, {
+      GEMINI_API_KEY: this.options.geminiApiKey,
+    });
 
     const proc = spawn(this.options.agyBin, args, {
       cwd: this.options.defaultCwd,

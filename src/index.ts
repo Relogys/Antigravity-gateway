@@ -2,6 +2,7 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { AgyAgentBackend } from "./acp/sessions.js";
+import { createConversationSyncFromEnv } from "./acp/conversation-sync.js";
 import { MultiChannelHub } from "./channels/hub.js";
 import { createEnabledAdapters } from "./channels/registry.js";
 import { getEnabledChannelNames, loadConfig } from "./config.js";
@@ -11,6 +12,8 @@ import { GatewayStore } from "./gateway/store.js";
 import { HealthServer } from "./health.js";
 import { redactSecrets } from "./logger.js";
 import type { PendingPermission } from "./types.js";
+
+const CLEAN_SHUTDOWN_SENTINEL = ".clean_shutdown";
 
 function isProcessAlive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) {
@@ -60,6 +63,8 @@ async function releasePidLock(pidPath: string | null): Promise<void> {
 
 async function main(): Promise<void> {
   const config = loadConfig();
+  const burstDebounceMs = config.ingressDebounceMs;
+  const cleanShutdownPath = path.join(config.dataDir, CLEAN_SHUTDOWN_SENTINEL);
   const pidPath = await acquirePidLock(config.dataDir);
 
   let router: GatewayRouter | undefined;
@@ -76,6 +81,12 @@ async function main(): Promise<void> {
     shuttingDown = true;
     console.log(`[gateway] Received ${signal}; shutting down...`);
 
+    if (signal === "SIGINT" || signal === "SIGTERM") {
+      router?.stop();
+      await fsp
+        .writeFile(cleanShutdownPath, `${new Date().toISOString()}\n`, "utf8")
+        .catch(() => {});
+    }
     scheduler?.stop();
     await channel?.stop().catch(() => {});
     await backend?.stop().catch(() => {});
@@ -94,6 +105,11 @@ async function main(): Promise<void> {
     const store = new GatewayStore(config.dataDir);
     await store.load();
 
+    const previousHomeChatId = store.getHomeChatId();
+    // A known home chat without the sentinel means the last run never shut down cleanly.
+    const recoveredFromUncleanShutdown =
+      Boolean(previousHomeChatId) && !fs.existsSync(cleanShutdownPath);
+
     const { adapters, errors } = await createEnabledAdapters(config);
     for (const [name, reason] of Object.entries(errors)) {
       console.error(`[gateway] Channel "${name}" is configured but unavailable: ${reason}`);
@@ -104,16 +120,15 @@ async function main(): Promise<void> {
           "Set credentials for at least one channel in .env (see .env.example).",
       );
     }
-    const homeChatId = store.getHomeChatId();
-    if (homeChatId) {
+    if (previousHomeChatId) {
       const photonAdapter = adapters.find((a) => a.name === "photon") as
         | { seedProbeSpaceId?: (spaceId: string) => void }
         | undefined;
       if (photonAdapter?.seedProbeSpaceId) {
-        if (homeChatId.startsWith("photon::")) {
-          photonAdapter.seedProbeSpaceId(homeChatId.slice("photon::".length));
-        } else if (!homeChatId.includes("::")) {
-          photonAdapter.seedProbeSpaceId(homeChatId);
+        if (previousHomeChatId.startsWith("photon::")) {
+          photonAdapter.seedProbeSpaceId(previousHomeChatId.slice("photon::".length));
+        } else if (!previousHomeChatId.includes("::")) {
+          photonAdapter.seedProbeSpaceId(previousHomeChatId);
         }
       }
     }
@@ -143,6 +158,8 @@ async function main(): Promise<void> {
       backend,
       store,
       scheduler,
+      burstDebounceMs,
+      conversationSync: createConversationSyncFromEnv(),
     });
 
     if (config.healthEnabled) {
@@ -157,6 +174,21 @@ async function main(): Promise<void> {
     scheduler.start();
     await channel.start((msg) => router!.handleInbound(msg));
     router.markReady();
+
+    // Startup succeeded: clear any stale sentinel and tell the home chat we recovered.
+    await fsp.rm(cleanShutdownPath, { force: true }).catch(() => {});
+    if (recoveredFromUncleanShutdown && previousHomeChatId) {
+      await channel
+        .sendMessage({
+          chatId: previousHomeChatId,
+          text: `♻️ Antigravity Gateway recovered after unexpected restart (channels: ${channel.listChannelNames().join(", ")}).`,
+          markdown: true,
+        })
+        .catch(() => {});
+      console.log(
+        `[gateway] Sent unclean-restart recovery notice to ${previousHomeChatId}`,
+      );
+    }
 
     console.log(
       `[gateway] Antigravity gateway started (channels=${channel.listChannelNames().join(",")}, approval=${config.approvalMode}, allowlist=${config.allowedSenders.size}, paired=${store.listApprovedSenders().length})`,

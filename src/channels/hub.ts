@@ -4,6 +4,7 @@ import type {
   InboundMessage,
   OutboundMessage,
 } from "../types.js";
+import { SentMessageIndex } from "./sent-index.js";
 import { errorMessage } from "./utils.js";
 
 /** Separator between channel name and raw chat id in hub-qualified chat ids. */
@@ -62,6 +63,7 @@ export class MultiChannelHub implements ChannelAdapter {
   readonly name = "hub";
 
   private readonly entries = new Map<string, ChannelEntry>();
+  private readonly sentIndex = new SentMessageIndex();
   private readonly defaultChannel?: string;
   private readonly log: (message: string) => void;
   private handler?: InboundHandler;
@@ -179,6 +181,16 @@ export class MultiChannelHub implements ChannelAdapter {
       channel,
       chatId: qualifyChatId(channel, msg.chatId),
     };
+
+    this.sentIndex.record(channel, msg.chatId, msg.id, msg.text, false);
+    if (msg.replyToMessageId && !msg.replyToText) {
+      const referenced = this.sentIndex.lookup(channel, msg.chatId, msg.replyToMessageId);
+      if (referenced?.text) {
+        qualified.replyToText = referenced.text;
+        qualified.replyToIsOwnMessage = referenced.isOwnMessage;
+      }
+    }
+
     Promise.resolve()
       .then(() => handler(qualified))
       .catch((err) => {
@@ -225,6 +237,10 @@ export class MultiChannelHub implements ChannelAdapter {
       const result = await adapter.sendMessage({ ...msg, chatId: rawChatId });
       if (entry) {
         entry.lastOutboundAt = Date.now();
+      }
+      const sentId = result && typeof result === "object" ? result.messageId : undefined;
+      if (sentId && msg.text) {
+        this.sentIndex.record(channel, rawChatId, sentId, msg.text, true);
       }
       return result;
     } catch (err) {
