@@ -21,6 +21,7 @@ import {
   chunkText,
   closeHttpServer,
   configureHttpServerTimeouts,
+  extractAuthSchemeToken,
   isLoopbackHost,
   isMentioned,
   listenHttpServer,
@@ -141,9 +142,7 @@ function safeEqual(a: string, b: string): boolean {
 }
 
 function bearerTokenOf(header: string | string[] | undefined): string | undefined {
-  const value = Array.isArray(header) ? header[0] : header;
-  const match = /^Bearer\s+(.+)$/i.exec((value ?? "").trim());
-  return match ? (match[1] as string).trim() : undefined;
+  return extractAuthSchemeToken(header, "Bearer");
 }
 
 interface ParsedJwt {

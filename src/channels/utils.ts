@@ -369,6 +369,34 @@ export function isLoopbackHost(host: string): boolean {
   return h === "localhost" || h === "::1" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
 }
 
+/**
+ * Extract `<token>` from an HTTP Authorization header like `Bearer <token>` or
+ * `HMAC <base64>` in strict O(n) linear time without backtracking regexes.
+ */
+export function extractAuthSchemeToken(
+  header: string | string[] | undefined,
+  scheme: string,
+): string | undefined {
+  const raw = Array.isArray(header) ? header[0] : header;
+  if (typeof raw !== "string") {
+    return undefined;
+  }
+  const trimmed = raw.trim();
+  const prefixLen = scheme.length;
+  if (trimmed.length <= prefixLen + 1) {
+    return undefined;
+  }
+  if (trimmed.slice(0, prefixLen).toLowerCase() !== scheme.toLowerCase()) {
+    return undefined;
+  }
+  const sep = trimmed.charCodeAt(prefixLen);
+  if (sep !== 0x20 && sep !== 0x09) {
+    return undefined;
+  }
+  const token = trimmed.slice(prefixLen + 1).trim();
+  return token.length > 0 ? token : undefined;
+}
+
 /** Parse a request URL against localhost, throwing `onInvalid()` on malformed paths. */
 export function parseRequestUrl(rawUrl: string | undefined, onInvalid: () => Error): URL {
   try {

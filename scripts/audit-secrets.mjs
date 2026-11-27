@@ -28,6 +28,38 @@ function stripSurroundingQuotes(raw) {
   return raw;
 }
 
+function isExampleDomain(hostname) {
+  const lower = hostname.trim().toLowerCase().replace(/\.+$/, "");
+  return (
+    lower === "example.com" ||
+    lower.endsWith(".example.com") ||
+    lower === "example.org" ||
+    lower.endsWith(".example.org")
+  );
+}
+
+/**
+ * True only when `value` is a genuine RFC 2606 placeholder URL, email, or host
+ * (never matches substrings like `https://example.com.attacker.net`).
+ */
+function isPlaceholderDomainValue(value) {
+  const trimmed = value.trim();
+  if (!trimmed) return false;
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)) {
+    try {
+      const parsed = new URL(trimmed);
+      return isExampleDomain(parsed.hostname);
+    } catch {
+      return false;
+    }
+  }
+  const atIdx = trimmed.lastIndexOf("@");
+  if (atIdx > 0 && atIdx < trimmed.length - 1) {
+    return isExampleDomain(trimmed.slice(atIdx + 1));
+  }
+  return isExampleDomain(trimmed);
+}
+
 /**
  * If a local `.env` exists, collect its real secret/PII values in memory (never printed)
  * so we also catch accidental literal leaks anywhere in trackable files.
@@ -54,15 +86,14 @@ function loadLocalEnvLiterals(repoRoot) {
     if (listKeys.test(key)) {
       for (const item of val.split(",")) {
         const token = stripSurroundingQuotes(item.trim());
-        if (token.length >= 6 && !token.includes("example.com") && token !== "+15550001111") {
+        if (token.length >= 6 && !isPlaceholderDomainValue(token) && token !== "+15550001111") {
           literals.push({ key, token });
         }
       }
     } else if (
       val.length >= 8 &&
       !/^your-/i.test(val) &&
-      !val.includes("example.com") &&
-      !val.includes("example.org")
+      !isPlaceholderDomainValue(val)
     ) {
       literals.push({ key, token: val });
     }

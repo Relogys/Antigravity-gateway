@@ -164,9 +164,9 @@ async function main(): Promise<void> {
     if (config.healthEnabled) {
       healthServer = new HealthServer(config, () => router!.getHealthSnapshot());
       await healthServer.start();
-      console.log(
-        `[gateway] Health endpoint listening on http://${config.healthHost}:${config.healthPort}/healthz`,
-      );
+      const bound = healthServer.getBoundAddress();
+      const endpoint = bound ? `http://${bound.host}:${bound.port}/healthz` : "/healthz";
+      console.log(`[gateway] Health endpoint listening on ${endpoint}`);
     }
 
     await backend.start();
@@ -189,8 +189,16 @@ async function main(): Promise<void> {
       );
     }
 
+    const approvalLabel =
+      config.approvalMode === "auto"
+        ? "auto"
+        : config.approvalMode === "sandbox"
+          ? "sandbox"
+          : "interactive";
+    const allowlistCount = Math.max(0, Math.floor(Number(config.allowedSenders.size)));
+    const pairedCount = store.listApprovedSenders().length;
     console.log(
-      `[gateway] Antigravity gateway started (channels=${channel.listChannelNames().join(",")}, approval=${config.approvalMode}, allowlist=${config.allowedSenders.size}, paired=${store.listApprovedSenders().length})`,
+      `[gateway] Antigravity gateway started (channels=${channel.listChannelNames().join(",")}, approval=${approvalLabel}, allowlist=${allowlistCount}, paired=${pairedCount})`,
     );
   } catch (err) {
     await shutdown("startup-error");

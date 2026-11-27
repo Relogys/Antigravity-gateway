@@ -1,18 +1,15 @@
 import crypto from "node:crypto";
 import http from "node:http";
-import { isLoopbackHost } from "./channels/utils.js";
+import { extractAuthSchemeToken, isLoopbackHost } from "./channels/utils.js";
 import type { GatewayConfig } from "./config.js";
 import { redactSecrets } from "./logger.js";
 import type { HealthSnapshot } from "./types.js";
 
 function verifyBearerToken(req: http.IncomingMessage, expectedToken: string): boolean {
-  const raw = req.headers.authorization;
-  const header = Array.isArray(raw) ? (raw[0] ?? "") : (raw ?? "");
-  const match = /^Bearer\s+(.+)$/i.exec(header.trim());
-  if (!match) {
+  const provided = extractAuthSchemeToken(req.headers.authorization, "Bearer");
+  if (!provided) {
     return false;
   }
-  const provided = match[1].trim();
   const a = crypto.createHash("sha256").update(provided).digest();
   const b = crypto.createHash("sha256").update(expectedToken).digest();
   return crypto.timingSafeEqual(a, b);
@@ -286,6 +283,14 @@ export class HealthServer {
     const addr = this.server?.address();
     if (addr && typeof addr === "object") {
       return addr.port;
+    }
+    return null;
+  }
+
+  getBoundAddress(): { host: string; port: number } | null {
+    const addr = this.server?.address();
+    if (addr && typeof addr === "object") {
+      return { host: addr.address, port: addr.port };
     }
     return null;
   }

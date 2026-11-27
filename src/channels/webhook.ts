@@ -16,6 +16,7 @@ import {
   closeHttpServer,
   configureHttpServerTimeouts,
   errorMessage,
+  extractAuthSchemeToken,
   isLoopbackHost,
   listenHttpServer,
   parseRequestUrl,
@@ -248,9 +249,8 @@ export class WebhookChannelAdapter extends BaseChannelAdapter {
     if (!token) {
       return true;
     }
-    const header = req.headers.authorization ?? "";
-    const m = /^Bearer\s+(.+)$/i.exec(header);
-    return Boolean(m) && safeEqual((m as RegExpExecArray)[1].trim(), token);
+    const provided = extractAuthSchemeToken(req.headers.authorization, "Bearer");
+    return provided !== undefined && safeEqual(provided, token);
   }
 
   private headerValue(req: http.IncomingMessage, name: string): string | undefined {

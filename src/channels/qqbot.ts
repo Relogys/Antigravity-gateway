@@ -351,7 +351,20 @@ export class QQBotChannelAdapter extends BaseChannelAdapter {
 
   private startHeartbeat(intervalMs: number, ws: QQBotSocketLike, signal: AbortSignal): void {
     this.clearHeartbeat();
-    const delay = Math.max(1000, intervalMs || this.options.defaultHeartbeatMs || 45_000);
+    const MIN_HEARTBEAT_MS = 1_000;
+    const MAX_HEARTBEAT_MS = 300_000;
+    const defaultMs = this.options.defaultHeartbeatMs ?? 45_000;
+    const boundedDefault = Math.min(MAX_HEARTBEAT_MS, Math.max(MIN_HEARTBEAT_MS, Math.trunc(defaultMs)));
+    // Reject non-finite or out-of-range remote intervals to prevent timer overflow / resource exhaustion.
+    let delay = boundedDefault;
+    if (
+      typeof intervalMs === "number" &&
+      Number.isFinite(intervalMs) &&
+      intervalMs >= MIN_HEARTBEAT_MS &&
+      intervalMs <= MAX_HEARTBEAT_MS
+    ) {
+      delay = Math.trunc(intervalMs);
+    }
     const heartbeat = () => {
       if (signal.aborted || ws.readyState !== WS_OPEN) {
         return;
@@ -434,8 +447,12 @@ export class QQBotChannelAdapter extends BaseChannelAdapter {
         if (signal.aborted || this.socket !== ws) {
           return false;
         }
-        const interval = Number(frame.d?.heartbeat_interval);
-        this.startHeartbeat(Number.isFinite(interval) ? interval : this.options.defaultHeartbeatMs ?? 45_000, ws, signal);
+        const rawInterval = Number(frame.d?.heartbeat_interval);
+        const safeInterval =
+          Number.isFinite(rawInterval) && rawInterval >= 1_000 && rawInterval <= 300_000
+            ? Math.trunc(rawInterval)
+            : (this.options.defaultHeartbeatMs ?? 45_000);
+        this.startHeartbeat(safeInterval, ws, signal);
         this.sendIdentify(ws, token);
         this.setConnected(true);
         return true;

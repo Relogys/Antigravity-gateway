@@ -8,6 +8,7 @@ import {
   chunkText,
   closeHttpServer,
   configureHttpServerTimeouts,
+  extractAuthSchemeToken,
   isLoopbackHost,
   isMentioned,
   listenHttpServer,
@@ -64,11 +65,11 @@ export function verifyTeamsHmac(
   if (!webhookSecret || !authorizationHeader.trim()) {
     return false;
   }
-  const match = /^HMAC\s+(.+)$/i.exec(authorizationHeader.trim());
-  if (!match) {
+  const encoded = extractAuthSchemeToken(authorizationHeader, "HMAC");
+  if (!encoded) {
     return false;
   }
-  const provided = Buffer.from(match[1].trim(), "base64");
+  const provided = Buffer.from(encoded, "base64");
   if (provided.length === 0) {
     return false;
   }

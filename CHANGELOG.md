@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## [0.4.1] - 2026-11-26
+
+### Security (Zero CodeQL High Alerts)
+
+- **Eliminated polynomial ReDoS in HTTP Authorization parsers**: Replaced backtracking `/^(Bearer|HMAC)\s+(.+)$/i` regexes across `HealthServer`, `Webhook`, `Microsoft Teams`, and `Google Chat` with a shared linear-time `O(n)` `extractAuthSchemeToken()` helper in `src/channels/utils.ts` (resolves CodeQL `#1`, `#2`, `#3`, `#11`).
+- **Bounded remote QQBot heartbeat intervals**: Enforced strict `[1s, 300s]` finite bounds on remote `heartbeat_interval` frames in `src/channels/qqbot.ts` so hostile or overflowed server intervals cannot cause 32-bit `setInterval` timer exhaustion (resolves CodeQL `#4`).
+- **Hardened secret-audit placeholder domain checks**: Replaced `.includes("example.com")` / `.includes("example.org")` substring checks in `scripts/audit-secrets.mjs` with exact RFC 2606 parsed URL hostname / email domain matching so lookalike hosts like `https://example.com.attacker.net` can never bypass leak scanning (resolves CodeQL `#8`, `#9`, `#10`).
+- **Clean startup log taint isolation**: Logged the OS-bound socket address from `HealthServer.getBoundAddress()` and explicit approval mode label constants in `src/index.ts` instead of raw environment-derived fields (resolves CodeQL `#6`, `#7`).
+- **Docs-only CI matrix fix**: Incorporated PR `#9` so `Node 22` and `Node 24` status checks always report cleanly on Markdown-only PRs.
+
 ## [0.4.0] - 2026-11-26
 
 ### Session Reliability & Real-World Gateway Hardening
