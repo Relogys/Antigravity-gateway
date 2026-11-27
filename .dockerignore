@@ -1,0 +1,28 @@
+# Git & CI metadata
+.git
+.gitignore
+.github
+
+# Secrets — never bake a real .env into an image
+.env
+.env.*
+!.env.example
+
+# Dependencies & build output (rebuilt inside the image)
+node_modules
+dist
+coverage
+
+# Runtime state
+data
+logs
+*.log
+*.pid
+*.lock
+
+# Not needed at build time
+tests
+docs
+README.md
+SECURITY.md
+CHANGELOG.md

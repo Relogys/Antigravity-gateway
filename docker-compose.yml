@@ -1,0 +1,54 @@
+# Antigravity Gateway — loopback-only Docker Compose deployment.
+#
+#   1. cp .env.example .env     # fill in at least one channel
+#   2. docker compose up -d --build
+#   3. curl http://127.0.0.1:18790/healthz
+#
+# `agy` is not bundled in the image: mount an existing `agy` binary and its
+# credentials into the container (see the commented volume below), or set
+# GEMINI_API_KEY in .env. Details: docs/QUICKSTART.md § "Docker / 容器部署".
+#
+# Linux: make the data directory writable by the container's UID 1000 first:
+#   mkdir -p data && sudo chown -R 1000:1000 data
+
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: antigravity-gateway:latest
+    container_name: antigravity-gateway
+    restart: unless-stopped
+
+    volumes:
+      # Read-only configuration. Create it first: cp .env.example .env
+      - ./.env:/app/.env:ro
+      # Persisted sessions, pairings, loops, and the PID file.
+      - ./data:/app/data
+      # Optional: mount an existing `agy` CLI instead of using GEMINI_API_KEY.
+      # Adjust the source paths for your environment, then uncomment:
+      # - /path/to/agy:/usr/local/bin/agy:ro
+      # - /path/to/agy-credentials:/home/node/<agy-config-dir>:ro
+
+    environment:
+      # Container-internal health server, so the HEALTHCHECK and the published
+      # loopback port both work. The host binding below is still 127.0.0.1.
+      HEALTH_ENABLED: "true"
+      HEALTH_HOST: "0.0.0.0"
+      HEALTH_PORT: "18790"
+
+    ports:
+      # Health/status only — loopback on the host, never public.
+      - "127.0.0.1:18790:18790"
+      # Callback receivers (webhook 18791, wecom 18792, line 18793,
+      # whatsapp 18794, teams 18795, googlechat 18796) stay on loopback inside
+      # the container. To use one, set its *_HOST to 0.0.0.0, publish only to
+      # host loopback, and front it with a TLS tunnel. Example:
+      # - "127.0.0.1:18794:18794"
+
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:18790/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s

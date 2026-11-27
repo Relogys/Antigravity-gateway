@@ -26,6 +26,7 @@ import {
 } from "./utils.js";
 
 const MATRIX_TEXT_LIMIT = 4000;
+const MAX_TRACKED_REACTIONS = 500;
 
 export interface MatrixAdapterOptions {
   fetchImpl?: typeof fetch;
@@ -69,6 +70,10 @@ export class MatrixChannelAdapter extends BaseChannelAdapter {
   private readonly groupMentionPatterns: string[];
   private readonly dedupe = new BoundedDedupeCache();
   private readonly directRooms = new Set<string>();
+  private readonly reactionsByMessageId = new Map<
+    string,
+    { emoji: string; eventId?: string }
+  >();
 
   private selfUserId: string;
   private since?: string;
@@ -117,6 +122,7 @@ export class MatrixChannelAdapter extends BaseChannelAdapter {
       await loop.catch(() => undefined);
     }
     this.handler = undefined;
+    this.reactionsByMessageId.clear();
     this.setConnected(false);
   }
 
@@ -172,13 +178,49 @@ export class MatrixChannelAdapter extends BaseChannelAdapter {
   }
 
   async react(chatId: string, messageId: string, emoji: string): Promise<void> {
-    await this.sendRoomEvent(chatId, "m.reaction", {
-      "m.relates_to": {
-        rel_type: "m.annotation",
-        event_id: messageId,
-        key: emoji,
-      },
-    });
+    const key = `${chatId}|${messageId}`;
+    const previous = this.reactionsByMessageId.get(key);
+    if (previous?.emoji === emoji) {
+      return;
+    }
+    try {
+      if (previous?.eventId) {
+        // Redact the old annotation so 👀 -> 👍/👎/🛑 reads as one clean reaction.
+        await this.redactEvent(chatId, previous.eventId).catch(() => undefined);
+      }
+      const eventId = await this.sendRoomEvent(chatId, "m.reaction", {
+        "m.relates_to": {
+          rel_type: "m.annotation",
+          event_id: messageId,
+          key: emoji,
+        },
+      });
+      this.rememberReaction(key, { emoji, eventId });
+    } catch (err) {
+      this.noteError(err);
+    }
+  }
+
+  async markRead(chatId: string, messageId?: string): Promise<void> {
+    if (!messageId) {
+      return;
+    }
+    try {
+      const res = await this.fetchImpl(
+        `${this.hsUrl()}/_matrix/client/v3/rooms/${encodeURIComponent(chatId)}/receipt/m.read/${encodeURIComponent(messageId)}`,
+        {
+          method: "POST",
+          headers: this.authHeaders({ "Content-Type": "application/json" }),
+          body: JSON.stringify({}),
+          signal: AbortSignal.timeout(15_000),
+        },
+      );
+      if (!res.ok) {
+        throw new Error(`Matrix read receipt failed with HTTP ${res.status}`);
+      }
+    } catch (err) {
+      this.noteError(err);
+    }
   }
 
   private async ensureIdentity(): Promise<void> {
@@ -458,6 +500,37 @@ export class MatrixChannelAdapter extends BaseChannelAdapter {
     }
     const body = (await res.json().catch(() => ({}))) as { event_id?: string };
     return body.event_id;
+  }
+
+  private async redactEvent(roomId: string, eventId: string): Promise<void> {
+    const txnId = `${Date.now()}.${this.txnCounter++}`;
+    const res = await this.fetchImpl(
+      `${this.hsUrl()}/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/redact/${encodeURIComponent(eventId)}/${txnId}`,
+      {
+        method: "PUT",
+        headers: this.authHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify({}),
+        signal: AbortSignal.timeout(15_000),
+      },
+    );
+    if (!res.ok) {
+      throw new Error(`Matrix redaction failed with HTTP ${res.status}`);
+    }
+  }
+
+  private rememberReaction(
+    key: string,
+    entry: { emoji: string; eventId?: string },
+  ): void {
+    this.reactionsByMessageId.delete(key);
+    this.reactionsByMessageId.set(key, entry);
+    while (this.reactionsByMessageId.size > MAX_TRACKED_REACTIONS) {
+      const oldest = this.reactionsByMessageId.keys().next().value;
+      if (oldest === undefined) {
+        break;
+      }
+      this.reactionsByMessageId.delete(oldest);
+    }
   }
 
   private async uploadAttachment(

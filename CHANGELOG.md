@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+#### Wave 5 & Wave 6 — Onboarding, reliability & containers
+
+- Photon iMessage **dual-layer heartbeat**: a transport heartbeat watchdog
+  (`PHOTON_HEARTBEAT_TIMEOUT_MS`, default `180000`) combined with an
+  application-level probe (`PHOTON_PROBE_SPACE_ID`) and zombie-inbound
+  detection, so half-open gRPC streams are detected and reconnected after long
+  idle periods.
+- **Daemon lifecycle CLI**: `pnpm cli start | stop | restart | logs` with a PID
+  file, stale-lock cleanup, graceful `SIGTERM` (with a Windows `taskkill`
+  fallback), background log capture, and foreground mode.
+- Crash-backoff supervisor `scripts/start-gateway.ps1` (2s→60s exponential
+  restart delay, 5 MB log rotation) and Windows Scheduled Task autostart via
+  `scripts/install-task.ps1`.
+- Rotating, redacting file logger (`RotatingFileLogger`): size-based rotation
+  (`gateway.log` → `.1` → `.3`) that masks bearer tokens, Slack/Discord/Telegram
+  tokens, provider API keys, and Spectrum project secrets before writing.
+- **Cross-channel inbound image bridge**: images from Photon, Telegram,
+  Discord, WhatsApp, and Matrix are downloaded, cached, and forwarded to `agy`
+  as native image attachments; the outbound media guard still blocks
+  `.env*`/`.ssh`/private-key paths.
+- Hermes-grade **reaction lifecycle and read receipts**: `已读` (read) → `👀`
+  while working → `👍` on success / `👎` on error, with periodically refreshed
+  typing indicators during long turns.
+- Interactive first-run onboarding wizard entry point (`pnpm setup`, alias
+  `pnpm cli init`) with a documented manual fallback (`pnpm install` +
+  `.env.example`).
+- `docs/QUICKSTART.md`: bilingual 3-minute quick start, per-platform credential
+  recipes (Photon, Telegram, Discord, Slack, Feishu/Lark, DingTalk, OneBot, plus
+  WhatsApp/Teams/Signal/Matrix/Webhook pointers), a daily-operations cheat
+  sheet, and a troubleshooting FAQ.
+- **Docker support**: multi-stage `Dockerfile` on `node:24-slim` (corepack
+  pnpm, frozen-lockfile install, non-root `node` user, `/healthz`
+  `HEALTHCHECK`), `docker-compose.yml` (read-only `.env`, `./data` volume,
+  loopback-only `127.0.0.1:18790`, `restart: unless-stopped`), and
+  `.dockerignore`.
+
+#### CI, documentation & cross-channel tests
+
 - GitHub Actions CI workflow (`.github/workflows/ci.yml`) that runs on pushes to
   `main` and on pull requests, on a Node.js `[22, 24]` matrix with pnpm caching.
   Each job installs from the frozen lockfile, then runs typecheck, build, the
@@ -20,6 +58,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Cross-channel test coverage (`tests/multichannel-20.test.ts`) asserting that
   all 20 channels enable, construct, isolate their allowlists, round-trip
   qualified chat ids, and route outbound/inbound messages through the hub.
+
+### Changed
+
+- Redesigned the README top-level Quick Start around a 4-step copy-paste
+  onboarding flow (`pnpm setup` → `pnpm build` → `pnpm cli doctor` →
+  `pnpm cli start`), with a prominent link to `docs/QUICKSTART.md`, a Docker
+  subsection, and a summary of the new read-receipt, heartbeat, image-vision,
+  daemon CLI, and container capabilities.
 
 ### Security
 

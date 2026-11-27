@@ -573,6 +573,35 @@ export class WhatsAppChannelAdapter extends BaseChannelAdapter {
     return lastMessageId ? { messageId: lastMessageId } : undefined;
   }
 
+  async markRead(chatId: string, messageId?: string): Promise<void> {
+    if (!messageId) {
+      return;
+    }
+    try {
+      await this.postGraphMessage({
+        messaging_product: "whatsapp",
+        status: "read",
+        message_id: messageId,
+      });
+    } catch (err) {
+      this.noteError(err);
+    }
+  }
+
+  async react(chatId: string, messageId: string, emoji: string): Promise<void> {
+    try {
+      await this.postGraphMessage({
+        messaging_product: "whatsapp",
+        recipient_type: "individual",
+        to: chatId,
+        type: "reaction",
+        reaction: { message_id: messageId, emoji },
+      });
+    } catch (err) {
+      this.noteError(err);
+    }
+  }
+
   private async resolveOutboundMedia(
     msg: OutboundMessage & WhatsAppSendExtensions,
   ): Promise<ResolvedWhatsAppMedia | undefined> {

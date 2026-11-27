@@ -107,6 +107,7 @@ export class MultiChannelHub implements ChannelAdapter {
         connected: entry.adapter.isConnected(),
         lastInboundAt: maxDefined(stats.lastInboundAt, entry.lastInboundAt),
         lastOutboundAt: maxDefined(stats.lastOutboundAt, entry.lastOutboundAt),
+        lastHeartbeatAt: stats.lastHeartbeatAt,
         lastError: stats.lastError ?? entry.lastError ?? entry.startError,
       };
     }

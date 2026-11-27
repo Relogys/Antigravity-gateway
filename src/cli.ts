@@ -19,6 +19,7 @@ import {
 import { GatewayStore } from "./gateway/store.js";
 import { tailLogFile } from "./logger.js";
 import type { HealthSnapshot } from "./types.js";
+import { runSetupWizard } from "./wizard.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -99,19 +100,22 @@ function printUsage(): void {
   console.log(`Antigravity Gateway Admin CLI
 
 Usage:
-  pnpm cli pair list              List pending pairing codes & approved senders
-  pnpm cli pair approve <CODE>    Approve a pending 8-character pairing code
-  pnpm cli pair revoke <sender>   Revoke an approved sender
-  pnpm cli pair clear             Clear all pending pairing requests
-  pnpm cli status                 Show live health endpoint + local store summary
-  pnpm cli usage                  Check Antigravity quota (0 model tokens)
-  pnpm cli doctor                 Run environment & connectivity diagnostics (lists all channels)
-  pnpm cli send --channel <name> --to <chatId> <text>
-                                  Send a one-off message through a configured channel
+  pnpm cli init [--yes] [--channels 1,2]
+                                  Interactive first-time setup wizard (writes .env safely)
+  pnpm cli setup                  Alias for 'pnpm cli init' (also: pnpm setup)
   pnpm cli start [--foreground]   Start the gateway (detached unless --foreground)
   pnpm cli stop                   Stop the running gateway (data/gateway.pid)
   pnpm cli restart                Restart the gateway (stop + start)
   pnpm cli logs [-n <lines>]      Tail logs/gateway.log (default ${CLI_DEFAULT_TAIL_LINES} lines)
+  pnpm cli status                 Show live health endpoint + local store summary
+  pnpm cli doctor                 Run environment & connectivity diagnostics (lists all channels)
+  pnpm cli usage                  Check Antigravity quota (0 model tokens)
+  pnpm cli pair list              List pending pairing codes & approved senders
+  pnpm cli pair approve <CODE>    Approve a pending 8-character pairing code
+  pnpm cli pair revoke <sender>   Revoke an approved sender
+  pnpm cli pair clear             Clear all pending pairing requests
+  pnpm cli send --channel <name> --to <chatId> <text>
+                                  Send a one-off message through a configured channel
 `);
 }
 
@@ -429,9 +433,57 @@ async function runSendCommand(args: string[]): Promise<number> {
   }
 }
 
+function formatDuration(ms: number): string | null {
+  if (!Number.isFinite(ms) || ms < 0) {
+    return null;
+  }
+  const seconds = Math.round(ms / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours}h`;
+  return `${Math.round(hours / 24)}d`;
+}
+
+function formatAge(ms: number): string {
+  const duration = formatDuration(ms);
+  return duration === null ? "unknown age" : `${duration} ago`;
+}
+
+async function runInitCommand(args: string[]): Promise<number> {
+  let nonInteractive = false;
+  let presetChannels: string[] | undefined;
+  let envPath: string | undefined;
+
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i] ?? "";
+    if (arg === "--non-interactive" || arg === "--yes" || arg === "-y") {
+      nonInteractive = true;
+    } else if (arg === "--channels" || arg === "--channel") {
+      presetChannels = (args[++i] ?? "")
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+    } else if (arg === "--env") {
+      envPath = args[++i];
+    } else if (arg === "--help" || arg === "-h") {
+      printUsage();
+      return 0;
+    } else {
+      console.error(`Unknown init option: ${arg}`);
+      return 1;
+    }
+  }
+
+  await runSetupWizard({ nonInteractive, presetChannels, envPath });
+  return 0;
+}
+
 async function runDoctorCommand(): Promise<number> {
   const info = getSafeEnvPaths();
   let issues = 0;
+  const hints = new Set<string>();
 
   // 1. Node version
   const major = Number.parseInt(process.versions.node.split(".")[0] ?? "0", 10);
@@ -440,22 +492,27 @@ async function runDoctorCommand(): Promise<number> {
   } else {
     console.log(`[FAIL] Node.js ${process.version} (requires >=22.0.0)`);
     issues++;
+    hints.add("Install Node.js >=22: https://nodejs.org/en/download");
   }
 
   // 2. .env presence & required keys (no secret values printed!)
-  const envExists = fs.existsSync(path.resolve(process.cwd(), ".env"));
+  const envPath = path.resolve(process.cwd(), ".env");
+  const envExists = fs.existsSync(envPath);
   if (!envExists) {
-    console.log("[WARN] .env file missing in workspace root (copy .env.example to .env)");
+    console.log(`[WARN] .env file missing in workspace root (${envPath})`);
+    hints.add("Run 'pnpm setup' (or 'pnpm cli init') for interactive setup");
   }
   if (!info.config) {
     console.log("[FAIL] Configuration failed to load (check .env values)");
     issues++;
+    hints.add("Fix invalid values in .env, or re-run 'pnpm setup' to regenerate it");
   }
   if (info.enabledChannels.length > 0) {
     console.log(`[OK] ${info.enabledChannels.length}/${CHANNEL_NAMES.length} channel(s) configured`);
   } else {
     console.log("[FAIL] No channels configured (set credentials for at least one channel)");
     issues++;
+    hints.add("Run 'pnpm setup' and choose at least one channel (e.g. Photon or Telegram)");
   }
   for (const name of CHANNEL_NAMES) {
     const enabled = info.enabledChannels.includes(name);
@@ -475,6 +532,9 @@ async function runDoctorCommand(): Promise<number> {
       `[FAIL] Unable to run '${info.agyBin} --version': ${err instanceof Error ? err.message : String(err)}`,
     );
     issues++;
+    hints.add(
+      "Install the Antigravity CLI (agy): https://antigravity.google/docs/getting-started (then re-run 'pnpm cli doctor')",
+    );
   }
 
   // 4. Zero-token /usage check
@@ -487,6 +547,7 @@ async function runDoctorCommand(): Promise<number> {
     console.log(`[OK] GEMINI_API_KEY set (${quota.error ?? "quota endpoint disabled in API key mode"})`);
   } else {
     console.log(`[WARN] agy /usage unavailable: ${quota.error ?? "unknown"}`);
+    hints.add("Sign in to agy ('agy' then choose a login method), or run 'pnpm cli usage' to re-check");
   }
 
   // 5. Allowlist & pairing
@@ -502,31 +563,84 @@ async function runDoctorCommand(): Promise<number> {
     console.log(
       `[WARN] Allowlist is empty (fail-closed; DMs will receive pairing codes, ${pendingCount} pending)`,
     );
+    hints.add(
+      "Approve a sender with 'pnpm cli pair list' + 'pnpm cli pair approve <CODE>', or set ALLOWED_SENDERS in .env",
+    );
   }
 
-  // 6. Health port & PID lock
+  // 6. Health server, live status, and per-channel state
   if (info.healthEnabled) {
     const live = await fetchLiveStatus(info.healthHost, info.healthPort);
     if (live) {
-      console.log(`[OK] Health server live at http://${info.healthHost}:${info.healthPort}/status`);
+      console.log(
+        `[OK] Health server live at http://${info.healthHost}:${info.healthPort}/status (uptime ${formatDuration(live.uptimeMs) ?? "unknown"})`,
+      );
+      const channelEntries = Object.entries(live.channels ?? {});
+      let anyDisconnected = false;
+      if (channelEntries.length > 0) {
+        console.log("  Live channel state:");
+        for (const [name, status] of channelEntries) {
+          const parts: string[] = [status.connected ? "connected" : "disconnected"];
+          if (typeof status.lastHeartbeatAt === "number") {
+            parts.push(`heartbeat ${formatAge(Date.now() - status.lastHeartbeatAt)}`);
+          }
+          if (status.lastError) {
+            parts.push(`error: ${status.lastError}`);
+          }
+          console.log(
+            `    ${status.connected ? "[OK]  " : "[WARN]"} ${name.padEnd(12)} ${parts.join(" | ")}`,
+          );
+          if (!status.connected) {
+            anyDisconnected = true;
+          }
+        }
+      }
+      if (anyDisconnected) {
+        hints.add("Inspect channel connection errors with 'pnpm cli logs'");
+      }
+      if (live.lastError) {
+        console.log(`[WARN] Gateway reported: ${live.lastError}`);
+        hints.add("Review the error above and run 'pnpm cli logs'");
+      }
     } else {
       const free = await isPortAvailable(info.healthHost, info.healthPort);
-      console.log(
-        free
-          ? `[OK] Health port ${info.healthHost}:${info.healthPort} is available`
-          : `[WARN] Health port ${info.healthHost}:${info.healthPort} is already in use`,
-      );
+      if (free) {
+        console.log(
+          `[OK] Health endpoint configured on http://${info.healthHost}:${info.healthPort}/status (gateway not running)`,
+        );
+      } else {
+        console.log(
+          `[WARN] Health port ${info.healthHost}:${info.healthPort} is in use but /status is unreachable`,
+        );
+        hints.add("Stop the process using the health port, or change HEALTH_PORT in .env");
+      }
     }
   } else {
     console.log("[OK] Health endpoint disabled (HEALTH_ENABLED=false)");
+    hints.add("Set HEALTH_ENABLED=true in .env to use 'pnpm cli status'");
   }
 
+  // 7. Live daemon PID
   const pidFile = path.join(info.dataDir, "gateway.pid");
-  if (fs.existsSync(pidFile)) {
-    const rawPid = fs.readFileSync(pidFile, "utf8").trim();
-    console.log(`[INFO] PID lock file present (${pidFile}, pid=${rawPid})`);
+  const daemonPid = readPidFile(pidFile);
+  if (daemonPid !== null && isPidAlive(daemonPid)) {
+    console.log(`[OK] Background gateway running (PID ${daemonPid}, ${pidFile})`);
+  } else if (daemonPid !== null) {
+    console.log(`[WARN] Stale gateway.pid (PID ${daemonPid} is not alive)`);
+    hints.add("Run 'pnpm cli stop' to clear the stale PID file, then 'pnpm cli start'");
+  } else if (fs.existsSync(pidFile)) {
+    console.log(`[WARN] Invalid gateway.pid contents (${pidFile})`);
+    hints.add("Run 'pnpm cli stop' to clean up the PID file");
   } else {
-    console.log("[OK] No stale gateway.pid lock");
+    console.log("[INFO] Background gateway stopped (no data/gateway.pid)");
+    console.log("       Run 'pnpm cli start' to start background gateway");
+  }
+
+  if (hints.size > 0) {
+    console.log("\nSuggested fixes:");
+    for (const hint of hints) {
+      console.log(`  - ${hint}`);
+    }
   }
 
   return issues === 0 ? 0 : 1;
@@ -746,6 +860,10 @@ async function main(): Promise<void> {
 
   let exitCode = 0;
   switch (cmd) {
+    case "init":
+    case "setup":
+      exitCode = await runInitCommand(args.slice(1));
+      break;
     case "pair":
       exitCode = await runPairCommand(args.slice(1), info.dataDir);
       break;

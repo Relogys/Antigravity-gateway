@@ -38,6 +38,7 @@ const DEDUPE_TTL_MS = 48 * 60 * 60 * 1000;
 const DEDUPE_MAX_ENTRIES = 4000;
 const MAX_CACHED_MESSAGES = 1000;
 const MAX_CHAT_CACHE = 2000;
+const MAX_ACTIVE_REACTIONS = 500;
 const MAX_INLINE_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 const RICH_LINK_SUPPRESS_WINDOW_MS = 30 * 1000;
 const TYPING_COOLDOWN_MS = 5 * 1000;
@@ -140,6 +141,15 @@ function resolveEffectId(name: string | undefined): IMessageMessageEffect | unde
   return undefined;
 }
 
+interface ReactionHandle {
+  unsend?: () => Promise<unknown>;
+}
+
+interface ActiveReaction {
+  emoji: string;
+  handle?: ReactionHandle;
+}
+
 export class PhotonChannelAdapter implements ChannelAdapter {
   readonly name = "photon";
 
@@ -171,6 +181,7 @@ export class PhotonChannelAdapter implements ChannelAdapter {
   private readonly lastServiceByChatId = new Map<string, "iMessage" | "SMS" | "RCS" | "unknown">();
   private readonly lastUrlAtByChatId = new Map<string, number>();
   private readonly lastTypingAtByChatId = new Map<string, number>();
+  private readonly activeReactionsByMessageId = new Map<string, ActiveReaction>();
 
   constructor(
     config: GatewayConfig,
@@ -322,6 +333,7 @@ export class PhotonChannelAdapter implements ChannelAdapter {
     this.lastServiceByChatId.clear();
     this.lastUrlAtByChatId.clear();
     this.lastTypingAtByChatId.clear();
+    this.activeReactionsByMessageId.clear();
   }
 
   /**
@@ -471,6 +483,18 @@ export class PhotonChannelAdapter implements ChannelAdapter {
       if (oldestKey !== undefined) {
         this.messagesById.delete(oldestKey);
       }
+    }
+  }
+
+  private rememberActiveReaction(messageId: string, entry: ActiveReaction): void {
+    this.activeReactionsByMessageId.delete(messageId);
+    this.activeReactionsByMessageId.set(messageId, entry);
+    while (this.activeReactionsByMessageId.size > MAX_ACTIVE_REACTIONS) {
+      const oldest = this.activeReactionsByMessageId.keys().next().value;
+      if (oldest === undefined) {
+        break;
+      }
+      this.activeReactionsByMessageId.delete(oldest);
     }
   }
 
@@ -857,8 +881,14 @@ export class PhotonChannelAdapter implements ChannelAdapter {
       return;
     }
     try {
-      const space = await this.resolveSpace(chatId);
-      const target = await this.resolveTargetMessage(space, messageId);
+      // Prefer the cached inbound Message so receipts still work when the transport
+      // cannot re-resolve the space (e.g. briefly disconnected).
+      const cached = this.messagesById.get(messageId);
+      const target =
+        cached ??
+        (await this.resolveSpace(chatId)
+          .then((space) => this.resolveTargetMessage(space, messageId))
+          .catch(() => undefined));
       if (target && target.direction === "inbound") {
         await target.read();
       }
@@ -871,12 +901,26 @@ export class PhotonChannelAdapter implements ChannelAdapter {
     if (!this.photon.reactions) {
       return;
     }
+    const previous = this.activeReactionsByMessageId.get(messageId);
+    if (previous?.emoji === emoji) {
+      // Avoid stacking duplicate tapbacks for the same message.
+      return;
+    }
     try {
       const space = await this.resolveSpace(chatId);
       const target = await this.resolveTargetMessage(space, messageId);
-      if (target) {
-        await target.react(emoji);
+      if (!target) {
+        return;
       }
+      if (previous?.handle?.unsend) {
+        // Retract the old reaction first so 👀 -> 👍/👎/🛑 is a clean transition.
+        await previous.handle.unsend().catch(() => undefined);
+      }
+      const handle = await target.react(emoji);
+      this.rememberActiveReaction(messageId, {
+        emoji,
+        handle: handle ?? undefined,
+      });
     } catch {
       // Reactions are best-effort
     }

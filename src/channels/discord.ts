@@ -22,6 +22,7 @@ import {
 const DISCORD_MAX_TEXT = 1950;
 const DISCORD_EDIT_MAX_TEXT = 2000;
 const DISCORD_MAX_FILES_PER_MESSAGE = 10;
+const MAX_CACHED_MESSAGES = 500;
 const READY_WAIT_MS = 15_000;
 
 /* ------------------------------------------------------------------------ *
@@ -37,6 +38,10 @@ export interface DiscordAttachmentLike {
   size?: number;
 }
 
+export interface DiscordReactionLike {
+  users?: { remove(userId: string): Promise<unknown> };
+}
+
 export interface DiscordMessageLike {
   id: string;
   channelId: string;
@@ -47,6 +52,9 @@ export interface DiscordMessageLike {
   mentions: { has(target: unknown): boolean; repliedUser?: { id: string } | null };
   reference?: { messageId?: string | null } | null;
   attachments?: { values(): Iterable<DiscordAttachmentLike> } | Iterable<DiscordAttachmentLike>;
+  reactions?: {
+    cache?: Map<string, DiscordReactionLike> | { get(key: string): DiscordReactionLike | undefined };
+  };
   react?(emoji: string): Promise<unknown>;
   edit?(content: string): Promise<unknown>;
 }
@@ -148,6 +156,10 @@ export class DiscordChannelAdapter extends BaseChannelAdapter {
   private readonly useInboundMediaBridge: boolean;
   private readonly readyTimeoutMs: number;
   private readonly dedupe = new BoundedDedupeCache();
+  private readonly recentMessages = new Map<
+    string,
+    { message: DiscordMessageLike; lastReaction?: string }
+  >();
 
   private client?: DiscordClientLike;
   private cancelReadyWait?: () => void;
@@ -236,6 +248,7 @@ export class DiscordChannelAdapter extends BaseChannelAdapter {
     const client = this.client;
     this.client = undefined;
     this.handler = undefined;
+    this.recentMessages.clear();
     this.setConnected(false);
     if (client) {
       try {
@@ -315,8 +328,17 @@ export class DiscordChannelAdapter extends BaseChannelAdapter {
 
   async react(chatId: string, messageId: string, emoji: string): Promise<void> {
     try {
-      const message = await this.fetchMessage(chatId, messageId);
+      const cached = this.recentMessages.get(messageId);
+      const message = cached?.message ?? (await this.fetchMessage(chatId, messageId));
+      const previous = cached?.lastReaction;
+      if (previous === emoji) {
+        return;
+      }
+      if (previous) {
+        await this.removeBotReaction(message, previous).catch(() => undefined);
+      }
       await message.react?.(emoji);
+      this.cacheRecentMessage(message, emoji);
     } catch (err) {
       this.noteError(err);
     }
@@ -377,6 +399,7 @@ export class DiscordChannelAdapter extends BaseChannelAdapter {
       mentionsBot,
       raw: message,
     };
+    this.cacheRecentMessage(message);
     await this.emit(inbound);
   }
 
@@ -459,6 +482,39 @@ export class DiscordChannelAdapter extends BaseChannelAdapter {
       throw new Error(`Discord channel ${chatId} does not support message lookup`);
     }
     return channel.messages.fetch(messageId);
+  }
+
+  private cacheRecentMessage(message: DiscordMessageLike, lastReaction?: string): void {
+    const previous = this.recentMessages.get(message.id);
+    this.recentMessages.delete(message.id);
+    this.recentMessages.set(message.id, {
+      message,
+      lastReaction: lastReaction ?? previous?.lastReaction,
+    });
+    while (this.recentMessages.size > MAX_CACHED_MESSAGES) {
+      const oldest = this.recentMessages.keys().next().value;
+      if (oldest === undefined) {
+        break;
+      }
+      this.recentMessages.delete(oldest);
+    }
+  }
+
+  private async removeBotReaction(
+    message: DiscordMessageLike,
+    emoji: string,
+  ): Promise<void> {
+    const cache = message.reactions?.cache;
+    if (!cache) {
+      return;
+    }
+    const reaction =
+      cache instanceof Map ? cache.get(emoji) : cache.get?.(emoji);
+    const botId = this.client?.user?.id;
+    const users = reaction?.users;
+    if (reaction && botId && users && typeof users.remove === "function") {
+      await users.remove(botId);
+    }
   }
 }
 

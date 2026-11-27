@@ -20,6 +20,7 @@
   <a href="#architecture--架构设计">Architecture</a> •
   <a href="#supported-channels--支持通道一览">20 Channels</a> •
   <a href="#quick-start--快速开始">Quick Start</a> •
+  <a href="docs/QUICKSTART.md">3-Min Guide</a> •
   <a href="#channel-configuration--各平台环境变量">Env Vars</a> •
   <a href="#cli--health-endpoint--命令行与健康检查">CLI &amp; Health</a> •
   <a href="#slash-commands--斜杠命令">Slash Commands</a> •
@@ -132,34 +133,55 @@ Every channel is **optional** and automatically enabled when its credentials are
 
 ## Quick Start / 快速开始
 
-### 1. Prerequisites / 环境准备
+> [!TIP]
+> **First time here? Read the [3-Minute Platform Setup Guides &amp; Troubleshooting → docs/QUICKSTART.md](docs/QUICKSTART.md).**
+> Copy-paste `.env` recipes and credential walkthroughs for Photon, Telegram, Discord, Slack, Feishu, DingTalk, and OneBot — plus daily-ops commands, Docker, and a troubleshooting FAQ.
+>
+> 中文提示：第一次使用请先阅读 **[三分钟快速上手 → docs/QUICKSTART.md](docs/QUICKSTART.md)**，内含各平台凭据获取步骤、可直接复制的 `.env`、日常运维命令与常见问题排查。
 
-- **Node.js `>= 22`** (tested on Node `24`) and **`pnpm`**
-- **Google Antigravity CLI (`agy`)** installed on `PATH` and signed in (`agy --version`)
-- Credentials for **at least one** of the 20 supported channels
+### 4-Step Quick Start / 四步快速开始
 
-### 2. Install &amp; Configure / 安装与配置
+**Prerequisites / 前置条件**: **Node.js `>= 22`** (Node `24` recommended) and **`pnpm`**; **Google Antigravity CLI (`agy`)** on `PATH` and signed in (`agy --version`); credentials for **at least one** of the 20 channels (Telegram needs **0 public domain**).
 
-```powershell
+```bash
+# 1) Clone and run the interactive onboarding wizard (alias: pnpm cli init)
 git clone https://github.com/Relogys/Antigravity-gateway.git
 cd Antigravity-gateway
-pnpm install
-Copy-Item .env.example .env
-```
+pnpm setup
 
-Edit `.env` (never commit `.env`), configure any channels you want to enable, then validate and start:
-
-```powershell
-pnpm cli doctor
+# 2) Build once
 pnpm build
-pnpm start
+
+# 3) Validate Node, agy, every channel, allowlist, and ports
+pnpm cli doctor
+
+# 4) Start the background daemon and follow the log
+pnpm cli start
+pnpm cli logs -n 120
 ```
 
-For TypeScript hot execution during development:
+> Prefer manual setup? Run `pnpm install`, copy `.env.example` to `.env` (PowerShell: `Copy-Item .env.example .env`), fill in one channel, then `pnpm build` → `pnpm cli doctor` → `pnpm cli start`.
 
-```powershell
-pnpm dev
+Send a DM to your bot. With an empty allowlist the gateway replies with an **8-character pairing code** — approve it with `pnpm cli pair approve <CODE>` and chat normally. For TypeScript hot execution during development, use `pnpm dev`.
+
+### Docker / 容器
+
+```bash
+cp .env.example .env     # fill in at least one channel
+docker compose up -d --build
+docker compose logs -f
+curl http://127.0.0.1:18790/healthz
 ```
+
+The container runs as the non-root `node` user, reads `./.env` read-only, persists state in `./data`, publishes only `127.0.0.1:18790`, and uses `restart: unless-stopped`. Mount your `agy` binary/credentials or set `GEMINI_API_KEY` — see [`Dockerfile`](Dockerfile) and the [Docker guide](docs/QUICKSTART.md#4-docker--容器部署).
+
+### What you get out of the box / 开箱即用的体验
+
+- **Hermes-grade read receipts &amp; emoji reaction lifecycle**: an inbound message is marked read (**已读**) → reacts **👀** while `agy` works → **👍** on success / **👎** on error. Typing indicators refresh periodically during long turns.
+- **Photon dual-layer heartbeat**: a transport heartbeat watchdog plus an application-level probe (`PHOTON_HEARTBEAT_TIMEOUT_MS=180000`, `PHOTON_PROBE_SPACE_ID`) detects half-open iMessage streams and reconnects automatically after hours of idle time.
+- **Cross-channel inbound image vision**: photos from Photon, Telegram, Discord, WhatsApp, and Matrix are downloaded, cached, and forwarded to `agy` as native image attachments.
+- **Daemon CLI**: `pnpm cli start`, `stop`, `restart`, `logs`, and `status` with a PID lock and graceful shutdown — plus the crash-backoff supervisor in [`scripts/start-gateway.ps1`](scripts/start-gateway.ps1).
+- **Docker &amp; Compose**: multi-stage `node:24-slim` image, non-root, built-in `/healthz` `HEALTHCHECK`, loopback-only port publishing.
 
 ---
 
@@ -426,6 +448,11 @@ LOG_LEVEL=info
 ### Admin CLI (`pnpm cli ...`)
 
 ```powershell
+pnpm cli start                                         # Start the gateway as a background daemon (logs/gateway.log)
+pnpm cli start --foreground                            # Run in the foreground instead
+pnpm cli stop                                          # Graceful stop (SIGTERM; taskkill fallback on Windows)
+pnpm cli restart                                       # Stop + start
+pnpm cli logs -n 200                                   # Tail the rotating log file
 pnpm cli doctor                                        # Check Node, agy, and status of all 20 channels
 pnpm cli send --channel telegram --to <userId> "Hi"    # Send a one-off message through any configured channel
 pnpm cli status                                        # Query live health endpoint + local store summary
@@ -548,7 +575,7 @@ Portable PowerShell scripts in [`scripts/`](scripts/) resolve paths dynamically 
 
 | Script | Purpose |
 | :--- | :--- |
-| [`scripts/start-gateway.ps1`](scripts/start-gateway.ps1) | Builds `dist/index.js` if missing and launches the gateway |
+| [`scripts/start-gateway.ps1`](scripts/start-gateway.ps1) | Builds `dist/index.js` if missing, then supervises the gateway with crash backoff (2s→60s) and 5 MB log rotation |
 | [`scripts/install-task.ps1`](scripts/install-task.ps1) | Registers Windows Scheduled Task `AntigravityGateway` (`AtLogOn`, hidden window, restart on failure) |
 | [`scripts/uninstall-task.ps1`](scripts/uninstall-task.ps1) | Stops and unregisters `AntigravityGateway` |
 

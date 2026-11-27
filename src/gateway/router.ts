@@ -108,6 +108,18 @@ const ALWAYS_DISPATCHABLE_COMMANDS = new Set([
   "v",
 ]);
 
+/** Slash commands that may take a while (network / agent work) get a 👀 working receipt. */
+const SLOW_SLASH_COMMANDS = new Set([
+  "usage",
+  "sessions",
+  "compact",
+  "compress",
+  "resume",
+  "model",
+  "effort",
+  "mode",
+]);
+
 const HELP_TEXT = [
   "Antigravity Gateway Commands:",
   "Always available (even while busy):",
@@ -621,6 +633,35 @@ export class GatewayRouter {
       );
       return;
     }
+
+    const reactionsOn = this.reactionsEnabled(msg.channel) && Boolean(this.channel.react);
+    const slow = SLOW_SLASH_COMMANDS.has(cmd);
+    if (reactionsOn && slow) {
+      this.channel.react!(chatId, msg.id, "👀").catch(() => {});
+    }
+
+    try {
+      await this.dispatchSlashCommand(msg, senderId, cmd, args, busy);
+      if (reactionsOn) {
+        // Fast commands confirm immediately after replying; slow ones report completion here.
+        this.channel.react!(chatId, msg.id, "👍").catch(() => {});
+      }
+    } catch (err) {
+      if (reactionsOn) {
+        this.channel.react!(chatId, msg.id, "👎").catch(() => {});
+      }
+      throw err;
+    }
+  }
+
+  private async dispatchSlashCommand(
+    msg: InboundMessage,
+    senderId: string,
+    cmd: string,
+    args: string,
+    busy: boolean,
+  ): Promise<void> {
+    const { chatId } = msg;
 
     switch (cmd) {
       case "help":
@@ -1412,15 +1453,22 @@ export class GatewayRouter {
         busyMode: this.getChatBusyMode(chatId),
       });
 
+      const reactionsOn =
+        this.reactionsEnabled(msg.channel) && Boolean(this.channel.react) && !options.isLoop;
+
       if (wasUserCancelled && !result.text.trim()) {
+        if (reactionsOn) {
+          this.channel.react!(chatId, msg.id, "🛑").catch(() => {});
+        }
         return;
       }
 
       const { cleanText, mediaPaths } = extractOutboundMedia(result.text, cwd);
       const quotaNotice = await this.maybeGetLowQuotaNotice();
       const combinedText = [cleanText, quotaNotice].filter(Boolean).join("\n\n");
+      const emptyResult = !combinedText && mediaPaths.length === 0;
 
-      if (combinedText || mediaPaths.length > 0) {
+      if (!emptyResult) {
         await this.sendReply(
           chatId,
           combinedText,
@@ -1429,8 +1477,13 @@ export class GatewayRouter {
         );
       }
 
-      if (this.reactionsEnabled(msg.channel) && this.channel.react && !options.isLoop) {
-        this.channel.react(chatId, msg.id, "👍").catch(() => {});
+      if (reactionsOn) {
+        // A user-cancelled or empty turn is a deliberate stop, not a successful reply.
+        this.channel.react!(
+          chatId,
+          msg.id,
+          wasUserCancelled || emptyResult ? "🛑" : "👍",
+        ).catch(() => {});
       }
     } catch (err) {
       const wasResetDuringTurn =
