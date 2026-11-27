@@ -2,11 +2,13 @@ import fs from "node:fs";
 import path from "node:path";
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
+export type LogFormat = "text" | "json";
 
 export interface RotatingFileLoggerOptions {
   logFile: string;
   maxBytes?: number;
   maxFiles?: number;
+  format?: LogFormat;
 }
 
 const DEFAULT_MAX_BYTES = 5 * 1024 * 1024;
@@ -64,6 +66,7 @@ export class RotatingFileLogger {
   readonly logFile: string;
   readonly maxBytes: number;
   readonly maxFiles: number;
+  readonly format: LogFormat;
 
   constructor(options: RotatingFileLoggerOptions) {
     if (!options.logFile || !options.logFile.trim()) {
@@ -72,10 +75,24 @@ export class RotatingFileLogger {
     this.logFile = path.resolve(options.logFile);
     this.maxBytes = normalizePositiveInt(options.maxBytes, DEFAULT_MAX_BYTES);
     this.maxFiles = normalizePositiveInt(options.maxFiles, DEFAULT_MAX_FILES);
+    this.format = options.format === "json" ? "json" : "text";
   }
 
-  write(level: LogLevel, message: string): void {
-    const line = `${new Date().toISOString()} [${level.toUpperCase()}] ${redactSecrets(message)}\n`;
+  write(level: LogLevel, message: string, meta?: Record<string, unknown>): void {
+    const safeMessage = redactSecrets(message);
+    const ts = new Date().toISOString();
+    let line: string;
+    if (this.format === "json") {
+      const safeMeta = meta ? sanitizeMeta(meta) : undefined;
+      line = `${JSON.stringify({
+        ts,
+        level,
+        msg: safeMessage,
+        ...(safeMeta && Object.keys(safeMeta).length > 0 ? { meta: safeMeta } : {}),
+      })}\n`;
+    } else {
+      line = `${ts} [${level.toUpperCase()}] ${safeMessage}\n`;
+    }
     fs.mkdirSync(path.dirname(this.logFile), { recursive: true });
     this.rotateIfNeeded(Buffer.byteLength(line, "utf8"));
     fs.appendFileSync(this.logFile, line, { encoding: "utf8" });
@@ -149,6 +166,24 @@ export function tailLogFile(logFile: string, lines = 100): string {
       }
     }
   }
+}
+
+function sanitizeMeta(meta: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(meta)) {
+    if (typeof value === "string") {
+      out[key] = redactSecrets(value);
+    } else if (typeof value === "number" || typeof value === "boolean" || value === null) {
+      out[key] = value;
+    } else if (Array.isArray(value)) {
+      out[key] = value.map((item) =>
+        typeof item === "string" ? redactSecrets(item) : item,
+      );
+    } else if (value && typeof value === "object") {
+      out[key] = sanitizeMeta(value as Record<string, unknown>);
+    }
+  }
+  return out;
 }
 
 function normalizePositiveInt(value: number | undefined, fallback: number): number {

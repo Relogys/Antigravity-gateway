@@ -103,41 +103,166 @@ export function formatDurationMs(ms: number): string {
   return `${Math.round(ms / 1000)}s`;
 }
 
+interface ParsedCronField {
+  values: Set<number>;
+  wildcard: boolean;
+}
+
+function parseCronField(
+  raw: string,
+  min: number,
+  max: number,
+  normalizeValue?: (v: number) => number,
+): ParsedCronField | null {
+  const token = raw.trim();
+  if (!token) {
+    return null;
+  }
+  const values = new Set<number>();
+  const norm = normalizeValue ?? ((v: number) => v);
+  const segments = token.split(",");
+  const wildcard = token === "*";
+
+  for (const seg of segments) {
+    const part = seg.trim();
+    if (!part) return null;
+
+    const slashParts = part.split("/");
+    if (slashParts.length > 2) return null;
+    const rangePart = slashParts[0];
+    let step = 1;
+    if (slashParts.length === 2) {
+      if (!/^\d+$/.test(slashParts[1])) return null;
+      step = Number.parseInt(slashParts[1], 10);
+      if (step <= 0) return null;
+    }
+
+    let start: number;
+    let end: number;
+    if (rangePart === "*") {
+      start = min;
+      end = max;
+    } else if (rangePart.includes("-")) {
+      const bounds = rangePart.split("-");
+      if (bounds.length !== 2 || !/^\d+$/.test(bounds[0]) || !/^\d+$/.test(bounds[1])) {
+        return null;
+      }
+      start = Number.parseInt(bounds[0], 10);
+      end = Number.parseInt(bounds[1], 10);
+      if (start < min || end > max || start > end) return null;
+    } else {
+      if (!/^\d+$/.test(rangePart)) return null;
+      const single = Number.parseInt(rangePart, 10);
+      if (single < min || single > max) return null;
+      start = single;
+      end = slashParts.length === 2 ? max : single;
+    }
+
+    for (let v = start; v <= end; v += step) {
+      values.add(norm(v));
+    }
+  }
+
+  return values.size > 0 ? { values, wildcard } : null;
+}
+
 /**
- * Compute next fire timestamp (ms) for a simple daily HH:MM or "min hour * * *" cron.
+ * Compute next fire timestamp (ms) for a daily `HH:MM` shorthand or a full
+ * standard 5-field cron expression (`minute hour dayOfMonth month dayOfWeek`).
+ * Supports `*`, `*\/n`, lists (`1,15`), ranges (`1-5`), stepped ranges (`0-30/10`),
+ * and both `0` and `7` for Sunday.
  */
 export function computeNextCronTimestamp(cron: string, fromMs = Date.now()): number | null {
   const trimmed = cron.trim();
-  let hour: number;
-  let minute: number;
-
   const hhmm = /^(\d{1,2}):(\d{2})$/.exec(trimmed);
   if (hhmm) {
-    hour = Number.parseInt(hhmm[1], 10);
-    minute = Number.parseInt(hhmm[2], 10);
-  } else {
-    const parts = trimmed.split(/\s+/);
-    if (parts.length !== 5 || parts[2] !== "*" || parts[3] !== "*" || parts[4] !== "*") {
+    const hour = Number.parseInt(hhmm[1], 10);
+    const minute = Number.parseInt(hhmm[2], 10);
+    if (hour < 0 || hour > 23 || minute < 0 || minute > 59) {
       return null;
     }
-    if (!/^\d{1,2}$/.test(parts[0]) || !/^\d{1,2}$/.test(parts[1])) {
-      return null;
+    const candidate = new Date(fromMs);
+    candidate.setSeconds(0, 0);
+    candidate.setHours(hour, minute, 0, 0);
+    if (candidate.getTime() <= fromMs) {
+      candidate.setDate(candidate.getDate() + 1);
     }
-    minute = Number.parseInt(parts[0], 10);
-    hour = Number.parseInt(parts[1], 10);
+    return candidate.getTime();
   }
 
-  if (hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+  const parts = trimmed.split(/\s+/);
+  if (parts.length !== 5) {
     return null;
   }
 
-  const candidate = new Date(fromMs);
-  candidate.setSeconds(0, 0);
-  candidate.setHours(hour, minute, 0, 0);
-  if (candidate.getTime() <= fromMs) {
-    candidate.setDate(candidate.getDate() + 1);
+  const minutes = parseCronField(parts[0], 0, 59);
+  const hours = parseCronField(parts[1], 0, 23);
+  const doms = parseCronField(parts[2], 1, 31);
+  const months = parseCronField(parts[3], 1, 12);
+  const dows = parseCronField(parts[4], 0, 7, (v) => (v === 7 ? 0 : v));
+  if (!minutes || !hours || !doms || !months || !dows) {
+    return null;
   }
-  return candidate.getTime();
+
+  const dayMatches = (date: Date): boolean => {
+    const domHit = doms.values.has(date.getDate());
+    const dowHit = dows.values.has(date.getDay());
+    if (!doms.wildcard && !dows.wildcard) {
+      // Standard Vixie cron semantics: OR when both day-of-month and day-of-week are constrained.
+      return domHit || dowHit;
+    }
+    return domHit && dowHit;
+  };
+
+  // Start strictly after `fromMs` on a minute boundary.
+  const cursor = new Date(fromMs);
+  cursor.setSeconds(0, 0);
+  cursor.setMinutes(cursor.getMinutes() + 1);
+
+  const maxYear = cursor.getFullYear() + 5;
+  let guard = 0;
+  while (cursor.getFullYear() <= maxYear && guard < 10_000) {
+    guard += 1;
+
+    if (!months.values.has(cursor.getMonth() + 1)) {
+      cursor.setMonth(cursor.getMonth() + 1, 1);
+      cursor.setHours(0, 0, 0, 0);
+      continue;
+    }
+
+    if (!dayMatches(cursor)) {
+      cursor.setDate(cursor.getDate() + 1);
+      cursor.setHours(0, 0, 0, 0);
+      continue;
+    }
+
+    if (!hours.values.has(cursor.getHours())) {
+      const nextHour = [...hours.values].sort((a, b) => a - b).find((h) => h > cursor.getHours());
+      if (nextHour !== undefined) {
+        cursor.setHours(nextHour, 0, 0, 0);
+      } else {
+        cursor.setDate(cursor.getDate() + 1);
+        cursor.setHours(0, 0, 0, 0);
+      }
+      continue;
+    }
+
+    if (!minutes.values.has(cursor.getMinutes())) {
+      const nextMin = [...minutes.values]
+        .sort((a, b) => a - b)
+        .find((m) => m > cursor.getMinutes());
+      if (nextMin !== undefined) {
+        cursor.setMinutes(nextMin, 0, 0);
+      } else {
+        cursor.setHours(cursor.getHours() + 1, 0, 0, 0);
+      }
+      continue;
+    }
+
+    return cursor.getTime();
+  }
+
+  return null;
 }
 
 /**
@@ -145,6 +270,7 @@ export function computeNextCronTimestamp(cron: string, fromMs = Date.now()): num
  * - "every <dur> <prompt>"
  * - "remind <dur> <text>"
  * - "daily <HH:MM> <prompt>"
+ * - "cron \"<m h dom mon dow>\" <prompt>" or "cron <m> <h> <dom> <mon> <dow> <prompt>"
  */
 export function parseScheduleSpec(input: string): ParsedScheduleSpec | null {
   const trimmed = input.trim();
@@ -170,6 +296,22 @@ export function parseScheduleSpec(input: string): ParsedScheduleSpec | null {
     if (computeNextCronTimestamp(cron) === null) return null;
     const prompt = dailyMatch[2].trim();
     if (!prompt) return null;
+    return { kind: "loop", cron, prompt, oneShot: false };
+  }
+
+  const quotedCron = /^cron\s+["']([^"']+)["']\s+([\s\S]+)$/i.exec(trimmed);
+  if (quotedCron) {
+    const cron = quotedCron[1].trim();
+    const prompt = quotedCron[2].trim();
+    if (!prompt || computeNextCronTimestamp(cron) === null) return null;
+    return { kind: "loop", cron, prompt, oneShot: false };
+  }
+
+  const rawCron = /^cron\s+(\S+\s+\S+\s+\S+\s+\S+\s+\S+)\s+([\s\S]+)$/i.exec(trimmed);
+  if (rawCron) {
+    const cron = rawCron[1].trim();
+    const prompt = rawCron[2].trim();
+    if (!prompt || computeNextCronTimestamp(cron) === null) return null;
     return { kind: "loop", cron, prompt, oneShot: false };
   }
 

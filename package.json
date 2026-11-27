@@ -1,6 +1,6 @@
 {
   "name": "antigravity-gateway",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Universal 20-channel messaging gateway (Photon iMessage, Telegram, Discord, Slack, and more) for Google Antigravity CLI (agy acp).",
   "type": "module",
   "license": "MIT",
@@ -30,6 +30,8 @@
   "files": [
     "dist",
     "scripts/audit-secrets.mjs",
+    "scripts/install.sh",
+    "scripts/install.ps1",
     "scripts/start-gateway.ps1",
     "scripts/install-task.ps1",
     "scripts/uninstall-task.ps1",

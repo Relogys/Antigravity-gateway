@@ -2,13 +2,23 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import dotenv from "dotenv";
+import { ZodError } from "zod";
+import { AgyAcpClient } from "./acp/client.js";
 import { fetchAgyQuota, formatQuotaSummary } from "./acp/quota.js";
+import {
+  exportGatewayBundle,
+  importGatewayBundle,
+  parseRemapRule,
+  type PathRemapRule,
+} from "./backup.js";
 import { MultiChannelHub, qualifyChatId } from "./channels/hub.js";
 import { createEnabledAdapters } from "./channels/registry.js";
+import { isLoopbackHost } from "./channels/utils.js";
 import {
   CHANNEL_NAMES,
   getEnabledChannelNames,
@@ -17,7 +27,7 @@ import {
   type GatewayConfig,
 } from "./config.js";
 import { GatewayStore } from "./gateway/store.js";
-import { tailLogFile } from "./logger.js";
+import { redactSecrets, tailLogFile } from "./logger.js";
 import {
   formatPidPayload,
   isGatewayProcess,
@@ -27,7 +37,7 @@ import {
   readPidMetadata,
   type PidMetadata,
 } from "./pid.js";
-import { runServiceCommand } from "./service.js";
+import { resolveServicePaths, runServiceCommand } from "./service.js";
 import type { HealthSnapshot } from "./types.js";
 import { runSetupWizard } from "./wizard.js";
 
@@ -40,6 +50,19 @@ export {
   readPidMetadata,
   type PidMetadata,
 };
+
+/** Format a config parsing failure into concise, secret-redacted field hints. */
+export function formatConfigError(err: unknown): string {
+  if (err instanceof ZodError) {
+    return err.issues
+      .map((issue) => {
+        const key = issue.path.length > 0 ? issue.path.join(".") : "env";
+        return `${key}: ${redactSecrets(issue.message)}`;
+      })
+      .join("; ");
+  }
+  return redactSecrets(err instanceof Error ? err.message : String(err));
+}
 
 const execFileAsync = promisify(execFile);
 
@@ -133,8 +156,13 @@ Usage:
   pnpm cli logs [-n <lines>]      Tail gateway.log (default ${CLI_DEFAULT_TAIL_LINES} lines)
   pnpm cli service [install|uninstall|status|print]
                                   Manage native OS autostart (macOS launchd / Linux systemd / Windows Task)
+  pnpm cli export [--out <file>] [--include-auth]
+                                  Export secret-free backup bundle (sessions, loops, workspace bookmarks)
+  pnpm cli import <file> [--dry-run] [--overwrite] [--include-auth] [--remap-cwd <from>=<to>]
+                                  Import a backup bundle with optional preview and cross-OS path remapping
   pnpm cli status                 Show live health endpoint + local store summary
-  pnpm cli doctor                 Run environment & connectivity diagnostics (lists all channels)
+  pnpm cli doctor [--json] [--probe-acp]
+                                  Run environment, security & connectivity diagnostics
   pnpm cli usage                  Check Antigravity quota (0 model tokens)
   pnpm cli pair list              List pending pairing codes & approved senders
   pnpm cli pair approve <CODE>    Approve a pending 8-character pairing code
@@ -155,6 +183,7 @@ function getSafeEnvPaths(): {
   healthToken?: string;
   allowedCount: number;
   config?: GatewayConfig;
+  configError?: string;
   enabledChannels: ChannelName[];
 } {
   dotenv.config({ quiet: true });
@@ -172,7 +201,7 @@ function getSafeEnvPaths(): {
       config: cfg,
       enabledChannels: getEnabledChannelNames(cfg),
     };
-  } catch {
+  } catch (err) {
     const dataDir = process.env.DATA_DIR
       ? path.resolve(process.env.DATA_DIR)
       : path.resolve(process.cwd(), "data");
@@ -192,6 +221,7 @@ function getSafeEnvPaths(): {
         .split(",")
         .map((s) => s.trim())
         .filter(Boolean).length,
+      configError: formatConfigError(err),
       enabledChannels: [],
     };
   }
@@ -521,18 +551,40 @@ async function runInitCommand(args: string[]): Promise<number> {
   return 0;
 }
 
-async function runDoctorCommand(): Promise<number> {
+interface DoctorCheckItem {
+  name: string;
+  status: "ok" | "warn" | "fail" | "info";
+  detail: string;
+}
+
+async function runDoctorCommand(args: string[] = []): Promise<number> {
+  const jsonOutput = args.includes("--json");
+  const probeAcp = args.includes("--probe-acp");
   const info = getSafeEnvPaths();
   let issues = 0;
   const hints = new Set<string>();
+  const checks: DoctorCheckItem[] = [];
+  const report = (
+    name: string,
+    status: DoctorCheckItem["status"],
+    detail: string,
+    printLine?: string,
+  ) => {
+    checks.push({ name, status, detail });
+    if (status === "fail") {
+      issues += 1;
+    }
+    if (!jsonOutput) {
+      console.log(printLine ?? `[${status.toUpperCase()}] ${detail}`);
+    }
+  };
 
   // 1. Node version
   const major = Number.parseInt(process.versions.node.split(".")[0] ?? "0", 10);
   if (major >= 22) {
-    console.log(`[OK] Node.js ${process.version}`);
+    report("node", "ok", `Node.js ${process.version}`);
   } else {
-    console.log(`[FAIL] Node.js ${process.version} (requires >=22.0.0)`);
-    issues++;
+    report("node", "fail", `Node.js ${process.version} (requires >=22.0.0)`);
     hints.add("Install Node.js >=22: https://nodejs.org/en/download");
   }
 
@@ -540,54 +592,99 @@ async function runDoctorCommand(): Promise<number> {
   const envPath = path.resolve(process.cwd(), ".env");
   const envExists = fs.existsSync(envPath);
   if (!envExists) {
-    console.log(`[WARN] .env file missing in workspace root (${envPath})`);
+    report("dotenv", "warn", `.env file missing in workspace root (${envPath})`);
     hints.add("Run 'pnpm setup' (or 'pnpm cli init') for interactive setup");
   }
   if (!info.config) {
-    console.log("[FAIL] Configuration failed to load (check .env values)");
-    issues++;
+    const errDetail = info.configError
+      ? `Configuration failed to load: ${info.configError}`
+      : "Configuration failed to load (check .env values)";
+    report("config", "fail", errDetail);
     hints.add("Fix invalid values in .env, or re-run 'pnpm setup' to regenerate it");
   }
   if (info.enabledChannels.length > 0) {
-    console.log(`[OK] ${info.enabledChannels.length}/${CHANNEL_NAMES.length} channel(s) configured`);
+    report(
+      "channels",
+      "ok",
+      `${info.enabledChannels.length}/${CHANNEL_NAMES.length} channel(s) configured (${info.enabledChannels.join(", ")})`,
+      `[OK] ${info.enabledChannels.length}/${CHANNEL_NAMES.length} channel(s) configured`,
+    );
   } else {
-    console.log("[FAIL] No channels configured (set credentials for at least one channel)");
-    issues++;
+    report(
+      "channels",
+      "fail",
+      "No channels configured (set credentials for at least one channel)",
+    );
     hints.add("Run 'pnpm setup' and choose at least one channel (e.g. Photon or Telegram)");
   }
-  for (const name of CHANNEL_NAMES) {
-    const enabled = info.enabledChannels.includes(name);
-    const detail = enabled ? describeChannel(name, info.config) : channelHint(name);
-    console.log(`  - ${name.padEnd(10)} ${enabled ? "configured" : "disabled  "}  ${detail}`);
+  if (!jsonOutput) {
+    for (const name of CHANNEL_NAMES) {
+      const enabled = info.enabledChannels.includes(name);
+      const detail = enabled ? describeChannel(name, info.config) : channelHint(name);
+      console.log(`  - ${name.padEnd(10)} ${enabled ? "configured" : "disabled  "}  ${detail}`);
+    }
   }
 
-  // 3. agy --version
+  // 3. agy --version (+ optional live ACP handshake probe)
   try {
     const { stdout } = await execFileAsync(info.agyBin, ["--version"], {
       timeout: 10_000,
       windowsHide: true,
     });
-    console.log(`[OK] ${info.agyBin} --version -> ${stdout.trim()}`);
+    report("agy", "ok", `${info.agyBin} --version -> ${stdout.trim()}`);
   } catch (err) {
-    console.log(
-      `[FAIL] Unable to run '${info.agyBin} --version': ${err instanceof Error ? err.message : String(err)}`,
+    report(
+      "agy",
+      "fail",
+      `Unable to run '${info.agyBin} --version': ${redactSecrets(err instanceof Error ? err.message : String(err))}`,
     );
-    issues++;
     hints.add(
       "Install the Antigravity CLI (agy): https://antigravity.google/docs/getting-started (then re-run 'pnpm cli doctor')",
     );
   }
 
+  if (probeAcp) {
+    const client = new AgyAcpClient({
+      agyBin: info.agyBin,
+      defaultCwd: info.config?.defaultCwd ?? process.cwd(),
+      approvalMode: info.config?.approvalMode ?? "interactive",
+      geminiApiKey: info.config?.geminiApiKey,
+      passthroughEnv: info.config?.agyPassthroughEnv,
+    });
+    try {
+      await client.ensureStarted();
+      const initRes = client.getInitializeResult();
+      const agentName = initRes?.agentInfo?.name ?? "agy";
+      const agentVersion = initRes?.agentInfo?.version ?? "unknown";
+      report("acp_probe", "ok", `ACP handshake succeeded (${agentName} ${agentVersion})`);
+    } catch (err) {
+      report(
+        "acp_probe",
+        "fail",
+        `ACP handshake failed: ${redactSecrets(err instanceof Error ? err.message : String(err))}`,
+      );
+      hints.add("Run 'agy' interactively once to confirm login, then re-run 'pnpm cli doctor --probe-acp'");
+    } finally {
+      await client.stop().catch(() => {});
+    }
+  }
+
   // 4. Zero-token /usage check
   const quota = await fetchAgyQuota(info.agyBin, { forceRefresh: true });
   if (quota.available) {
-    console.log(
-      `[OK] agy /usage (0 tokens) -> 5h: ${quota.fiveHourRemainingPercent ?? "?"}%, Weekly: ${quota.weeklyRemainingPercent ?? "?"}%`,
+    report(
+      "quota",
+      "ok",
+      `agy /usage (0 tokens) -> 5h: ${quota.fiveHourRemainingPercent ?? "?"}%, Weekly: ${quota.weeklyRemainingPercent ?? "?"}%`,
     );
   } else if (process.env.GEMINI_API_KEY) {
-    console.log(`[OK] GEMINI_API_KEY set (${quota.error ?? "quota endpoint disabled in API key mode"})`);
+    report(
+      "quota",
+      "ok",
+      `GEMINI_API_KEY set (${quota.error ?? "quota endpoint disabled in API key mode"})`,
+    );
   } else {
-    console.log(`[WARN] agy /usage unavailable: ${quota.error ?? "unknown"}`);
+    report("quota", "warn", `agy /usage unavailable: ${quota.error ?? "unknown"}`);
     hints.add("Sign in to agy ('agy' then choose a login method), or run 'pnpm cli usage' to re-check");
   }
 
@@ -597,87 +694,149 @@ async function runDoctorCommand(): Promise<number> {
   const pairedCount = store.listApprovedSenders().length;
   const pendingCount = store.listPendingPairings().length;
   if (info.allowedCount + pairedCount > 0) {
-    console.log(
-      `[OK] Access control: ${info.allowedCount} env allowlist + ${pairedCount} paired sender(s), ${pendingCount} pending`,
+    report(
+      "access_control",
+      "ok",
+      `Access control: ${info.allowedCount} env allowlist + ${pairedCount} paired sender(s), ${pendingCount} pending`,
     );
   } else {
-    console.log(
-      `[WARN] Allowlist is empty (fail-closed; DMs will receive pairing codes, ${pendingCount} pending)`,
+    report(
+      "access_control",
+      "warn",
+      `Allowlist is empty (fail-closed; DMs will receive pairing codes, ${pendingCount} pending)`,
     );
     hints.add(
       "Approve a sender with 'pnpm cli pair list' + 'pnpm cli pair approve <CODE>', or set ALLOWED_SENDERS in .env",
     );
   }
 
-  // 6. Health server, live status, and per-channel state
+  // 6. Health server, live status, security posture, and per-channel state
   if (info.healthEnabled) {
-    const live = await fetchLiveStatus(info.healthHost, info.healthPort);
+    if (!isLoopbackHost(info.healthHost) && !info.healthToken) {
+      report(
+        "health_security",
+        "warn",
+        `Health endpoint listens on non-loopback host (${info.healthHost}) without HEALTH_TOKEN`,
+      );
+      hints.add("Set HEALTH_TOKEN in .env (or bind HEALTH_HOST=127.0.0.1) to protect /status and /metrics");
+    }
+    const live = await fetchLiveStatus(info.healthHost, info.healthPort, info.healthToken);
     if (live) {
-      console.log(
-        `[OK] Health server live at http://${info.healthHost}:${info.healthPort}/status (uptime ${formatDuration(live.uptimeMs) ?? "unknown"})`,
+      report(
+        "health_server",
+        "ok",
+        `Health server live at http://${info.healthHost}:${info.healthPort}/status (uptime ${formatDuration(live.uptimeMs) ?? "unknown"})`,
       );
       const channelEntries = Object.entries(live.channels ?? {});
       let anyDisconnected = false;
-      if (channelEntries.length > 0) {
+      if (channelEntries.length > 0 && !jsonOutput) {
         console.log("  Live channel state:");
-        for (const [name, status] of channelEntries) {
-          const parts: string[] = [status.connected ? "connected" : "disconnected"];
-          if (typeof status.lastHeartbeatAt === "number") {
-            parts.push(`heartbeat ${formatAge(Date.now() - status.lastHeartbeatAt)}`);
-          }
-          if (status.lastError) {
-            parts.push(`error: ${status.lastError}`);
-          }
+      }
+      for (const [name, status] of channelEntries) {
+        const parts: string[] = [status.connected ? "connected" : "disconnected"];
+        if (typeof status.lastHeartbeatAt === "number") {
+          parts.push(`heartbeat ${formatAge(Date.now() - status.lastHeartbeatAt)}`);
+        }
+        if (status.lastError) {
+          parts.push(`error: ${status.lastError}`);
+        }
+        if (!jsonOutput) {
           console.log(
             `    ${status.connected ? "[OK]  " : "[WARN]"} ${name.padEnd(12)} ${parts.join(" | ")}`,
           );
-          if (!status.connected) {
-            anyDisconnected = true;
-          }
+        }
+        if (!status.connected) {
+          anyDisconnected = true;
         }
       }
       if (anyDisconnected) {
         hints.add("Inspect channel connection errors with 'pnpm cli logs'");
       }
       if (live.lastError) {
-        console.log(`[WARN] Gateway reported: ${live.lastError}`);
+        report("gateway_error", "warn", `Gateway reported: ${live.lastError}`);
         hints.add("Review the error above and run 'pnpm cli logs'");
       }
     } else {
       const free = await isPortAvailable(info.healthHost, info.healthPort);
       if (free) {
-        console.log(
-          `[OK] Health endpoint configured on http://${info.healthHost}:${info.healthPort}/status (gateway not running)`,
+        report(
+          "health_server",
+          "ok",
+          `Health endpoint configured on http://${info.healthHost}:${info.healthPort}/status (gateway not running)`,
         );
       } else {
-        console.log(
-          `[WARN] Health port ${info.healthHost}:${info.healthPort} is in use but /status is unreachable`,
+        report(
+          "health_server",
+          "warn",
+          `Health port ${info.healthHost}:${info.healthPort} is in use but /status is unreachable`,
         );
-        hints.add("Stop the process using the health port, or change HEALTH_PORT in .env");
+        hints.add("Stop the process using the health port, verify HEALTH_TOKEN, or change HEALTH_PORT in .env");
       }
     }
   } else {
-    console.log("[OK] Health endpoint disabled (HEALTH_ENABLED=false)");
-    hints.add("Set HEALTH_ENABLED=true in .env to use 'pnpm cli status'");
+    report("health_server", "ok", "Health endpoint disabled (HEALTH_ENABLED=false)");
+    hints.add("Set HEALTH_ENABLED=true in .env to use 'pnpm cli status' and '/metrics'");
   }
 
-  // 7. Live daemon PID
-  const pidFile = path.join(info.dataDir, "gateway.pid");
-  const daemonPid = readPidFile(pidFile);
-  if (daemonPid !== null && isPidAlive(daemonPid)) {
-    console.log(`[OK] Background gateway running (PID ${daemonPid}, ${pidFile})`);
-  } else if (daemonPid !== null) {
-    console.log(`[WARN] Stale gateway.pid (PID ${daemonPid} is not alive)`);
+  // 7. Build artifact, daemon PID & native OS service
+  const paths = resolveDaemonPaths(info.dataDir, { logDir: info.logDir });
+  if (!fs.existsSync(paths.distEntry)) {
+    report("build", "warn", `Built entry point missing (${paths.distEntry})`);
+    hints.add("Run 'pnpm build' before starting the background daemon");
+  }
+
+  const pidMeta = readPidMetadata(paths.pidFile);
+  if (pidMeta !== null && (await isGatewayProcess(pidMeta))) {
+    report("daemon", "ok", `Background gateway running (PID ${pidMeta.pid}, ${paths.pidFile})`);
+  } else if (pidMeta !== null && isPidAlive(pidMeta.pid)) {
+    report(
+      "daemon",
+      "warn",
+      `Stale gateway.pid (PID ${pidMeta.pid} belongs to another process)`,
+    );
+    hints.add("Run 'pnpm cli stop' to safely clear the stale PID file");
+  } else if (pidMeta !== null) {
+    report("daemon", "warn", `Stale gateway.pid (PID ${pidMeta.pid} is not alive)`);
     hints.add("Run 'pnpm cli stop' to clear the stale PID file, then 'pnpm cli start'");
-  } else if (fs.existsSync(pidFile)) {
-    console.log(`[WARN] Invalid gateway.pid contents (${pidFile})`);
+  } else if (fs.existsSync(paths.pidFile)) {
+    report("daemon", "warn", `Invalid gateway.pid contents (${paths.pidFile})`);
     hints.add("Run 'pnpm cli stop' to clean up the PID file");
   } else {
-    console.log("[INFO] Background gateway stopped (no data/gateway.pid)");
-    console.log("       Run 'pnpm cli start' to start background gateway");
+    report(
+      "daemon",
+      "info",
+      "Background gateway stopped (no data/gateway.pid)",
+      "[INFO] Background gateway stopped (no data/gateway.pid)\n       Run 'pnpm cli start' to start background gateway",
+    );
   }
 
-  if (hints.size > 0) {
+  const svc = resolveServicePaths(process.platform, os.homedir(), REPO_ROOT);
+  if (svc.kind === "launchd" || svc.kind === "systemd") {
+    const installed = fs.existsSync(svc.serviceFile);
+    report(
+      "service",
+      "info",
+      `${svc.kind} autostart service: ${installed ? "installed" : "not installed"} (${svc.serviceFile})`,
+    );
+  }
+
+  if (jsonOutput) {
+    console.log(
+      JSON.stringify(
+        {
+          ok: issues === 0,
+          issues,
+          platform: process.platform,
+          nodeVersion: process.version,
+          enabledChannels: info.enabledChannels,
+          checks,
+          hints: [...hints],
+        },
+        null,
+        2,
+      ),
+    );
+  } else if (hints.size > 0) {
     console.log("\nSuggested fixes:");
     for (const hint of hints) {
       console.log(`  - ${hint}`);
@@ -685,6 +844,118 @@ async function runDoctorCommand(): Promise<number> {
   }
 
   return issues === 0 ? 0 : 1;
+}
+
+async function runExportCommand(args: string[], dataDir: string): Promise<number> {
+  let outPath: string | undefined;
+  let includeAuth = false;
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i] ?? "";
+    if (arg === "--out" || arg === "-o") {
+      outPath = args[++i];
+    } else if (arg.startsWith("--out=")) {
+      outPath = arg.slice("--out=".length);
+    } else if (arg === "--include-auth") {
+      includeAuth = true;
+    } else if (arg === "--help" || arg === "-h") {
+      console.log("Usage: pnpm cli export [--out <file.json>] [--include-auth]");
+      return 0;
+    } else {
+      console.error(`Unknown export option: ${arg}`);
+      return 1;
+    }
+  }
+
+  const store = new GatewayStore(dataDir);
+  await store.load();
+  const bundle = exportGatewayBundle(store, { includeAuth });
+  const json = `${JSON.stringify(bundle, null, 2)}\n`;
+
+  if (outPath) {
+    const resolved = path.resolve(outPath);
+    fs.mkdirSync(path.dirname(resolved), { recursive: true });
+    fs.writeFileSync(resolved, json, "utf8");
+    console.log(
+      `Exported ${bundle.sessions.length} session(s), ${bundle.loops.length} loop(s), ${Object.keys(bundle.workspaces).length} workspace bookmark(s) -> ${resolved}`,
+    );
+  } else {
+    process.stdout.write(json);
+  }
+  return 0;
+}
+
+async function runImportCommand(args: string[], dataDir: string): Promise<number> {
+  let inputFile: string | undefined;
+  let dryRun = false;
+  let overwrite = false;
+  let includeAuth = false;
+  const remapCwd: PathRemapRule[] = [];
+
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i] ?? "";
+    if (arg === "--dry-run" || arg === "-n") {
+      dryRun = true;
+    } else if (arg === "--overwrite") {
+      overwrite = true;
+    } else if (arg === "--include-auth") {
+      includeAuth = true;
+    } else if (arg === "--remap-cwd") {
+      const rule = parseRemapRule(args[++i] ?? "");
+      if (!rule) {
+        console.error("Invalid --remap-cwd value; expected <from>=<to>");
+        return 1;
+      }
+      remapCwd.push(rule);
+    } else if (arg.startsWith("--remap-cwd=")) {
+      const rule = parseRemapRule(arg.slice("--remap-cwd=".length));
+      if (!rule) {
+        console.error("Invalid --remap-cwd value; expected <from>=<to>");
+        return 1;
+      }
+      remapCwd.push(rule);
+    } else if (arg === "--help" || arg === "-h") {
+      console.log(
+        "Usage: pnpm cli import <file.json> [--dry-run] [--overwrite] [--include-auth] [--remap-cwd <from>=<to>]",
+      );
+      return 0;
+    } else if (!arg.startsWith("-") && !inputFile) {
+      inputFile = arg;
+    } else {
+      console.error(`Unknown import argument: ${arg}`);
+      return 1;
+    }
+  }
+
+  if (!inputFile) {
+    console.error("Usage: pnpm cli import <file.json> [--dry-run] [--overwrite] [--remap-cwd <from>=<to>]");
+    return 1;
+  }
+
+  const resolved = path.resolve(inputFile);
+  if (!fs.existsSync(resolved)) {
+    console.error(`Backup file not found: ${resolved}`);
+    return 1;
+  }
+
+  const parsed = JSON.parse(fs.readFileSync(resolved, "utf8")) as unknown;
+  const store = new GatewayStore(dataDir);
+  await store.load();
+  const summary = await importGatewayBundle(store, parsed, {
+    dryRun,
+    overwrite,
+    includeAuth,
+    remapCwd,
+  });
+
+  console.log(
+    `${summary.dryRun ? "[DRY RUN] " : ""}Import summary (${resolved}):\n` +
+      `  Sessions:   +${summary.sessionsAdded} added, ${summary.sessionsUpdated} updated, ${summary.sessionsSkipped} skipped\n` +
+      `  Loops:      +${summary.loopsAdded} added, ${summary.loopsUpdated} updated, ${summary.loopsSkipped} skipped\n` +
+      `  Workspaces: ${summary.workspacesImported} imported\n` +
+      `  Paths remapped: ${summary.pathsRemapped}` +
+      (includeAuth ? `\n  Approved senders added: ${summary.approvedSendersAdded}` : ""),
+  );
+  return 0;
 }
 
 async function runStartCommand(
@@ -952,7 +1223,13 @@ async function main(): Promise<void> {
       exitCode = await runUsageCommand();
       break;
     case "doctor":
-      exitCode = await runDoctorCommand();
+      exitCode = await runDoctorCommand(args.slice(1));
+      break;
+    case "export":
+      exitCode = await runExportCommand(args.slice(1), info.dataDir);
+      break;
+    case "import":
+      exitCode = await runImportCommand(args.slice(1), info.dataDir);
       break;
     case "send":
       exitCode = await runSendCommand(args.slice(1));

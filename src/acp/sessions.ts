@@ -247,6 +247,19 @@ function isTransientTurnError(error: unknown): boolean {
   return TRANSIENT_TURN_ERROR_RE.test(String(error));
 }
 
+function isStaleSessionError(error: unknown): boolean {
+  const msg = (error instanceof Error ? error.message : String(error)).toLowerCase();
+  return (
+    msg.includes("session not found") ||
+    msg.includes("unknown session") ||
+    msg.includes("invalid session") ||
+    msg.includes("session closed") ||
+    msg.includes("session expired") ||
+    msg.includes("not_found") ||
+    msg.includes("-32002")
+  );
+}
+
 function isCancellationLike(error: unknown): boolean {
   const msg = error instanceof Error ? error.message : String(error);
   return /\b(cancel|cancelled|canceled|aborted)\b/i.test(msg);
@@ -521,6 +534,37 @@ export class AgyAgentBackend implements AgentBackend {
     return run;
   }
 
+  private async createAndConfigureSession(
+    state: ChatSessionState,
+    cwd: string,
+  ): Promise<void> {
+    const created = await this.client.newSession(cwd);
+    state.info.sessionId = created.sessionId;
+    state.info.cwd = cwd;
+
+    if (state.info.model) {
+      await this.client.setConfigOption(
+        created.sessionId,
+        "model",
+        state.info.model,
+      );
+    }
+    if (state.info.effort) {
+      await this.client.setConfigOption(
+        created.sessionId,
+        "thought_level",
+        state.info.effort,
+      );
+    }
+    if (state.info.mode) {
+      await this.client.setConfigOption(
+        created.sessionId,
+        "mode",
+        state.info.mode,
+      );
+    }
+  }
+
   private async executeTurn(
     state: ChatSessionState,
     input: AgentTurnInput,
@@ -533,35 +577,22 @@ export class AgyAgentBackend implements AgentBackend {
     }
 
     if (input.sessionId && input.sessionId !== state.info.sessionId) {
-      await this.client.loadSession(input.sessionId, cwd);
-      state.info.sessionId = input.sessionId;
-      state.info.cwd = cwd;
+      try {
+        await this.client.loadSession(input.sessionId, cwd);
+        state.info.sessionId = input.sessionId;
+        state.info.cwd = cwd;
+      } catch (err) {
+        if (!isStaleSessionError(err)) {
+          throw err;
+        }
+        // Saved ACP session was pruned or expired across restart: self-heal into a fresh session.
+        console.warn(
+          `[acp] Session ${input.sessionId.slice(0, 12)} unavailable (${conciseReason(err)}); creating a fresh session.`,
+        );
+        await this.createAndConfigureSession(state, cwd);
+      }
     } else if (!state.info.sessionId || state.info.cwd !== cwd) {
-      const created = await this.client.newSession(cwd);
-      state.info.sessionId = created.sessionId;
-      state.info.cwd = cwd;
-
-      if (state.info.model) {
-        await this.client.setConfigOption(
-          created.sessionId,
-          "model",
-          state.info.model,
-        );
-      }
-      if (state.info.effort) {
-        await this.client.setConfigOption(
-          created.sessionId,
-          "thought_level",
-          state.info.effort,
-        );
-      }
-      if (state.info.mode) {
-        await this.client.setConfigOption(
-          created.sessionId,
-          "mode",
-          state.info.mode,
-        );
-      }
+      await this.createAndConfigureSession(state, cwd);
     }
 
     if (input.model) {
@@ -653,6 +684,7 @@ export class AgyAgentBackend implements AgentBackend {
 
     const maxRetries = activity.maxRetries;
     let attempt = 0;
+    let recoveredStaleSession = false;
     for (;;) {
       try {
         return await this.client.prompt(state.info.sessionId, {
@@ -663,6 +695,21 @@ export class AgyAgentBackend implements AgentBackend {
         });
       } catch (error) {
         const aborted = abortSignal.aborted;
+        if (
+          !hasStreamedText &&
+          !aborted &&
+          !recoveredStaleSession &&
+          isStaleSessionError(error)
+        ) {
+          // Active in-memory session was evicted/pruned upstream before any output streamed:
+          // recreate the session once and retry seamlessly instead of wedging the chat.
+          recoveredStaleSession = true;
+          console.warn(
+            `[acp] Active session ${state.info.sessionId.slice(0, 12)} became stale (${conciseReason(error)}); recreating and retrying once.`,
+          );
+          await this.createAndConfigureSession(state, cwd);
+          continue;
+        }
         const canRetry =
           !hasStreamedText &&
           !aborted &&

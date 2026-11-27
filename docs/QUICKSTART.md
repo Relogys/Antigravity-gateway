@@ -297,7 +297,9 @@ TOOL_PROGRESS_EDIT_INTERVAL_MS=1500       # throttle between in-place edits
 | `pnpm cli service install` | Install & start the native OS autostart service (`launchd` on macOS, `systemd --user` on Linux, Task Scheduler on Windows). |
 | `pnpm cli service status` | Check native OS autostart service status (`uninstall` removes it; `print` previews templates). |
 | `pnpm cli status` | Query the live health endpoint (`/status`, supports `HEALTH_TOKEN`) and persisted store summary. |
-| `pnpm cli doctor` | Full environment / channel / allowlist / port diagnostics. |
+| `pnpm cli doctor [--json] [--probe-acp]` | Full environment / security / channel diagnostics (`--json` for scripts, `--probe-acp` for live ACP handshake). |
+| `pnpm cli export --out backup.json` | Export secret-free sessions, loops, and workspace bookmarks. |
+| `pnpm cli import backup.json --dry-run --remap-cwd E:\work=/Users/dev` | Preview or import a backup bundle with cross-OS path remapping. |
 | `pnpm cli pair list` | List pending pairing codes and approved senders. |
 | `pnpm cli pair approve <CODE>` | Approve an 8-character pairing code. |
 | `pnpm cli pair revoke <sender>` | Revoke an approved sender. |

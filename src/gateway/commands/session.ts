@@ -836,20 +836,128 @@ export async function handleSessionCommand(
     }
 
     case "cwd": {
+      const mergedWorkspaces = (): Record<string, string> => ({
+        ...(ctx.config.workspaceAliases ?? {}),
+        ...ctx.store.getWorkspaces(),
+      });
+      const formatBookmarks = (bookmarks: Record<string, string>): string => {
+        const entries = Object.entries(bookmarks).sort(([a], [b]) => a.localeCompare(b));
+        if (entries.length === 0) {
+          return "No saved workspaces yet. Save one with: /cwd save <alias> [path]";
+        }
+        return [
+          "Saved workspaces:",
+          ...entries.map(([alias, dir]) => `• @${alias} -> ${dir}`),
+        ].join("\n");
+      };
+
       if (isHelpFlag(args)) {
         await ctx.sendReply(
           chatId,
-          "Usage: /cwd [path] — View or change the working directory.",
+          [
+            "Usage:",
+            "  /cwd                  — Show current working directory & saved bookmarks",
+            "  /cwd <path|@alias>    — Switch working directory (starts a clean session)",
+            "  /cwd save <alias> [path] — Bookmark current (or given) directory",
+            "  /cwd rm <alias>       — Remove a saved workspace bookmark",
+            "  /cwd list             — List all workspace bookmarks",
+          ].join("\n"),
           msg.id,
         );
         return true;
       }
+
       const currentCwd = ctx.resolveDefaultCwd();
+      const bookmarks = mergedWorkspaces();
       if (!args) {
-        await ctx.sendReply(chatId, `Current working directory: ${currentCwd}`, msg.id);
+        const extra =
+          Object.keys(bookmarks).length > 0 ? `\n\n${formatBookmarks(bookmarks)}` : "";
+        await ctx.sendReply(
+          chatId,
+          `Current working directory: ${currentCwd}${extra}`,
+          msg.id,
+        );
         return true;
       }
-      const resolved = path.resolve(currentCwd, args);
+
+      const tokens = args.trim().split(/\s+/);
+      const sub = (tokens[0] ?? "").toLowerCase();
+      if (sub === "list" || sub === "ls") {
+        await ctx.sendReply(chatId, formatBookmarks(bookmarks), msg.id);
+        return true;
+      }
+
+      if (sub === "save" || sub === "add") {
+        const rawAlias = (tokens[1] ?? "").trim().replace(/^@+/, "").toLowerCase();
+        if (!rawAlias || !/^[a-z0-9._-]+$/.test(rawAlias)) {
+          await ctx.sendReply(
+            chatId,
+            "Usage: /cwd save <alias> [path] (alias uses letters, digits, ., _, -)",
+            msg.id,
+          );
+          return true;
+        }
+        const rawTarget = args.trim().slice(tokens[0].length).trim().slice((tokens[1] ?? "").length).trim();
+        const targetDir = rawTarget ? path.resolve(currentCwd, rawTarget) : currentCwd;
+        try {
+          const stat = fs.statSync(targetDir);
+          if (!stat.isDirectory()) {
+            await ctx.sendReply(chatId, `Not a directory: ${targetDir}`, msg.id);
+            return true;
+          }
+        } catch {
+          await ctx.sendReply(chatId, `Directory does not exist: ${targetDir}`, msg.id);
+          return true;
+        }
+        await ctx.store.setWorkspace(rawAlias, targetDir);
+        await ctx.sendReply(
+          chatId,
+          `📌 Saved workspace @${rawAlias} -> ${targetDir}`,
+          msg.id,
+        );
+        return true;
+      }
+
+      if (sub === "rm" || sub === "del" || sub === "delete" || sub === "remove") {
+        const rawAlias = (tokens[1] ?? "").trim().replace(/^@+/, "").toLowerCase();
+        if (!rawAlias) {
+          await ctx.sendReply(chatId, "Usage: /cwd rm <alias>", msg.id);
+          return true;
+        }
+        const removed = await ctx.store.deleteWorkspace(rawAlias);
+        await ctx.sendReply(
+          chatId,
+          removed
+            ? `Removed saved workspace @${rawAlias}.`
+            : `Workspace @${rawAlias} not found in saved bookmarks.`,
+          msg.id,
+        );
+        return true;
+      }
+
+      const trimmedArg = args.trim();
+      let resolved: string;
+      let usedAlias: string | undefined;
+      if (trimmedArg.startsWith("@")) {
+        const key = trimmedArg.slice(1).toLowerCase();
+        const mapped = bookmarks[key];
+        if (!mapped) {
+          await ctx.sendReply(
+            chatId,
+            `Unknown workspace alias @${key}.\n${formatBookmarks(bookmarks)}`,
+            msg.id,
+          );
+          return true;
+        }
+        resolved = mapped;
+        usedAlias = key;
+      } else if (bookmarks[trimmedArg.toLowerCase()] && !fs.existsSync(path.resolve(currentCwd, trimmedArg))) {
+        usedAlias = trimmedArg.toLowerCase();
+        resolved = bookmarks[usedAlias];
+      } else {
+        resolved = path.resolve(currentCwd, trimmedArg);
+      }
+
       try {
         const stat = fs.statSync(resolved);
         if (!stat.isDirectory()) {
@@ -863,9 +971,10 @@ export async function handleSessionCommand(
       ctx.bumpSessionGeneration();
       await ctx.ensureSessionRecord({ cwd: resolved, sessionId: "" });
       await ctx.backend.resetSession(chatId);
+      const aliasTag = usedAlias ? ` (@${usedAlias})` : "";
       await ctx.sendReply(
         chatId,
-        `Working directory set to: ${resolved} (new session will start here).`,
+        `Working directory set to: ${resolved}${aliasTag} (new session will start here).`,
         msg.id,
       );
       return true;

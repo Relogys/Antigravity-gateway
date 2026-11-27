@@ -279,3 +279,38 @@ jobs:
           fail_on_unmatched_files: true
           draft: false
           prerelease: false
+
+  npm-publish:
+    name: Publish to npm (optional)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [verify-and-pack, github-release]
+    if: ${{ !contains(needs.verify-and-pack.outputs.tag, '-') }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v8
+        with:
+          name: release-assets
+          path: release-assets
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Publish tarball with provenance (when NPM_TOKEN is configured)
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "NPM_TOKEN secret is not set; skipping npm registry publish."
+            exit 0
+          fi
+          tgz="$(ls release-assets/*.tgz)"
+          npm publish "$tgz" --access public --provenance

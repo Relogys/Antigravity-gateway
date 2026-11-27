@@ -52,7 +52,7 @@ import type { GatewayStore } from "./store.js";
 const DEFAULT_TYPING_INTERVAL_MS = 5000;
 const DEFAULT_PROGRESS_POLL_INTERVAL_MS = 15_000;
 const QUOTA_CHECK_INTERVAL_MS = 5 * 60 * 1000;
-const GATEWAY_VERSION = "0.3.0";
+const GATEWAY_VERSION = "0.4.0";
 const MAX_SESSION_LIST_CACHE = 500;
 const MAX_LAST_PROMPTS = 500;
 const REPLY_QUOTE_SNIPPET_MAX = 500;
@@ -240,6 +240,7 @@ export class GatewayRouter {
   private readonly toolProgressModeByChatId = new Map<string, ToolProgressMode>();
   private readonly toolProgressKeepByChatId = new Map<string, boolean>();
   private readonly lastPromptByChatId = new Map<string, string>();
+  private readonly activeTurnCleanups = new Set<() => void>();
   private cachedQuota?: QuotaSummary;
 
   constructor(deps: GatewayRouterDeps) {
@@ -281,9 +282,17 @@ export class GatewayRouter {
     this.ready = true;
   }
 
-  /** Stops pending burst timers so buffered fragments never fire after shutdown. */
+  /** Stops pending burst timers and active typing/progress timers so nothing leaks after shutdown. */
   stop(): void {
     this.burstCoalescer.stop();
+    for (const cleanup of [...this.activeTurnCleanups]) {
+      try {
+        cleanup();
+      } catch {
+        // Best-effort shutdown cleanup.
+      }
+    }
+    this.activeTurnCleanups.clear();
   }
 
   /**
@@ -387,7 +396,9 @@ export class GatewayRouter {
   }
 
   /**
-   * Executes a scheduled prompt loop directly against the backend and sends the result.
+   * Executes a scheduled prompt loop in an isolated backend session key so
+   * background cron/loop runs never clobber, reset, or pollute the user's
+   * interactive conversation session or working directory.
    */
   async runLoopPrompt(job: LoopJob): Promise<void> {
     const syntheticMsg: InboundMessage = {
@@ -401,13 +412,10 @@ export class GatewayRouter {
       timestamp: Date.now(),
     };
     const cwd = job.cwd ?? this.resolveDefaultCwd(job.chatId);
-    if (this.isChatBusy(job.chatId)) {
-      this.enqueueChatPrompt(job.chatId, job.prompt);
-      return;
-    }
     await this.executeTurn(syntheticMsg, job.prompt, [], {
       overrideCwd: cwd,
       isLoop: true,
+      loopJobId: job.id,
     });
   }
 
@@ -1066,17 +1074,18 @@ export class GatewayRouter {
     msg: InboundMessage,
     text: string,
     attachments: InboundAttachment[],
-    options: { overrideCwd?: string; isLoop?: boolean } = {},
+    options: { overrideCwd?: string; isLoop?: boolean; loopJobId?: string } = {},
   ): Promise<void> {
     const { chatId } = msg;
-    if (!options.isLoop) {
+    const isLoop = options.isLoop === true;
+    if (!isLoop) {
       this.rememberLastPrompt(chatId, text);
+      this.activeTurnChats.add(chatId);
     }
-    this.activeTurnChats.add(chatId);
 
     try {
       let currentMsg = msg;
-      let currentText = options.isLoop ? text : this.withReplyQuote(msg, text);
+      let currentText = isLoop ? text : this.withReplyQuote(msg, text);
       let currentAttachments = attachments;
       let currentOptions = options;
 
@@ -1090,6 +1099,9 @@ export class GatewayRouter {
           currentOptions,
         );
 
+        if (isLoop) {
+          break;
+        }
         if (this.stopDrainChats.delete(chatId)) {
           break;
         }
@@ -1107,7 +1119,9 @@ export class GatewayRouter {
         currentOptions = {};
       }
     } finally {
-      this.activeTurnChats.delete(chatId);
+      if (!isLoop) {
+        this.activeTurnChats.delete(chatId);
+      }
     }
   }
 
@@ -1116,11 +1130,15 @@ export class GatewayRouter {
     text: string,
     attachments: InboundAttachment[],
     turnGeneration: number,
-    options: { overrideCwd?: string; isLoop?: boolean } = {},
+    options: { overrideCwd?: string; isLoop?: boolean; loopJobId?: string } = {},
   ): Promise<void> {
     const { chatId } = msg;
+    const isLoop = options.isLoop === true;
+    const backendChatId = isLoop
+      ? `${chatId}::loop:${options.loopJobId ?? "job"}`
+      : chatId;
 
-    if (this.reactionsEnabled(msg.channel) && this.channel.react && !options.isLoop) {
+    if (this.reactionsEnabled(msg.channel) && this.channel.react && !isLoop) {
       this.channel.react(chatId, msg.id, "👀").catch(() => {});
     }
 
@@ -1137,7 +1155,16 @@ export class GatewayRouter {
         this.channel.sendTyping?.(chatId, false).catch(() => {});
       }
     };
-    if (this.channel.sendTyping) {
+    const cleanupTurnTimers = () => {
+      if (progressTimer) {
+        clearInterval(progressTimer);
+        progressTimer = undefined;
+      }
+      stopTyping();
+    };
+    this.activeTurnCleanups.add(cleanupTurnTimers);
+
+    if (this.channel.sendTyping && !isLoop) {
       typingActive = true;
       this.channel.sendTyping(chatId, true).catch(() => {});
       if (this.typingIntervalMs > 0) {
@@ -1261,8 +1288,8 @@ export class GatewayRouter {
           ) || undefined;
 
       const result = await this.backend.sendTurn({
-        chatId,
-        sessionId: stored?.sessionId || undefined,
+        chatId: backendChatId,
+        sessionId: isLoop ? undefined : stored?.sessionId || undefined,
         cwd,
         text,
         attachments,
@@ -1276,10 +1303,11 @@ export class GatewayRouter {
       });
 
       const wasResetDuringTurn =
-        this.getSessionGeneration(chatId) !== turnGeneration;
+        !isLoop && this.getSessionGeneration(chatId) !== turnGeneration;
       const wasUserCancelled =
-        this.cancelledByUser.delete(chatId) ||
-        result.stopReason === "cancelled";
+        !isLoop &&
+        (this.cancelledByUser.delete(chatId) ||
+          result.stopReason === "cancelled");
 
       if (wasResetDuringTurn) {
         await liveProgress?.finish("cancelled");
@@ -1287,15 +1315,17 @@ export class GatewayRouter {
       }
 
       const isFirstCompleted =
-        !options.isLoop && !stored?.onboarded && !wasUserCancelled;
+        !isLoop && !stored?.onboarded && !wasUserCancelled;
 
-      await this.ensureSessionRecord(chatId, {
-        sessionId: result.sessionId,
-        cwd,
-        approvalMode,
-        busyMode: this.getChatBusyMode(chatId),
-        ...(isFirstCompleted ? { onboarded: true } : {}),
-      });
+      if (!isLoop) {
+        await this.ensureSessionRecord(chatId, {
+          sessionId: result.sessionId,
+          cwd,
+          approvalMode,
+          busyMode: this.getChatBusyMode(chatId),
+          ...(isFirstCompleted ? { onboarded: true } : {}),
+        });
+      }
 
       const reactionsOn =
         this.reactionsEnabled(msg.channel) && Boolean(this.channel.react) && !options.isLoop;
@@ -1373,11 +1403,12 @@ export class GatewayRouter {
         ).catch(() => {});
       }
     } finally {
-      if (progressTimer) {
-        clearInterval(progressTimer);
-        progressTimer = undefined;
+      this.activeTurnCleanups.delete(cleanupTurnTimers);
+      cleanupTurnTimers();
+      if (isLoop) {
+        // Release the ephemeral loop backend session so recurring cron runs never leak sessions.
+        await this.backend.resetSession(backendChatId).catch(() => {});
       }
-      stopTyping();
     }
   }
 

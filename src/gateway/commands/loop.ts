@@ -1,10 +1,20 @@
-import { formatDurationMs, parseDurationMs } from "../scheduler.js";
+import {
+  computeNextCronTimestamp,
+  formatDurationMs,
+  parseDurationMs,
+  parseScheduleSpec,
+} from "../scheduler.js";
 import { isHelpFlag, type RouterCommandContext } from "./system.js";
 
 const LOOP_COMMANDS = new Set(["loop", "remind"]);
 
-const LOOP_USAGE =
-  "Usage: /loop [list|add <dur> <prompt>|rm <id>|pause <id>|resume <id>]";
+const LOOP_USAGE = [
+  'Usage: /loop [list|add <dur> <prompt>|daily <HH:MM> <prompt>|cron "<m h dom mon dow>" <prompt>|rm <id>|pause <id>|resume <id>]',
+  "Examples:",
+  "  /loop add 30m check CI status",
+  "  /loop daily 09:00 summarize overnight commits",
+  '  /loop cron "0 9 * * 1-5" morning standup digest',
+].join("\n");
 
 /** Handles `/loop` and `/remind`. Returns `true` when the command was consumed. */
 export async function handleLoopCommand(
@@ -85,18 +95,85 @@ async function handleLoop(ctx: RouterCommandContext): Promise<void> {
   const parts = args.split(/\s+/);
   const sub = parts[0].toLowerCase();
 
+  if (sub === "daily" || sub === "cron") {
+    const spec = parseScheduleSpec(args);
+    if (!spec || !spec.cron) {
+      await ctx.sendReply(
+        chatId,
+        sub === "daily"
+          ? "Invalid daily schedule. Example: /loop daily 09:00 summarize overnight git commits"
+          : 'Invalid 5-field cron schedule. Example: /loop cron "0 9 * * 1-5" morning standup',
+        msg.id,
+      );
+      return;
+    }
+    const cwd = ctx.resolveDefaultCwd();
+    const job = await ctx.scheduler.addLoop({
+      chatId,
+      prompt: spec.prompt,
+      cron: spec.cron,
+      cwd,
+    });
+    const nextHint = job.nextRunAt ? ` (next: ${new Date(job.nextRunAt).toISOString()})` : "";
+    await ctx.sendReply(
+      chatId,
+      `🔁 Loop [${job.id}] added: ${sub === "daily" ? `daily ${spec.cron}` : `cron ${spec.cron}`}${nextHint}.`,
+      msg.id,
+    );
+    return;
+  }
+
   if (sub === "add" || sub === "every") {
+    const restAfterAdd = args.replace(/^(?:add|every)\s+/i, "").trim();
+    if (/^(?:daily|cron)\s+/i.test(restAfterAdd)) {
+      const spec = parseScheduleSpec(restAfterAdd);
+      if (!spec || !spec.cron) {
+        await ctx.sendReply(chatId, LOOP_USAGE, msg.id);
+        return;
+      }
+      const cwd = ctx.resolveDefaultCwd();
+      const job = await ctx.scheduler.addLoop({
+        chatId,
+        prompt: spec.prompt,
+        cron: spec.cron,
+        cwd,
+      });
+      await ctx.sendReply(
+        chatId,
+        `🔁 Loop [${job.id}] added: cron ${spec.cron}.`,
+        msg.id,
+      );
+      return;
+    }
+
     const m = /^(?:add|every)\s+(\S+)\s+([\s\S]+)$/i.exec(args);
     if (!m) {
       await ctx.sendReply(chatId, "Usage: /loop add <duration> <prompt>", msg.id);
       return;
     }
-    const intervalMs = parseDurationMs(m[1]);
+    const rawSched = m[1];
     const prompt = m[2].trim();
+    if (/^\d{1,2}:\d{2}$/.test(rawSched) && computeNextCronTimestamp(rawSched) !== null && prompt) {
+      const cwd = ctx.resolveDefaultCwd();
+      const job = await ctx.scheduler.addLoop({
+        chatId,
+        prompt,
+        cron: rawSched,
+        cwd,
+      });
+      await ctx.sendReply(
+        chatId,
+        `🔁 Loop [${job.id}] added: daily ${rawSched}.`,
+        msg.id,
+      );
+      return;
+    }
+
+    const intervalMs = parseDurationMs(rawSched);
     if (!intervalMs || !prompt) {
       await ctx.sendReply(
         chatId,
-        "Invalid duration or empty prompt. Examples: 30m, 2h, 1d.",
+        "Invalid duration or empty prompt. Examples: 30m, 2h, 1d, or /loop daily 09:00 <prompt>.",
         msg.id,
       );
       return;

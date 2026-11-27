@@ -13,8 +13,58 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  changes:
+    name: Detect changed paths
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Audit docs & repo for leaked secrets
+        run: node scripts/audit-secrets.mjs
+
+      - name: Classify changes
+        id: filter
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+            head="${{ github.event.pull_request.head.sha }}"
+          else
+            base="${{ github.event.before }}"
+            head="${{ github.sha }}"
+          fi
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          changed="$(git diff --name-only "$base" "$head" || true)"
+          echo "Changed files:"
+          echo "$changed"
+          if [ -z "$changed" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Skip heavy OS/Node/Docker builds when ONLY Markdown docs or LICENSE changed.
+          # Skipped jobs still satisfy GitHub Branch Ruleset required status checks,
+          # while Security's secret audit continues scanning docs changes.
+          if echo "$changed" | grep -Evq '^(README\.md|CHANGELOG\.md|SECURITY\.md|LICENSE|docs/.*\.md|.*\.md)$'; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Docs-only change detected; skipping heavy build matrix."
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
+
   verify:
     name: Node ${{ matrix.node }}
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -53,6 +103,8 @@ jobs:
 
   verify-windows:
     name: Windows / Node 24
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
@@ -87,6 +139,8 @@ jobs:
 
   verify-macos:
     name: macOS (Apple Silicon) / Node 24
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: macos-latest
     timeout-minutes: 20
     steps:
@@ -121,6 +175,8 @@ jobs:
 
   docker-build:
     name: Docker image build
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:

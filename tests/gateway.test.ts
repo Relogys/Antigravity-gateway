@@ -745,7 +745,7 @@ describe("GatewayRouter integration", () => {
     expect(channel.sent.at(-1)?.text).toContain("/usage");
 
     await send("/version");
-    expect(channel.sent.at(-1)?.text).toContain("antigravity-gateway v0.3.0");
+    expect(channel.sent.at(-1)?.text).toContain("antigravity-gateway v0.4.0");
 
     await send("/whoami");
     expect(channel.sent.at(-1)?.text).toContain("Auth: env allowlist");

@@ -186,6 +186,29 @@ function cleanEnv(value: string | undefined): string | undefined {
   return trimmed;
 }
 
+/**
+ * Parse `WORKSPACE_ALIASES` entries like `api=/srv/api,web=/srv/web` (comma or
+ * semicolon separated) into a normalized lowercase alias -> resolved path map.
+ */
+export function parseWorkspaceAliases(raw: string | undefined): Record<string, string> {
+  const cleaned = cleanEnv(raw);
+  if (!cleaned) {
+    return {};
+  }
+  const result: Record<string, string> = {};
+  for (const entry of cleaned.split(/[,;]/)) {
+    const trimmed = entry.trim();
+    if (!trimmed) continue;
+    const eq = trimmed.indexOf("=");
+    if (eq <= 0) continue;
+    const alias = trimmed.slice(0, eq).trim().toLowerCase().replace(/^@+/, "");
+    const target = trimmed.slice(eq + 1).trim();
+    if (!alias || !/^[a-z0-9._-]+$/.test(alias) || !target) continue;
+    result[alias] = path.resolve(target);
+  }
+  return result;
+}
+
 const optionalString = z.string().optional();
 
 /** Numeric env that treats blank strings as "unset" (so `FOO=` falls back to the default). */
@@ -232,6 +255,11 @@ const envSchema = z.object({
   DATA_DIR: z.string().trim().optional(),
   LOG_DIR: z.string().trim().optional(),
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
+  LOG_FORMAT: z.preprocess(
+    (v) => (typeof v === "string" ? v.trim().toLowerCase() || undefined : v),
+    z.enum(["text", "json"]).default("text"),
+  ),
+  WORKSPACE_ALIASES: optionalString,
 
   TELEGRAM_BOT_TOKEN: optionalString,
   TELEGRAM_ALLOWED_USERS: optionalString,
@@ -580,6 +608,10 @@ export interface GatewayConfig {
   /** Optional override directory for rotating gateway logs (defaults to user-writable path for global installs). */
   logDir?: string;
   logLevel: LogLevel;
+  /** Log output format (`text` or structured single-line `json`, default `text`). */
+  logFormat?: "text" | "json";
+  /** Optional named workspace shortcuts (`WORKSPACE_ALIASES=api=/srv/api,web=/srv/web`) for `/cwd @alias`. */
+  workspaceAliases?: Record<string, string>;
 
   /** Channel blocks: each present iff that channel's credentials are configured. */
   photon?: PhotonConfig;
@@ -803,6 +835,8 @@ export function loadConfig(
     dataDir,
     logDir: cleanEnv(parsed.LOG_DIR) ? path.resolve(cleanEnv(parsed.LOG_DIR)!) : undefined,
     logLevel: parsed.LOG_LEVEL,
+    logFormat: parsed.LOG_FORMAT,
+    workspaceAliases: parseWorkspaceAliases(parsed.WORKSPACE_ALIASES),
 
     photon,
     telegram: telegramToken

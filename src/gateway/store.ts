@@ -57,6 +57,8 @@ export interface PersistedState {
   loops: LoopJob[];
   homeChatId?: string;
   boundChannels: Record<string, BoundChannelRecord>;
+  /** Saved named workspace shortcuts (`alias -> resolved path`) used by `/cwd @alias`. */
+  workspaces?: Record<string, string>;
 }
 
 class UnsupportedStateVersionError extends Error {}
@@ -109,6 +111,17 @@ export function migratePersistedState(raw: unknown): Partial<PersistedState> {
     boundChannels: isPlainObject(raw.boundChannels)
       ? ({ ...raw.boundChannels } as Record<string, BoundChannelRecord>)
       : {},
+    workspaces: isPlainObject(raw.workspaces)
+      ? Object.fromEntries(
+          Object.entries(raw.workspaces).filter(
+            (entry): entry is [string, string] =>
+              typeof entry[0] === "string" &&
+              entry[0].trim().length > 0 &&
+              typeof entry[1] === "string" &&
+              entry[1].trim().length > 0,
+          ),
+        )
+      : {},
   };
 }
 
@@ -121,6 +134,7 @@ function emptyState(): PersistedState {
     pairingFailedAttempts: 0,
     loops: [],
     boundChannels: {},
+    workspaces: {},
   };
 }
 
@@ -854,5 +868,36 @@ export class GatewayStore {
   async setHomeChatId(chatId: string | undefined): Promise<void> {
     this.state.homeChatId = chatId;
     await this.save();
+  }
+
+  getWorkspaces(): Record<string, string> {
+    return { ...(this.state.workspaces ?? {}) };
+  }
+
+  getWorkspace(alias: string): string | undefined {
+    const key = alias.trim().toLowerCase().replace(/^@+/, "");
+    if (!key) return undefined;
+    return this.state.workspaces?.[key];
+  }
+
+  async setWorkspace(alias: string, dirPath: string): Promise<string> {
+    const key = alias.trim().toLowerCase().replace(/^@+/, "");
+    if (!key || !/^[a-z0-9._-]+$/.test(key)) {
+      throw new Error("Workspace alias must match [a-z0-9._-]+");
+    }
+    this.state.workspaces ??= {};
+    this.state.workspaces[key] = dirPath;
+    await this.save();
+    return key;
+  }
+
+  async deleteWorkspace(alias: string): Promise<boolean> {
+    const key = alias.trim().toLowerCase().replace(/^@+/, "");
+    if (!key || !this.state.workspaces || !(key in this.state.workspaces)) {
+      return false;
+    }
+    delete this.state.workspaces[key];
+    await this.save();
+    return true;
   }
 }

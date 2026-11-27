@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## [0.4.0] - 2026-11-26
+
+### Session Reliability & Real-World Gateway Hardening
+
+- **Stale ACP session self-healing**: `AgyAgentBackend` now automatically detects pruned or expired upstream ACP sessions (`session not found` / `unknown session` / `-32002`) during `loadSession` and pre-stream `prompt`, seamlessly creating a fresh session (re-applying saved model/effort/mode) instead of wedging the chat after restarts or idle evictions.
+- **Isolated cron/loop execution**: Scheduled `/loop` prompts now run under an isolated per-job backend session key and release their ephemeral session on completion — preventing background schedules from clobbering, resetting, or polluting interactive conversation history or `cwd` in `state.json`.
+- **Zero leaked typing/progress timers on shutdown**: `GatewayRouter.stop()` now drains all active typing indicators and progress polling handles cleanly during shutdown.
+
+### Agent Harness Power Features
+
+- **Full 5-field cron & daily schedules**: Upgraded `LoopScheduler` to support full standard 5-field cron expressions (`*`, `*/n`, ranges `1-5`, lists, stepped ranges, Sunday `0`/`7`, Vixie DOM/DOW semantics) alongside `HH:MM`, and exposed `/loop daily <HH:MM> <prompt>` and `/loop cron "<expr>" <prompt>` in chat.
+- **Mobile-friendly workspace bookmarks (`/cwd @alias`)**: Added `WORKSPACE_ALIASES` env support plus persistent `/cwd save <alias> [path]`, `/cwd rm <alias>`, `/cwd list`, and one-tap `/cwd @<alias>` switching.
+- **Portable secret-free backup & migration (`pnpm cli export` / `import`)**: Versioned JSON bundle for sessions, scheduled loops, and workspace bookmarks (excluding `.env` and auth lists by default), with `--dry-run` preview and `--remap-cwd <from>=<to>` cross-OS path rewriting.
+
+### Observability, Diagnostics & Zero-Friction Installers
+
+- **Prometheus `/metrics` endpoint & structured JSON logging**: `HealthServer` now exposes bounded-cardinality Prometheus metrics at `GET /metrics` (no sender/chat IDs; respects `HEALTH_TOKEN`), and `RotatingFileLogger` supports `LOG_FORMAT=json` with recursive secret redaction.
+- **Actionable `pnpm cli doctor`**: Displays redacted Zod field-level `.env` validation errors, honors `HEALTH_TOKEN`, flags unauthenticated non-loopback health bindings, inspects PID identity & native OS service status, and adds `--json` output plus opt-in `--probe-acp` live handshake checks.
+- **Checksum-verified one-line installers & smart docs-only CI**: Added `scripts/install.sh` (macOS/Linux) and `scripts/install.ps1` (Windows) verifying `SHA256SUMS.txt` against GitHub Releases, optional npm `--provenance` publishing in `release.yml`, `@types/node` major-version Dependabot pin, and a fast `changes` gate in `ci.yml` so Markdown/LICENSE-only PRs skip heavy multi-OS/Docker matrices while keeping secret scanning active.
+
 ## [0.3.0] - 2026-11-26
 
 ### Cross-Platform Support (macOS / Linux / Windows)

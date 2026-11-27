@@ -309,6 +309,6 @@ describe("Extracted command modules remain wired to GatewayRouter", () => {
     expect(channel.last()).toContain("No scheduled loops for this chat.");
 
     await send("/version");
-    expect(channel.last()).toContain("antigravity-gateway v0.3.0");
+    expect(channel.last()).toContain("antigravity-gateway v0.4.0");
   });
 });
