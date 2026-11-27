@@ -2,605 +2,439 @@
 
 # 🪐 Antigravity Gateway
 
-**Universal 20-Platform Multi-Channel Messaging Gateway for Google Antigravity (`agy acp`)**
+### Drive your local Google Antigravity agent from any chat app.
+### 在任何聊天软件里，远程驱动你本机的 Google Antigravity Agent。
 
-*通用 20 平台多通道 Google Antigravity 消息网关 — 无需公网域名与内网穿透，随时随地通过 iMessage / Telegram / Discord / Slack / 飞书 / 钉钉 / QQ / QQ 官方机器人 / 企业微信 / Matrix / Mattermost / LINE / IRC / Webhook / WhatsApp / Zulip / Rocket.Chat / Signal / Microsoft Teams / Google Chat 远程驱动你的本地 Antigravity Agent*
+One process bridges **`agy acp`** to **20 messaging platforms** (iMessage, Telegram, Discord, Slack, Feishu, DingTalk, QQ, WeCom, Matrix and more), with tool approvals, live progress, sessions and schedules, all **without a public domain, port forwarding or a reverse proxy**.
 
 <p>
-  <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/Node.js-22%2B%20%7C%2024%2B-339933?style=for-the-badge&logo=nodedotjs&logoColor=white" alt="Node.js 22+ / 24+" /></a>
-  <a href="#autostart--service-scripts--开机自启与后台服务"><img src="https://img.shields.io/badge/OS-macOS%20%7C%20Linux%20%7C%20Windows-111827?style=for-the-badge&logo=apple&logoColor=white" alt="macOS | Linux | Windows" /></a>
-  <a href="https://www.typescriptlang.org/"><img src="https://img.shields.io/badge/TypeScript-5.8%2B%20ESM-3178C6?style=for-the-badge&logo=typescript&logoColor=white" alt="TypeScript" /></a>
-  <a href="https://agentclientprotocol.com/"><img src="https://img.shields.io/badge/ACP-v1%20(%40agentclientprotocol%2Fsdk)-6E56CF?style=for-the-badge" alt="ACP v1" /></a>
-  <a href="#supported-channels--支持通道一览"><img src="https://img.shields.io/badge/Built--in%20Channels-20%20Platforms-0A84FF?style=for-the-badge" alt="20 Built-in Channels" /></a>
-  <a href="#supported-channels--支持通道一览"><img src="https://img.shields.io/badge/NAT--Friendly-Zero%20Public%20Domain-8B5CF6?style=for-the-badge" alt="NAT Friendly" /></a>
-  <a href="#slash-commands--斜杠命令"><img src="https://img.shields.io/badge/Quota%20Check-0%20Tokens-F59E0B?style=for-the-badge" alt="Zero-Token Quota" /></a>
-  <a href="#license"><img src="https://img.shields.io/badge/License-MIT-10B981?style=for-the-badge" alt="MIT License" /></a>
+  <a href="https://github.com/Relogys/Antigravity-gateway/actions/workflows/ci.yml"><img src="https://github.com/Relogys/Antigravity-gateway/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <a href="https://github.com/Relogys/Antigravity-gateway/actions/workflows/security.yml"><img src="https://github.com/Relogys/Antigravity-gateway/actions/workflows/security.yml/badge.svg" alt="Security" /></a>
+  <a href="https://github.com/Relogys/Antigravity-gateway/releases"><img src="https://img.shields.io/github/v/release/Relogys/Antigravity-gateway?color=0A84FF" alt="Release" /></a>
+  <img src="https://img.shields.io/badge/Node.js-%E2%89%A522-339933?logo=nodedotjs&logoColor=white" alt="Node.js >= 22" />
+  <img src="https://img.shields.io/badge/TypeScript-ESM-3178C6?logo=typescript&logoColor=white" alt="TypeScript ESM" />
+  <img src="https://img.shields.io/badge/ACP-v1-6E56CF" alt="ACP v1" />
+  <img src="https://img.shields.io/badge/macOS%20%7C%20Linux%20%7C%20Windows-supported-111827" alt="macOS | Linux | Windows" />
+  <img src="https://img.shields.io/badge/license-MIT-10B981" alt="MIT" />
 </p>
 
 <p>
-  <a href="#architecture--架构设计">Architecture</a> •
-  <a href="#supported-channels--支持通道一览">20 Channels</a> •
-  <a href="#quick-start--快速开始">Quick Start</a> •
-  <a href="docs/QUICKSTART.md">3-Min Guide</a> •
-  <a href="#channel-configuration--各平台环境变量">Env Vars</a> •
-  <a href="#cli--health-endpoint--命令行与健康检查">CLI &amp; Health</a> •
-  <a href="#slash-commands--斜杠命令">Slash Commands</a> •
-  <a href="#security--compliance--安全与合规">Security</a>
+  <a href="#-quick-start--快速开始"><b>Quick Start</b></a> ·
+  <a href="docs/QUICKSTART.md">3-Minute Guide</a> ·
+  <a href="#-supported-channels--支持平台">Channels</a> ·
+  <a href="#-chat-commands--聊天命令">Commands</a> ·
+  <a href="#%EF%B8%8F-configuration--配置">Configuration</a> ·
+  <a href="#-security--安全">Security</a> ·
+  <a href="CHANGELOG.md">Changelog</a>
 </p>
 
 </div>
 
 ---
 
-## Overview / 项目定位
+## ✨ Why / 为什么需要它
+
+`agy` is great at the keyboard. Antigravity Gateway lets you keep using it when you walk away:
+
+- 📱 **Ask from your phone.** Send a message in iMessage, Telegram or Feishu; your agent works on your machine and replies in the same chat.
+- ✅ **Approve tools remotely.** Permission prompts are forwarded to chat. Reply `/approve` or `/deny`, or switch to sandbox/auto mode.
+- 🧭 **Stay in control of long turns.** A live progress card, `/stop`, `/steer`, a busy queue and stall alerts.
+- ⏰ **Automate.** Recurring `/loop` prompts and zero-token `/remind` pushes that survive restarts.
+- 🔒 **Safe by default.** Fail-closed allowlists with 8-character DM pairing, loopback-only listeners, and secrets stripped from the agent's environment.
+
+> 中文简介：把本机已登录的 Antigravity CLI（`agy acp`）接到 20 个聊天平台。人不在电脑前，也能在手机上提问、审批工具调用、查看进度、管理会话和定时任务。14 个平台为纯出站连接，无需公网域名和内网穿透。
 
 > [!IMPORTANT]
-> **Compliance &amp; Positioning Notice / 合规与定位声明**
->
-> - **Strictly Compliant — Zero Reverse Proxy**: This project **does NOT provide any reverse proxy, OAuth token extraction/forwarding, account sharing, quota bypass, or any functionality that violates Google's Terms of Service**. Every request runs locally against your own officially installed and authenticated Google Antigravity CLI (`agy acp`) over the official Agent Client Protocol (ACP v1), or your own `GEMINI_API_KEY`.
-> - **Companion Agent Harness**: This is strictly an open-source client-side **harness companion tool** built to bridge everyday usability gaps in the native Antigravity CLI (multi-platform messaging, mobile tool-approval workflows, session persistence, and scheduled automations) so it feels as capable and ergonomic as modern agent workflows.
->
-> **合规声明**：本项目**不提供任何反向代理、OAuth 凭据提取/中转、账号共享、额度绕过或任何违反 Google 服务政策的能力**。所有交互均在本地通过官方 `agy acp` 协议直连你本人合法登录的 Google Antigravity CLI（或你自己的 `GEMINI_API_KEY`）。本项目的唯一目标是作为开源客户端 **Agent Harness 增强工具**，弥补 Antigravity 原生 CLI 在多平台消息接入、远程交互与日常自动化方面的体验短板。
-
-**Antigravity Gateway** turns local **Google Antigravity CLI (`agy acp`)** into an always-on, multi-platform engineering assistant. Enable any combination of the **20 built-in adapters** simultaneously via [`MultiChannelHub`](src/channels/hub.ts) — every platform runs behind NAT with **zero public domain or reverse-proxy setup required**.
-
-- **Concurrent Multi-Channel Hub (`MultiChannelHub`)**: Runs up to all 20 channels side by side in one process, namespacing conversations as `<channel>::<rawChatId>` with per-channel health tracking and non-blocking inbound dispatch (a failing channel never crashes healthy ones).
-- **14 Outbound-Only + 6 Loopback Receivers**: `photon`, `telegram`, `discord`, `slack`, `feishu`, `dingtalk`, `onebot`, `qqbot`, `matrix`, `mattermost`, `irc`, `zulip`, `rocketchat` and `signal` dial out (long polling / WebSocket / TLS) and need **zero inbound ports**; only `webhook`, `wecom`, `line`, `whatsapp`, `teams` and `googlechat` listen on callbacks, and they bind to `127.0.0.1` by default.
-- **Unified Gateway Core**: Every adapter shares fail-closed auth (`ALLOWED_SENDERS` + per-channel `*_ALLOWED_USERS` + 8-char DM pairing), interactive tool approval forwarding, busy turn control (`queue` / `interrupt` / `steer`), media/secret guards, zero-token `/usage`, and persistent `/loop` & `/remind` schedules.
-- **Native Rendering Everywhere**: iMessage uses UTF-16 Markdown styling (with automatic plain-text fallback), Telegram renders native HTML (`parse_mode: "HTML"`), Discord/Slack/Telegram support `editMessage` &amp; `deleteMessage`, plain-text channels (IRC, LINE, Signal, OneBot) get readable Markdown cleanup, and IDE `file:///` links are stripped on all 20 channels.
-- **Live Tool-Call Progress**: On editable platforms one compact card updates in-place during long turns (throttled, ≤48-char tool titles); `TOOL_PROGRESS_KEEP` decides whether it is deleted or kept as a summary, and `/progress` switches mode at runtime.
-- **Extensible by Design**: Drop in a new `src/channels/<name>.ts` exporting `createAdapter(config)` against [`ChannelAdapter`](src/types.ts) to add any custom platform.
+> **Compliance / 合规声明.** This is a client-side companion for the official CLI. It talks to **your own** signed-in `agy acp` over the official Agent Client Protocol, or to your own `GEMINI_API_KEY`. It does **not** proxy, extract or share OAuth tokens or accounts, and it does not bypass quotas.
+> 本项目不提供反向代理、OAuth 凭据提取或中转、账号共享、额度绕过等任何违反 Google 服务条款的能力。
 
 ---
 
-## Architecture / 架构设计
+## 🧩 How it works / 工作原理
 
 ```mermaid
 flowchart LR
-    subgraph Outbound["14 Outbound-Only Channels (Zero Inbound Ports / Behind NAT)"]
-        PH["📱 Photon iMessage (photon)<br/>Spectrum outbound TLS gRPC"]
-        TG["✈️ Telegram (telegram)<br/>Native Bot API long polling (0 extra deps)"]
-        DC["🎮 Discord (discord)<br/>discord.js Gateway WebSocket"]
-        SL["💼 Slack (slack)<br/>@slack/bolt Socket Mode"]
-        FS["🪶 Feishu / Lark 飞书 (feishu)<br/>Official WSClient long connection"]
-        DT["🔔 DingTalk 钉钉 (dingtalk)<br/>Official Stream Mode WebSocket"]
-        OB["🐧 QQ / OneBot v11 (onebot)<br/>Forward WS: NapCat / LLOneBot / Lagrange (0 extra deps)"]
-        QB["🤖 QQ Official Bot / QQ 官方机器人 (qqbot)<br/>OpenAPI v2 WS Gateway: C2C / Group / Guild (0 extra deps)"]
-        MX["🧩 Matrix (matrix)<br/>/_matrix/client/v3/sync long polling (0 extra deps)"]
-        MM["💬 Mattermost (mattermost)<br/>Native WebSocket + REST v4 (0 extra deps)"]
-        IR["🖥️ IRC (irc)<br/>RFC 1459 / IRCv3 TCP + TLS (0 extra deps)"]
-        ZP["💬 Zulip (zulip)<br/>Real-Time Events API long polling (0 extra deps)"]
-        RC["🚀 Rocket.Chat (rocketchat)<br/>DDP WebSocket + REST v1 (0 extra deps)"]
-        SG["🔒 Signal (signal)<br/>signal-cli-rest-api WS + poll fallback (0 extra deps)"]
+    subgraph Chat["💬 Your chat apps"]
+        A["14 outbound channels<br/>iMessage · Telegram · Discord · Slack<br/>Feishu · DingTalk · QQ · Matrix · …<br/><i>no inbound ports</i>"]
+        B["6 callback channels<br/>Webhook · WeCom · LINE · WhatsApp<br/>Teams · Google Chat<br/><i>127.0.0.1 by default</i>"]
     end
 
-    subgraph Callback["6 Loopback Callback Receivers (127.0.0.1 by default)"]
-        WH["🔗 Generic Webhook / HTTP API (webhook)<br/>POST /v1/messages + wait:true + SSE /v1/events"]
-        WC["🏢 WeCom / 企业微信自建应用 (wecom)<br/>WXBizMsgCrypt AES-256-CBC callback + REST push"]
-        LN["🟢 LINE (line)<br/>Messaging API webhook: HMAC-SHA256 + replyToken / push"]
-        WA["📗 WhatsApp Cloud API (whatsapp)<br/>Graph API + X-Hub-Signature-256 webhook"]
-        TM["🟣 Microsoft Teams (teams)<br/>Bot Framework + outgoing HMAC webhook"]
-        GC["🔵 Google Chat (googlechat)<br/>Chat App events + REST / incoming webhook"]
+    subgraph GW["🪐 Antigravity Gateway"]
+        H["MultiChannelHub<br/>&lt;channel&gt;::&lt;chatId&gt; · fault isolation"]
+        R["GatewayRouter<br/>auth & pairing · approvals<br/>busy queue / steer · commands"]
+        S["Store · Scheduler · Health<br/>state.json · /loop /remind · :18790"]
     end
 
-    subgraph Hub["MultiChannelHub (Concurrent Dispatch & Health)"]
-        HB["🔀 Channel Namespace Router<br/>&lt;channel&gt;::&lt;rawChatId&gt; • Fault Isolation"]
+    subgraph Agent["🤖 Your machine"]
+        ACP["agy acp<br/>(ACP v1 over stdio)"]
     end
 
-    subgraph Core["Gateway Core (Node.js / TypeScript)"]
-        RT["🛡️ GatewayRouter<br/>• Fail-closed Auth & 8-Char Pairing<br/>• Busy Queue / Steer / Interrupt<br/>• /channels, Slash Commands & Media Guard"]
-        ST["💾 GatewayStore<br/>Atomic JSON state.json"]
-        SC["⏰ LoopScheduler<br/>Loops & 0-Token Reminders"]
-        HL["🩺 HealthServer<br/>127.0.0.1:18790 (/healthz, /status)"]
-    end
-
-    subgraph Agent["AgentBackend (agy acp)"]
-        ACP["🤖 AgyAgentBackend<br/>• @agentclientprotocol/sdk (stdio)<br/>• Interactive / Sandbox / Auto Approvals<br/>• Multimodal Media & Session Resume"]
-        QU["📊 Zero-Token Quota<br/>agy -p '/usage' --output-format json"]
-    end
-
-    PH & TG & DC & SL & FS & DT <--> HB
-    OB & QB & MX & MM & IR <--> HB
-    ZP & RC & SG <--> HB
-    WH & WC & LN & WA & TM & GC <--> HB
-    HB <-->|Unified ChannelAdapter| RT
-    RT <--> ST
-    RT <--> SC
-    HL -.->|HealthSnapshot + channels| RT
-    RT <-->|AgentTurnInput / Result| ACP
-    RT -.->|5h / Weekly Quota| QU
+    A <--> H
+    B <--> H
+    H <--> R
+    R <--> S
+    R <-->|prompts · tool calls · media| ACP
 ```
 
----
-
-## Supported Channels / 支持通道一览
-
-Every channel is **optional** and automatically enabled when its credentials are configured in `.env`. Multiple channels run concurrently in `MultiChannelHub` across **20 platforms**; only **5 adapters are SDK-backed** (`spectrum-ts`, `discord.js`, `@slack/bolt`, `@larksuiteoapi/node-sdk`, `dingtalk-stream`), while the other **15 are zero-extra-dependency native Node 24 adapters**.
-
-| Channel | Name | Transport / SDK | Highlights &amp; NAT Traversal |
-| :--- | :--- | :--- | :--- |
-| **Photon iMessage** | `photon` | `spectrum-ts@^12.16.0` Outbound TLS gRPC | Flagship iMessage / SMS / RCS adapter; Spectrum gRPC behind NAT, native Markdown + mobile cards, polls, backgrounds, unsend &amp; contact card, 48h dedupe, zombie-stream probe, read receipts &amp; reactions |
-| **Telegram** | `telegram` | Native Bot API `getUpdates` Long Polling (**0 extra deps**) | Node 24 built-in `fetch`, no inbound port; group `@bot` / reply gating, photo/doc/voice/audio download, multipart uploads, typing &amp; reactions |
-| **Discord** | `discord` | `discord.js` Gateway WebSocket | Outbound gateway socket behind NAT; DM + guild mention gating (`DISCORD_ALLOW_GUILDS`), attachment download/upload, reply references, typing, reactions &amp; edits |
-| **Slack** | `slack` | `@slack/bolt` Socket Mode (`xoxb-` + `xapp-`) | Zero public URL; `app_mention` &amp; DM support, `thread_ts` continuity, Bearer file downloads, `filesUploadV2`, emoji reactions |
-| **Feishu / Lark 飞书** | `feishu` | Official `@larksuiteoapi/node-sdk` `WSClient` | Feishu (`feishu`) &amp; Lark (`lark`) domains; long connection behind NAT, resource downloads, image/file uploads &amp; reactions |
-| **DingTalk 钉钉** | `dingtalk` | Official Stream Mode WebSocket | Stream WebSocket robot callback (`TOPIC_ROBOT`) behind NAT; `sessionWebhook` reply caching, `@mention` detection, Markdown replies |
-| **QQ / OneBot v11** | `onebot` | Forward WebSocket client (**0 extra deps**) | Built-in Node 24 `WebSocket` for NapCat / LLOneBot / Lagrange; full string CQ-code &amp; segment array parsing, auto-reconnect, behind NAT |
-| **QQ Official Bot / QQ 官方机器人** | `qqbot` | Official OpenAPI v2 WebSocket Gateway (**0 extra deps**) | C2C / group / guild delivery; access-token refresh, heartbeat &amp; resume handled natively, `QQBOT_SANDBOX` toggle, no inbound port |
-| **WeCom / 企业微信** | `wecom` | `WXBizMsgCrypt` AES-256-CBC callback + REST push (**0 extra deps**) | Self-built app (自建应用) callback receiver on `127.0.0.1:18792` by default, SHA1 signature + AES decrypt/encrypt, passive XML replies and active REST `message/send` pushes |
-| **Matrix** | `matrix` | Native `/_matrix/client/v3/sync` long polling (**0 extra deps**) | Works with Element / Beeper / Synapse &amp; friends; `since`-token sync, encrypted-room plain-text replies, outbound upload via media repo |
-| **Mattermost** | `mattermost` | Native WebSocket + REST v4 (**0 extra deps**) | Self-hosted team chat behind NAT; `posted` event filtering, thread replies, file download/upload, typing indicators |
-| **LINE** | `line` | Messaging API Webhook (HMAC-SHA256 + replyToken / push) (**0 extra deps**) | Webhook listener on `127.0.0.1:18793` by default; `X-Line-Signature` verification over the raw body, `replyToken` fast replies with `push` fallback, image/file messages |
-| **IRC** | `irc` | Native RFC 1459 / IRCv3 TCP + TLS (**0 extra deps**) | Outbound client socket behind NAT; `NICK`/`USER` registration, SASL-free `PASS` auth, channel join list, PRIVMSG/NOTICE, auto-reconnect with backoff |
-| **WhatsApp Cloud API** | `whatsapp` | Meta Graph API Webhook + REST (**0 extra deps**) | Cloud API `messages` endpoint; `X-Hub-Signature-256` HMAC verification + `hub.verify_token` GET challenge, text plus image/audio/video/document media upload &amp; link, webhook receiver on `127.0.0.1:18794` |
-| **Zulip** | `zulip` | Real-Time Events API long polling (**0 extra deps**) | `register` + long-poll `/api/v1/events` behind NAT; stream topics &amp; private messages, optional `ZULIP_REQUIRE_MENTION` gating, API-key auth |
-| **Rocket.Chat** | `rocketchat` | Native DDP WebSocket + REST v1 (**0 extra deps**) | `stream-room-messages` subscription behind NAT, `chat.postMessage` REST replies, `@mention` gating, auto-reconnect with backoff |
-| **Signal** | `signal` | signal-cli-rest-api WebSocket + HTTP polling fallback (**0 extra deps**) | Self-hosted `signal-cli-rest-api`; `/v1/receive` WebSocket with polling fallback, `/v2/send` replies, 1:1 &amp; group routing, envelope dedupe |
-| **Microsoft Teams** | `teams` | Bot Framework + Outgoing / Incoming Webhook (**0 extra deps**) | Outgoing webhook `Authorization: HMAC` verification, Bot Framework client-credentials token with cached `serviceUrl`, Incoming Webhook fallback, thread replies; webhook receiver on `127.0.0.1:18795` |
-| **Google Chat** | `googlechat` | Chat App webhook + Chat REST API / Incoming Webhook (**0 extra deps**) | Event webhook on `127.0.0.1:18796` with verification-token / Bearer check, thread continuity, Chat REST `spaces/*/messages` or incoming-webhook replies |
-| **Generic Webhook / HTTP API** | `webhook` | Built-in Node `http` (`127.0.0.1:18791`) | `POST /v1/messages` (Bearer + HMAC-SHA256 + synchronous `wait: true` mode), `callbackUrl` webhooks &amp; `GET /v1/events` SSE stream for Siri Shortcuts, custom apps or bridges |
+Each enabled channel feeds one shared router, so every platform gets the same auth, approvals, commands and session handling. If one channel fails, the others keep running.
 
 ---
 
-## Quick Start / 快速开始
+## 📡 Supported channels / 支持平台
+
+A channel turns on automatically once its credentials are in `.env`. Run any combination at the same time.
+
+| Platform | Key | Connection | Needs inbound port? |
+| :--- | :--- | :--- | :---: |
+| 📱 **iMessage / SMS / RCS** (Photon) | `photon` | Spectrum gRPC over TLS (`spectrum-ts`) | No |
+| ✈️ **Telegram** | `telegram` | Bot API long polling | No |
+| 🎮 **Discord** | `discord` | Gateway WebSocket (`discord.js`) | No |
+| 💼 **Slack** | `slack` | Socket Mode (`@slack/bolt`) | No |
+| 🪶 **Feishu / Lark 飞书** | `feishu` | Official WSClient long connection | No |
+| 🔔 **DingTalk 钉钉** | `dingtalk` | Stream Mode WebSocket | No |
+| 🐧 **QQ via OneBot v11** (NapCat / LLOneBot / Lagrange) | `onebot` | Forward WebSocket | No |
+| 🤖 **QQ Official Bot QQ 官方机器人** | `qqbot` | OpenAPI v2 WebSocket gateway | No |
+| 🧩 **Matrix** (Element, Beeper, Synapse) | `matrix` | `/sync` long polling | No |
+| 💬 **Mattermost** | `mattermost` | WebSocket + REST v4 | No |
+| 🖥️ **IRC** | `irc` | TCP/TLS client | No |
+| 💬 **Zulip** | `zulip` | Real-time events long polling | No |
+| 🚀 **Rocket.Chat** | `rocketchat` | DDP WebSocket + REST | No |
+| 🔒 **Signal** (signal-cli-rest-api) | `signal` | WebSocket, polling fallback | No |
+| 🔗 **Generic Webhook / HTTP API** | `webhook` | `POST /v1/messages`, SSE `/v1/events` | Loopback `:18791` |
+| 🏢 **WeCom 企业微信** (self-built app) | `wecom` | Encrypted callback + REST push | Loopback `:18792` |
+| 🟢 **LINE** | `line` | Messaging API webhook | Loopback `:18793` |
+| 📗 **WhatsApp Cloud API** | `whatsapp` | Graph API webhook | Loopback `:18794` |
+| 🟣 **Microsoft Teams** | `teams` | Bot Framework / outgoing webhook | Loopback `:18795` |
+| 🔵 **Google Chat** | `googlechat` | Chat app events / incoming webhook | Loopback `:18796` |
+
+Only 5 channels use an SDK (`spectrum-ts`, `discord.js`, `@slack/bolt`, `@larksuiteoapi/node-sdk`, `dingtalk-stream`). The other 15 are dependency-free adapters built on Node's own `fetch`, `WebSocket`, `net`/`tls` and `crypto`.
 
 > [!TIP]
-> **First time here? Read the [3-Minute Platform Setup Guides &amp; Troubleshooting → docs/QUICKSTART.md](docs/QUICKSTART.md).**
-> Copy-paste `.env` recipes and credential walkthroughs for Photon, Telegram, Discord, Slack, Feishu, DingTalk, and OneBot — plus daily-ops commands, Docker, and a troubleshooting FAQ.
->
-> 中文提示：第一次使用请先阅读 **[三分钟快速上手 → docs/QUICKSTART.md](docs/QUICKSTART.md)**，内含各平台凭据获取步骤、可直接复制的 `.env`、日常运维命令与常见问题排查。
+> New to this? **Telegram is the quickest start**: one bot token, no public domain. Setup for every platform is in **[docs/QUICKSTART.md](docs/QUICKSTART.md)**.
 
-### 4-Step Quick Start / 四步快速开始
+---
 
-**Prerequisites / 前置条件**: **Node.js `>= 22`** (Node `24` recommended) and **`pnpm`**; **Google Antigravity CLI (`agy`)** on `PATH` and signed in (`agy --version`); credentials for **at least one** of the 20 channels (Telegram needs **0 public domain**).
+## 🚀 Quick start / 快速开始
+
+**You need / 准备：** Node.js **22+** (24 recommended), `pnpm` (`corepack enable pnpm`), the Antigravity CLI `agy` on your `PATH` and signed in (`agy --version`), plus credentials for at least one channel.
 
 ```bash
-# 1) Clone and run the interactive onboarding wizard (alias: pnpm cli init)
 git clone https://github.com/Relogys/Antigravity-gateway.git
 cd Antigravity-gateway
-pnpm setup
 
-# 2) Build once
-pnpm build
-
-# 3) Validate Node, agy, every channel, allowlist, and ports
-pnpm cli doctor
-
-# 4) Start the background daemon and follow the log
-pnpm cli start
+pnpm setup          # interactive wizard: pick channels, write .env
+pnpm build          # compile once
+pnpm cli doctor     # check Node, agy, channels, allowlist and ports
+pnpm cli start      # start the background daemon
 pnpm cli logs -n 120
 ```
 
-> Prefer manual setup? Run `pnpm install`, copy `.env.example` to `.env` (PowerShell: `Copy-Item .env.example .env`), fill in one channel, then `pnpm build` → `pnpm cli doctor` → `pnpm cli start`.
-
-Send a DM to your bot. With an empty allowlist the gateway replies with an **8-character pairing code** — approve it with `pnpm cli pair approve <CODE>` and chat normally. For TypeScript hot execution during development, use `pnpm dev`.
-
-### Docker / 容器
+<details>
+<summary>Prefer manual setup? / 手动配置</summary>
 
 ```bash
-cp .env.example .env     # fill in at least one channel
-docker compose up -d --build
-docker compose logs -f
-curl http://127.0.0.1:18790/healthz
+pnpm install
+cp .env.example .env      # PowerShell: Copy-Item .env.example .env
+# fill in ONE channel in .env
+pnpm build && pnpm cli doctor && pnpm cli start
 ```
 
-The container runs as the non-root `node` user, reads `./.env` read-only, persists state in `./data`, publishes only `127.0.0.1:18790`, and uses `restart: unless-stopped`. Mount your `agy` binary/credentials or set `GEMINI_API_KEY` — see [`Dockerfile`](Dockerfile) and the [Docker guide](docs/QUICKSTART.md#4-docker--容器部署).
+For hot reload during development, use `pnpm dev`.
+</details>
 
-### What you get out of the box / 开箱即用的体验
+### Your first message / 第一次对话
 
-- **Read receipts &amp; emoji reaction lifecycle**: an inbound message is marked read (**已读**) → reacts **👀** while `agy` works → **👍** on success / **👎** on error. Typing indicators refresh periodically during long turns.
-- **Photon dual-layer heartbeat**: a transport heartbeat watchdog plus an application-level probe (`PHOTON_HEARTBEAT_TIMEOUT_MS=180000`, `PHOTON_PROBE_SPACE_ID`) detects half-open iMessage streams and reconnects automatically after hours of idle time.
-- **Cross-channel inbound image vision**: photos from Photon, Telegram, Discord, WhatsApp, and Matrix are downloaded, cached, and forwarded to `agy` as native image attachments.
-- **Cross-platform Markdown rendering**: iMessage/Photon applies native UTF-16 styling even when replies contain URLs (automatically falling back to plain text on render errors, with mobile cards for wide tables capped by `PHOTON_MAX_CHUNK_CHARS=1600` so iOS never folds long bubbles); Telegram sends native HTML; Discord/Slack/Telegram delete and edit their own messages; IRC/LINE/Signal/OneBot receive Markdown-to-readable-text cleanup.
-- **Global privacy guard**: `file:///` IDE links are sanitized on every one of the 20 channels, so local workspace paths never leak into chat.
-- **Live tool-call progress &amp; `/progress`**: editable platforms (Telegram, Discord, Slack, …) show a single compact card updated in-place (`TOOL_PROGRESS_EDIT_INTERVAL_MS=1500`); `TOOL_PROGRESS_KEEP=false` deletes it when the final reply lands, `true` keeps a completed summary.
-- **Photon 1.0 native features**: `spectrum-ts@^12.16.0` adds startup cancellation via `Spectrum({ signal })`, heartbeat stream telemetry (`stream` / `lineId`), `senderDeviceId`, inbound polls, Mini App cards and group events — plus native `/poll`, `/bg`, `/unsend`, and `/card` commands.
-- **Daemon CLI**: `pnpm cli start`, `stop`, `restart`, `logs`, and `status` with a PID lock and graceful shutdown — plus the crash-backoff supervisor in [`scripts/start-gateway.ps1`](scripts/start-gateway.ps1).
-- **Docker &amp; Compose**: multi-stage `node:24-slim` image, non-root, built-in `/healthz` `HEALTHCHECK`, loopback-only port publishing.
+1. DM your bot. With no allowlist configured, it replies with an **8-character pairing code**.
+2. On your machine, approve it: `pnpm cli pair approve <CODE>`.
+3. Chat normally. Your message gets marked read and a 👀 reaction while `agy` works, then 👍 when it's done (👎 on error).
+
+> 中文提示：未登录 `agy` 时网关能启动但不会回复，请先在终端运行一次 `agy` 完成登录，或改用 `GEMINI_API_KEY`。
 
 ---
 
-## Channel Configuration / 各平台环境变量
+## 🎛️ Features / 功能一览
 
-Every variable below matches [`.env.example`](.env.example). Empty everywhere = deny all (DMs receive an 8-character pairing code instead). Leave unused values blank — a channel is simply not registered.
+<table>
+<tr>
+<td width="50%" valign="top">
 
-### Enablement Rules / 通道启用规则
+**Agent control**
+- Interactive, sandbox or auto tool approval, switchable per chat
+- Busy-turn policy: `queue`, `interrupt` or `steer`
+- Switch model, effort and ACP mode from chat
+- List, resume, title and compact ACP sessions
+- Per-channel session groups and working directories
+- Automatic retry of transient turn failures
 
-| Channel | Registered when |
+</td>
+<td width="50%" valign="top">
+
+**Chat experience**
+- Native rendering per platform: iMessage styling, Telegram HTML, plain-text cleanup for IRC, LINE, Signal and OneBot
+- One live progress card edited in place on Telegram, Discord and Slack
+- Images in from Photon, Telegram, Discord, WhatsApp and Matrix, passed to `agy` as attachments
+- Bursts of quick messages merged into one prompt
+- Long replies split cleanly, code fences kept intact
+
+</td>
+</tr>
+<tr>
+<td valign="top">
+
+**Automation**
+- `/loop` recurring prompts (`30m`, `2h`, `1d`)
+- `/remind` one-way pushes that use 0 AI tokens
+- `/usage` quota check that uses 0 tokens, with a low-quota warning
+- `pnpm cli send` to push a message from scripts
+- A GitHub Action to post CI events into your chat
+
+</td>
+<td valign="top">
+
+**Operations**
+- Daemon CLI with PID lock and graceful stop
+- Autostart via launchd, systemd `--user` or Task Scheduler
+- `/healthz`, `/readyz` and `/status` endpoints
+- Docker image on GHCR (`amd64` + `arm64`)
+- Photon heartbeat watchdog that reconnects half-open streams
+
+</td>
+</tr>
+</table>
+
+---
+
+## 💬 Chat commands / 聊天命令
+
+Send `/help` in any chat for the full list. Add `-h` to most commands for usage.
+
+**Always available, even mid-turn / 运行中随时可用**
+
+| Command | What it does |
 | :--- | :--- |
-| `photon` | **both** `SPECTRUM_PROJECT_ID` and `SPECTRUM_PROJECT_SECRET` are set |
-| `telegram` | `TELEGRAM_BOT_TOKEN` is set |
-| `discord` | `DISCORD_BOT_TOKEN` is set |
-| `slack` | **both** `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` are set |
-| `feishu` | **both** `FEISHU_APP_ID` and `FEISHU_APP_SECRET` are set |
-| `dingtalk` | **both** `DINGTALK_CLIENT_ID` and `DINGTALK_CLIENT_SECRET` are set |
-| `onebot` | `ONEBOT_WS_URL` is set (gateway dials out to the OneBot implementation) |
-| `qqbot` | **both** `QQBOT_APP_ID` and `QQBOT_CLIENT_SECRET` are set |
-| `wecom` | **corp id**, **agent id** and **secret** are all set |
-| `matrix` | **both** `MATRIX_HOMESERVER_URL` and `MATRIX_ACCESS_TOKEN` are set |
-| `mattermost` | **both** `MATTERMOST_BASE_URL` and `MATTERMOST_BOT_TOKEN` are set |
-| `line` | **both** `LINE_CHANNEL_ACCESS_TOKEN` and `LINE_CHANNEL_SECRET` are set |
-| `irc` | `IRC_HOST` is set (comma-separated `IRC_CHANNELS` to actually join rooms) |
-| `whatsapp` | **both** `WHATSAPP_ACCESS_TOKEN` and `WHATSAPP_PHONE_NUMBER_ID` are set |
-| `zulip` | **all of** `ZULIP_SITE`, `ZULIP_BOT_EMAIL` and `ZULIP_API_KEY` are set |
-| `rocketchat` | **all of** `ROCKETCHAT_URL`, `ROCKETCHAT_USER_ID` and `ROCKETCHAT_AUTH_TOKEN` are set |
-| `signal` | **both** `SIGNAL_API_URL` and `SIGNAL_ACCOUNT` are set |
-| `teams` | `TEAMS_WEBHOOK_SECRET`, **or both** `TEAMS_APP_ID` + `TEAMS_APP_PASSWORD`, **or** `TEAMS_INCOMING_WEBHOOK_URL` is set |
-| `googlechat` | **any of** `GOOGLECHAT_WEBHOOK_URL`, `GOOGLECHAT_ACCESS_TOKEN` or `GOOGLECHAT_VERIFICATION_TOKEN` is set |
-| `webhook` | `WEBHOOK_ENABLED=true` |
+| `/stop` | Cancel the active turn |
+| `/new [title]` · `/reset` | Start a fresh session (optionally titled) |
+| `/steer <prompt>` · `/s` | Interrupt and redirect the current turn |
+| `/queue [prompt\|list\|clear]` · `/q` | Queue a follow-up, list or clear the queue |
+| `/busy [queue\|interrupt\|steer]` | Choose what happens to messages sent mid-turn |
+| `/approve [once\|session\|always]` · `/deny [reason]` | Answer a pending tool permission |
+| `/yolo` | Toggle auto-approval for this chat (admins only in groups) |
+| `/progress [auto\|edit\|silence\|off\|keep\|delete]` | Live progress style and whether the card stays |
+| `/verbose [off\|brief\|full]` | How detailed progress pulses are |
+| `/status` · `/ping` | Session, model, queue and uptime |
+| `/channels` | Connection state of every channel |
+| `/usage` | Antigravity 5-hour and weekly quota (0 tokens) |
+| `/sethome` | Make this chat the recovery home |
+| `/whoami` · `/version` · `/help` | Who you are to the gateway, version, help |
 
-### Per-Channel Credentials &amp; Allowlists / 各平台配置
+**When idle / 空闲时**
 
-| Channel | Required Env Vars | Optional Env Vars |
-| :--- | :--- | :--- |
-| **Photon iMessage** | `SPECTRUM_PROJECT_ID`, `SPECTRUM_PROJECT_SECRET` | `PHOTON_READ_RECEIPTS=true`, `PHOTON_REACTIONS=true`, `PHOTON_MAX_CHUNK_CHARS=1600` |
-| **Telegram** | `TELEGRAM_BOT_TOKEN` | `TELEGRAM_ALLOWED_USERS`, `TELEGRAM_POLL_TIMEOUT_SEC=30` |
-| **Discord** | `DISCORD_BOT_TOKEN` | `DISCORD_ALLOWED_USERS`, `DISCORD_ALLOW_GUILDS=false` |
-| **Slack** | `SLACK_BOT_TOKEN` (`xoxb-...`), `SLACK_APP_TOKEN` (`xapp-...`) | `SLACK_ALLOWED_USERS` |
-| **Feishu / Lark 飞书** | `FEISHU_APP_ID`, `FEISHU_APP_SECRET` | `FEISHU_DOMAIN=feishu` (`feishu` \| `lark`), `FEISHU_ALLOWED_USERS` |
-| **DingTalk 钉钉** | `DINGTALK_CLIENT_ID`, `DINGTALK_CLIENT_SECRET` | `DINGTALK_ALLOWED_USERS` |
-| **QQ / OneBot v11** | `ONEBOT_WS_URL` (`ws://` or `wss://`) | `ONEBOT_ACCESS_TOKEN`, `ONEBOT_SELF_ID`, `ONEBOT_ALLOWED_USERS` |
-| **QQ Official Bot / QQ 官方机器人** | `QQBOT_APP_ID`, `QQBOT_CLIENT_SECRET` | `QQBOT_SANDBOX=false`, `QQBOT_ALLOWED_USERS` |
-| **WeCom / 企业微信** | `WECOM_CORP_ID`, `WECOM_AGENT_ID`, `WECOM_SECRET` | `WECOM_TOKEN`, `WECOM_ENCODING_AES_KEY`, `WECOM_HOST=127.0.0.1`, `WECOM_PORT=18792`, `WECOM_ALLOWED_USERS` |
-| **Matrix** | `MATRIX_HOMESERVER_URL`, `MATRIX_ACCESS_TOKEN` | `MATRIX_USER_ID`, `MATRIX_ALLOWED_USERS` |
-| **Mattermost** | `MATTERMOST_BASE_URL`, `MATTERMOST_BOT_TOKEN` | `MATTERMOST_ALLOWED_USERS` |
-| **LINE** | `LINE_CHANNEL_ACCESS_TOKEN`, `LINE_CHANNEL_SECRET` | `LINE_HOST=127.0.0.1`, `LINE_PORT=18793`, `LINE_ALLOWED_USERS` |
-| **IRC** | `IRC_HOST`, `IRC_CHANNELS` (comma-separated) | `IRC_PORT=6697`, `IRC_TLS=true`, `IRC_NICK=antigravity-bot`, `IRC_PASSWORD`, `IRC_ALLOWED_USERS` |
-| **WhatsApp Cloud API** | `WHATSAPP_ACCESS_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID` | `WHATSAPP_VERIFY_TOKEN`, `WHATSAPP_APP_SECRET`, `WHATSAPP_API_VERSION=v21.0`, `WHATSAPP_WEBHOOK_HOST=127.0.0.1`, `WHATSAPP_WEBHOOK_PORT=18794`, `WHATSAPP_WEBHOOK_PATH=/whatsapp/webhook`, `WHATSAPP_ALLOWED_USERS` |
-| **Zulip** | `ZULIP_SITE`, `ZULIP_BOT_EMAIL`, `ZULIP_API_KEY` | `ZULIP_STREAMS`, `ZULIP_REQUIRE_MENTION=true`, `ZULIP_ALLOWED_USERS` |
-| **Rocket.Chat** | `ROCKETCHAT_URL`, `ROCKETCHAT_USER_ID`, `ROCKETCHAT_AUTH_TOKEN` | `ROCKETCHAT_REQUIRE_MENTION=true`, `ROCKETCHAT_ALLOWED_USERS` |
-| **Signal** | `SIGNAL_API_URL`, `SIGNAL_ACCOUNT` | `SIGNAL_POLL_INTERVAL_MS=3000`, `SIGNAL_ALLOWED_USERS` |
-| **Microsoft Teams** | `TEAMS_WEBHOOK_SECRET`, or `TEAMS_APP_ID` + `TEAMS_APP_PASSWORD`, or `TEAMS_INCOMING_WEBHOOK_URL` | `TEAMS_TENANT_ID=botframework.com`, `TEAMS_WEBHOOK_HOST=127.0.0.1`, `TEAMS_WEBHOOK_PORT=18795`, `TEAMS_WEBHOOK_PATH=/teams/messages`, `TEAMS_ALLOWED_USERS` |
-| **Google Chat** | `GOOGLECHAT_WEBHOOK_URL`, or `GOOGLECHAT_ACCESS_TOKEN`, or `GOOGLECHAT_VERIFICATION_TOKEN` | `GOOGLECHAT_WEBHOOK_HOST=127.0.0.1`, `GOOGLECHAT_WEBHOOK_PORT=18796`, `GOOGLECHAT_WEBHOOK_PATH=/googlechat/events`, `GOOGLECHAT_ALLOWED_USERS` |
-| **Generic Webhook / HTTP API** | `WEBHOOK_ENABLED=true` | `WEBHOOK_HOST=127.0.0.1`, `WEBHOOK_PORT=18791`, `WEBHOOK_TOKEN`, `WEBHOOK_SECRET`, `WEBHOOK_CALLBACK_URL`, `WEBHOOK_ALLOWED_USERS` |
+| Command | What it does |
+| :--- | :--- |
+| `/retry` | Re-run the last prompt in this chat |
+| `/model [slug]` · `/effort [low\|medium\|high\|xhigh]` | Show or switch model and reasoning effort |
+| `/mode [default\|accept-edits\|auto\|plan]` | ACP session mode |
+| `/approvals [auto\|interactive\|sandbox]` | Tool approval policy |
+| `/sessions [channel\|all]` · `/groups` | List sessions, summarize channel session groups |
+| `/resume <id\|index>` · `/title [name]` | Resume a saved session, rename it |
+| `/compact` · `/compress` | Summarize and compact context |
+| `/cwd [path]` · `/discard` | Change working directory, drop local session state |
+| `/loop [list\|add <dur> <prompt>\|rm\|pause\|resume <id>]` | Recurring prompts |
+| `/remind <dur> <text>` | One-way reminder (0 tokens) |
 
-### Per-Channel `.env` Blocks / 各平台配置块
+**iMessage only (Photon) / 仅 iMessage**: `/poll <q> | <a> | <b>` native poll · `/bg [preset|clear|list]` one of 24 backgrounds · `/unsend` retract the last reply (~2 min) · `/card` share contact card.
 
-```env
-# Photon / Spectrum iMessage (enabled iff BOTH are set)
-SPECTRUM_PROJECT_ID=
-SPECTRUM_PROJECT_SECRET=
-PHOTON_READ_RECEIPTS=true
-PHOTON_REACTIONS=true
-PHOTON_MAX_CHUNK_CHARS=1600
+---
 
-# Telegram (Bot API long polling)
-TELEGRAM_BOT_TOKEN=
-TELEGRAM_ALLOWED_USERS=
-TELEGRAM_POLL_TIMEOUT_SEC=30
+## 🛠️ Admin CLI / 命令行
 
-# Discord (discord.js)
-DISCORD_BOT_TOKEN=
-DISCORD_ALLOWED_USERS=
-DISCORD_ALLOW_GUILDS=false
+```bash
+pnpm cli start [--foreground]     # start (daemon by default)
+pnpm cli stop | restart           # graceful, PID-verified
+pnpm cli logs -n 200              # tail the rotating log
+pnpm cli status                   # live health + store summary
+pnpm cli doctor                   # check Node, agy and every channel
+pnpm cli usage                    # 0-token quota check
+pnpm cli send --channel telegram --to <userId> "Hi"
 
-# Slack (Socket Mode: bot token xoxb-... + app-level token xapp-...)
-SLACK_BOT_TOKEN=
-SLACK_APP_TOKEN=
-SLACK_ALLOWED_USERS=
+pnpm cli pair list | clear
+pnpm cli pair approve <CODE>
+pnpm cli pair revoke telegram:<userId>
 
-# Feishu / Lark (domain: feishu | lark)
-FEISHU_APP_ID=
-FEISHU_APP_SECRET=
-FEISHU_DOMAIN=feishu
-FEISHU_ALLOWED_USERS=
-
-# DingTalk (Stream mode)
-DINGTALK_CLIENT_ID=
-DINGTALK_CLIENT_SECRET=
-DINGTALK_ALLOWED_USERS=
-
-# OneBot v11 / QQ (forward-WS client; e.g. ws://127.0.0.1:<port>)
-ONEBOT_WS_URL=
-ONEBOT_ACCESS_TOKEN=
-ONEBOT_SELF_ID=
-ONEBOT_ALLOWED_USERS=
-
-# QQ Bot (enabled iff app id and client secret are set)
-QQBOT_APP_ID=
-QQBOT_CLIENT_SECRET=
-QQBOT_SANDBOX=false
-QQBOT_ALLOWED_USERS=
-
-# WeCom / Enterprise WeChat (enabled iff corp id, agent id, and secret are set)
-WECOM_CORP_ID=
-WECOM_AGENT_ID=
-WECOM_SECRET=
-WECOM_TOKEN=
-WECOM_ENCODING_AES_KEY=
-WECOM_HOST=127.0.0.1
-WECOM_PORT=18792
-WECOM_ALLOWED_USERS=
-
-# Matrix (enabled iff homeserver URL and access token are set)
-MATRIX_HOMESERVER_URL=
-MATRIX_ACCESS_TOKEN=
-MATRIX_USER_ID=
-MATRIX_ALLOWED_USERS=
-
-# Mattermost (enabled iff base URL and bot token are set)
-MATTERMOST_BASE_URL=
-MATTERMOST_BOT_TOKEN=
-MATTERMOST_ALLOWED_USERS=
-
-# LINE Messaging API (enabled iff access token and channel secret are set)
-LINE_CHANNEL_ACCESS_TOKEN=
-LINE_CHANNEL_SECRET=
-LINE_HOST=127.0.0.1
-LINE_PORT=18793
-LINE_ALLOWED_USERS=
-
-# IRC (enabled when a host is set; channels are comma-separated)
-IRC_HOST=
-IRC_PORT=6697
-IRC_TLS=true
-IRC_NICK=antigravity-bot
-IRC_PASSWORD=
-IRC_CHANNELS=
-IRC_ALLOWED_USERS=
-
-# WhatsApp Cloud API (Meta Graph API; enabled iff access token + phone number id are set)
-WHATSAPP_ACCESS_TOKEN=
-WHATSAPP_PHONE_NUMBER_ID=
-WHATSAPP_VERIFY_TOKEN=
-WHATSAPP_APP_SECRET=
-WHATSAPP_API_VERSION=v21.0
-WHATSAPP_WEBHOOK_HOST=127.0.0.1
-WHATSAPP_WEBHOOK_PORT=18794
-WHATSAPP_WEBHOOK_PATH=/whatsapp/webhook
-WHATSAPP_ALLOWED_USERS=
-
-# Zulip (Real-Time Events API long polling behind NAT; enabled iff site + email + api key are set)
-ZULIP_SITE=
-ZULIP_BOT_EMAIL=
-ZULIP_API_KEY=
-ZULIP_STREAMS=
-ZULIP_REQUIRE_MENTION=true
-ZULIP_ALLOWED_USERS=
-
-# Rocket.Chat (DDP WebSocket behind NAT + REST v1; enabled iff url + user id + auth token are set)
-ROCKETCHAT_URL=
-ROCKETCHAT_USER_ID=
-ROCKETCHAT_AUTH_TOKEN=
-ROCKETCHAT_REQUIRE_MENTION=true
-ROCKETCHAT_ALLOWED_USERS=
-
-# Signal (via self-hosted signal-cli-rest-api WS/poll behind NAT; enabled iff api url + account are set)
-SIGNAL_API_URL=
-SIGNAL_ACCOUNT=
-SIGNAL_POLL_INTERVAL_MS=3000
-SIGNAL_ALLOWED_USERS=
-
-# Microsoft Teams (Outgoing Webhook HMAC or Bot Framework or Incoming Webhook)
-TEAMS_WEBHOOK_SECRET=
-TEAMS_APP_ID=
-TEAMS_APP_PASSWORD=
-TEAMS_TENANT_ID=botframework.com
-TEAMS_INCOMING_WEBHOOK_URL=
-TEAMS_WEBHOOK_HOST=127.0.0.1
-TEAMS_WEBHOOK_PORT=18795
-TEAMS_WEBHOOK_PATH=/teams/messages
-TEAMS_ALLOWED_USERS=
-
-# Google Chat (Chat App webhook + REST API or Incoming Webhook)
-GOOGLECHAT_WEBHOOK_URL=
-GOOGLECHAT_ACCESS_TOKEN=
-GOOGLECHAT_VERIFICATION_TOKEN=
-GOOGLECHAT_WEBHOOK_HOST=127.0.0.1
-GOOGLECHAT_WEBHOOK_PORT=18796
-GOOGLECHAT_WEBHOOK_PATH=/googlechat/events
-GOOGLECHAT_ALLOWED_USERS=
-
-# Generic Webhook / HTTP (avoid other local agents' ports 8789/9119/8765; health uses 18790)
-WEBHOOK_ENABLED=false
-WEBHOOK_HOST=127.0.0.1
-WEBHOOK_PORT=18791
-WEBHOOK_TOKEN=
-WEBHOOK_SECRET=
-WEBHOOK_CALLBACK_URL=
-WEBHOOK_ALLOWED_USERS=
+pnpm cli service install | uninstall | status
+pnpm cli service print --platform darwin|linux   # preview the unit file
 ```
 
-> [!NOTE]
-> **Loopback Listeners / 本地回调端口**: `webhook` (`18791`), `wecom` (`18792`), `line` (`18793`), `whatsapp` (`18794`), `teams` (`18795`) and `googlechat` (`18796`) bind to `127.0.0.1` by default, alongside the optional `HealthServer` (`18790`). Only expose a callback receiver through your own TLS reverse proxy or tunnel when the platform genuinely requires it — the other 14 channels never listen at all.
+---
 
-### Local Ports / 本地端口
+## ⚙️ Configuration / 配置
 
-| Port | Service | Endpoint / Notes |
-| :--- | :--- | :--- |
-| `18790` | `HealthServer` | Optional (`HEALTH_ENABLED=true`); `GET /healthz`, `GET /status` |
-| `18791` | `webhook` | `POST /v1/messages`, `GET /v1/events` (SSE) |
-| `18792` | `wecom` | Self-built app (自建应用) callback |
-| `18793` | `line` | Messaging API webhook |
-| `18794` | `whatsapp` | Cloud API verification (`hub.challenge`) + message events |
-| `18795` | `teams` | Outgoing webhook / Bot Framework activities |
-| `18796` | `googlechat` | Chat App event webhook |
+Everything lives in `.env`. **[`.env.example`](.env.example) is the full, commented reference.** Leave a value blank to turn that feature or channel off.
 
-All listeners above default to `127.0.0.1`. Override the host only through `*_HOST` / `*_WEBHOOK_HOST` with a deliberate TLS reverse proxy or tunnel in front.
-
-> [!IMPORTANT]
-> **Webhook Security Guard**: `webhook` refuses to bind to a non-loopback `WEBHOOK_HOST` unless `WEBHOOK_TOKEN` or `WEBHOOK_SECRET` is configured. For `POST /v1/messages`, pass `Authorization: Bearer <token>` and/or `X-Webhook-Signature: sha256=<hmac-hex>`. Set `"wait": true` in the request body to receive `{ "ok": true, "messageId": "...", "replies": [...] }` synchronously, or subscribe to `GET /v1/events` (SSE) / `WEBHOOK_CALLBACK_URL`.
-
-> [!TIP]
-> **Inbound Callback Signature Verification / 回调验签**: `wecom` verifies the SHA1 `msg_signature` + `timestamp` + `nonce` triple and decrypts `Encrypt` payloads with `WECOM_ENCODING_AES_KEY` (WXBizMsgCrypt AES-256-CBC), replying passively in XML; `line` verifies `X-Line-Signature` with `LINE_CHANNEL_SECRET` (HMAC-SHA256 over the raw body) and answers via `replyToken`, falling back to `push`. `whatsapp` answers the `hub.verify_token` challenge and verifies `X-Hub-Signature-256` (HMAC-SHA256) with `WHATSAPP_APP_SECRET`; `teams` verifies `Authorization: HMAC <base64>` with `TEAMS_WEBHOOK_SECRET` for outgoing webhooks (app credentials are used for outbound Bot Framework replies); `googlechat` checks `GOOGLECHAT_VERIFICATION_TOKEN` against the event `token` or a Bearer header. Configure the matching secret/token so unsigned or tampered callbacks are rejected.
-
-### Global Access Control &amp; Core Settings / 全局访问控制与核心配置
+### Core settings / 核心配置
 
 ```env
-# Global allowlist: Photon entries are E.164 phone numbers or Apple ID emails.
-# Entries for other channels use "<channel>:<userId>" (e.g. telegram:<userId>, irc:<nick>).
-# Unioned with per-channel *_ALLOWED_USERS and CLI-paired senders.
-ALLOWED_SENDERS=<E.164-number>,<apple-id>@example.com
+# Who may talk to the agent. Photon: E.164 numbers or Apple ID emails.
+# Other channels: "<channel>:<userId>", e.g. telegram:123456789
+ALLOWED_SENDERS=
+ADMIN_SENDERS=                 # may approve others' requests and /yolo in groups
 ALLOW_GROUPS=false
 GROUP_MENTION_PATTERNS=@agy,@antigravity
 
-# Antigravity CLI (`agy`) backend
 AGY_BIN=agy
-DEFAULT_CWD=.
-APPROVAL_MODE=interactive
+DEFAULT_CWD=.                  # per channel: TELEGRAM_CWD=, PHOTON_CWD=, ...
+APPROVAL_MODE=interactive      # interactive | sandbox | auto
 DEFAULT_MODEL=
 DEFAULT_EFFORT=
-GEMINI_API_KEY=
-
-# Optional local health endpoint (disabled by default; strictly localhost)
-HEALTH_ENABLED=false
-HEALTH_HOST=127.0.0.1
-HEALTH_PORT=18790
-# Optional Bearer token protecting GET /status diagnostics (recommended if binding beyond loopback)
-HEALTH_TOKEN=
-QUOTA_WARN_THRESHOLD=15
+GEMINI_API_KEY=                # optional; disables /usage reporting
+AGY_PASSTHROUGH_ENV=           # extra env var names to pass to agy
 
 DATA_DIR=./data
-# Optional rotating log directory override (auto-falls back to <DATA_DIR>/logs for global npm installs)
 LOG_DIR=
 LOG_LEVEL=info
 ```
 
-### Rendering &amp; Live Progress / 渲染与实时进度
+Empty allowlists everywhere mean **deny all**; DMs get a pairing code instead.
 
-Outbound replies are adapted per platform. Markdown is never sent raw to channels that cannot render it, and malformed markup degrades to plain text instead of failing the send.
+<details>
+<summary><b>Channel credentials / 各平台凭据</b> (what turns each channel on)</summary>
 
-| Channel group | Rendering behavior |
-| :--- | :--- |
-| **Photon iMessage** | Native UTF-16 Markdown styling survives URLs; falls back to plain text on render errors. Wide tables become mobile-friendly cards; bubbles are capped at `PHOTON_MAX_CHUNK_CHARS` (default `1600`) to avoid iOS fold/collapse. |
-| **Telegram** | Native HTML (`parse_mode: "HTML"`) with automatic plain-text retry on parse errors; supports `editMessage` and `deleteMessage`. |
-| **Discord &amp; Slack** | Native `editMessage` / `deleteMessage`; IDE `file:///` links are removed before delivery. |
-| **IRC, LINE, Signal, OneBot** | Markdown is reduced to readable plain text (tables, emphasis, links). |
-| **All 20 channels** | Global `file:///` sanitization strips local IDE paths so workspace locations never reach chat. |
+| Channel | Required | Useful optional |
+| :--- | :--- | :--- |
+| `photon` | `SPECTRUM_PROJECT_ID`, `SPECTRUM_PROJECT_SECRET` | `PHOTON_READ_RECEIPTS`, `PHOTON_REACTIONS`, `PHOTON_MAX_CHUNK_CHARS=1600`, `PHOTON_HEARTBEAT_TIMEOUT_MS`, `PHOTON_PROBE_SPACE_ID` |
+| `telegram` | `TELEGRAM_BOT_TOKEN` | `TELEGRAM_ALLOWED_USERS`, `TELEGRAM_POLL_TIMEOUT_SEC` |
+| `discord` | `DISCORD_BOT_TOKEN` | `DISCORD_ALLOWED_USERS`, `DISCORD_ALLOW_GUILDS` |
+| `slack` | `SLACK_BOT_TOKEN` (`xoxb-`), `SLACK_APP_TOKEN` (`xapp-`) | `SLACK_ALLOWED_USERS` |
+| `feishu` | `FEISHU_APP_ID`, `FEISHU_APP_SECRET` | `FEISHU_DOMAIN=feishu\|lark`, `FEISHU_ALLOWED_USERS` |
+| `dingtalk` | `DINGTALK_CLIENT_ID`, `DINGTALK_CLIENT_SECRET` | `DINGTALK_ALLOWED_USERS` |
+| `onebot` | `ONEBOT_WS_URL` | `ONEBOT_ACCESS_TOKEN`, `ONEBOT_SELF_ID`, `ONEBOT_ALLOWED_USERS` |
+| `qqbot` | `QQBOT_APP_ID`, `QQBOT_CLIENT_SECRET` | `QQBOT_SANDBOX`, `QQBOT_ALLOWED_USERS` |
+| `wecom` | `WECOM_CORP_ID`, `WECOM_AGENT_ID`, `WECOM_SECRET` | `WECOM_TOKEN`, `WECOM_ENCODING_AES_KEY`, `WECOM_HOST`, `WECOM_PORT` |
+| `matrix` | `MATRIX_HOMESERVER_URL`, `MATRIX_ACCESS_TOKEN` | `MATRIX_USER_ID`, `MATRIX_ALLOWED_USERS` |
+| `mattermost` | `MATTERMOST_BASE_URL`, `MATTERMOST_BOT_TOKEN` | `MATTERMOST_ALLOWED_USERS` |
+| `line` | `LINE_CHANNEL_ACCESS_TOKEN`, `LINE_CHANNEL_SECRET` | `LINE_HOST`, `LINE_PORT` |
+| `irc` | `IRC_HOST`, `IRC_CHANNELS` | `IRC_PORT=6697`, `IRC_TLS`, `IRC_NICK`, `IRC_PASSWORD` |
+| `whatsapp` | `WHATSAPP_ACCESS_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID` | `WHATSAPP_VERIFY_TOKEN`, `WHATSAPP_APP_SECRET`, `WHATSAPP_WEBHOOK_*` |
+| `zulip` | `ZULIP_SITE`, `ZULIP_BOT_EMAIL`, `ZULIP_API_KEY` | `ZULIP_STREAMS`, `ZULIP_REQUIRE_MENTION` |
+| `rocketchat` | `ROCKETCHAT_URL`, `ROCKETCHAT_USER_ID`, `ROCKETCHAT_AUTH_TOKEN` | `ROCKETCHAT_REQUIRE_MENTION` |
+| `signal` | `SIGNAL_API_URL`, `SIGNAL_ACCOUNT` | `SIGNAL_POLL_INTERVAL_MS` |
+| `teams` | `TEAMS_WEBHOOK_SECRET`, **or** `TEAMS_APP_ID` + `TEAMS_APP_PASSWORD`, **or** `TEAMS_INCOMING_WEBHOOK_URL` | `TEAMS_TENANT_ID`, `TEAMS_WEBHOOK_*` |
+| `googlechat` | any of `GOOGLECHAT_WEBHOOK_URL`, `GOOGLECHAT_ACCESS_TOKEN`, `GOOGLECHAT_VERIFICATION_TOKEN` | `GOOGLECHAT_AUDIENCE` (recommended), `GOOGLECHAT_WEBHOOK_*` |
+| `webhook` | `WEBHOOK_ENABLED=true` | `WEBHOOK_TOKEN`, `WEBHOOK_SECRET`, `WEBHOOK_CALLBACK_URL`, `WEBHOOK_FIXED_SENDER`, `WEBHOOK_REPLAY_WINDOW_SEC`, `WEBHOOK_REQUIRE_TIMESTAMP` |
 
-Live tool-call feedback during long turns:
+Every channel also accepts `<CHANNEL>_ALLOWED_USERS`, merged with `ALLOWED_SENDERS` and paired senders.
+
+**Photon tips:** register the handle you send from under *Photon Dashboard → Users* (check the exact identifier at `https://debug.photon.codes`). On shared iMessage pools, send the **first** message from your Apple device to the project's number, or replies fail with `Target not allowed for this project`.
+</details>
+
+<details>
+<summary><b>Long turns & progress / 长任务与进度</b></summary>
 
 ```env
-# auto | edit | silence | off (auto = in-place edits where supported, silence pulses on iMessage)
-TOOL_PROGRESS_MODE=auto
-# false (default) deletes the temporary progress card on completion; true keeps a compact summary
-TOOL_PROGRESS_KEEP=false
-# Minimum ms between in-place edits (platform rate limits)
+TOOL_PROGRESS_MODE=auto            # auto | edit | silence | off
+TOOL_PROGRESS_KEEP=false           # true keeps a summary card after the reply
 TOOL_PROGRESS_EDIT_INTERVAL_MS=1500
+PROGRESS_SILENCE_MS=120000         # pulse after this much silence (0 = off)
+SESSION_STALL_TIMEOUT_MS=300000    # warn once when a turn stalls
+TURN_MAX_RETRIES=2                 # retries for transient ACP failures
+INGRESS_DEBOUNCE_MS=350            # merge rapid-fire bubbles
+AUTO_BOOTSTRAP_CHANNEL_SESSION=true
+QUOTA_WARN_THRESHOLD=15            # % of 5-hour quota left
 ```
 
-- **`edit`**: one compact card updated in place, with clean ≤48-character tool titles.
-- **`silence`**: short progress pulses only — used on iMessage to avoid Apple's 5-edit limit.
-- **`off`**: no live card (final answer and stall alerts still work).
-- Switch at runtime with `/progress [auto|edit|silence|off|keep|delete]`; `keep`/`delete` toggle the final disposition for the current chat.
+`auto` edits one card in place where the platform allows it, and uses short pulses on iMessage to stay under Apple's 5-edit limit.
+</details>
 
-### Photon Dashboard &amp; Inbound-First Note / Photon 后台与首条消息规则
+<details>
+<summary><b>Health endpoint & local ports / 健康检查与端口</b></summary>
 
-1. In **Photon Dashboard -> Users**, register the Apple Messages handle you send from (E.164 phone number or Apple ID email; verify your exact identifier at `https://debug.photon.codes`).
-2. **Inbound-First Rule**: On Photon shared iMessage pools, **send the first message from your Apple device to your project's assigned number** before the gateway sends outbound replies (`Target not allowed for this project` otherwise).
+```env
+HEALTH_ENABLED=false
+HEALTH_HOST=127.0.0.1
+HEALTH_PORT=18790
+HEALTH_TOKEN=          # Bearer token for /status; set it if you bind beyond loopback
+```
 
----
+| Endpoint | Meaning |
+| :--- | :--- |
+| `GET /healthz` | Liveness: `200` while at least one channel is connected |
+| `GET /readyz` | Readiness: `200` only when every configured channel is connected |
+| `GET /status` | Full diagnostics per channel, errors redacted |
 
-## CLI &amp; Health Endpoint / 命令行与健康检查
+| Port | Used by |
+| :--- | :--- |
+| `18790` | Health server |
+| `18791`–`18796` | `webhook`, `wecom`, `line`, `whatsapp`, `teams`, `googlechat` callbacks |
 
-### Admin CLI (`pnpm cli ...`)
+All bind to `127.0.0.1` by default. Expose a callback only through your own TLS reverse proxy or tunnel, and only when that platform requires it.
+</details>
+
+<details>
+<summary><b>Webhook / HTTP API</b></summary>
 
 ```bash
-pnpm cli start                                         # Start the gateway as a background daemon (logs/gateway.log)
-pnpm cli start --foreground                            # Run in the foreground instead
-pnpm cli stop                                          # Graceful stop with PID identity check (SIGTERM; taskkill fallback on Windows)
-pnpm cli restart                                       # Stop + start
-pnpm cli logs -n 200                                   # Tail the rotating log file
-pnpm cli service install                               # Install native autostart (macOS launchd / Linux systemd --user / Windows Task)
-pnpm cli service uninstall                             # Stop and remove the native autostart service
-pnpm cli service status                                # Check native autostart service state
-pnpm cli service print --platform darwin               # Preview generated launchd plist (or --platform linux for systemd unit)
-pnpm cli doctor                                        # Check Node, agy, and status of all 20 channels
-pnpm cli send --channel telegram --to <userId> "Hi"    # Send a one-off message through any configured channel
-pnpm cli status                                        # Query live health endpoint (supports HEALTH_TOKEN) + local store summary
-pnpm cli usage                                         # Zero-token Antigravity quota check
-pnpm cli pair list                                     # List pending pairing codes & approved senders
-pnpm cli pair approve ABCD2345                         # Approve an 8-character DM pairing code
-pnpm cli pair revoke telegram:<userId>                  # Revoke an approved sender
-pnpm cli pair clear                                    # Clear all pending pairing requests
+curl -X POST http://127.0.0.1:18791/v1/messages \
+  -H "Authorization: Bearer $WEBHOOK_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"chatId":"ops","text":"summarize the git log for today","wait":true}'
 ```
 
-### `GET /status`, `GET /healthz` &amp; `GET /readyz` Per-Channel Health Output
-
-When `HEALTH_ENABLED=true`, [`HealthServer`](src/health.ts) serves read-only JSON on `127.0.0.1:18790` with per-channel connectivity and timestamps (all error strings are redacted through `redactSecrets()`, and `/status` supports optional `Authorization: Bearer <HEALTH_TOKEN>` authentication):
-
-```json
-{
-  "status": "ok",
-  "startedAt": 1700000000000,
-  "uptimeMs": 42500,
-  "channelConnected": true,
-  "activeSessions": 2,
-  "activeTurns": 0,
-  "pendingPermissions": 0,
-  "activeLoops": 1,
-  "channels": {
-    "photon": { "name": "photon", "connected": true, "lastInboundAt": 1700000030000, "lastOutboundAt": 1700000032000 },
-    "telegram": { "name": "telegram", "connected": true, "lastInboundAt": 1700000040000 },
-    "whatsapp": { "name": "whatsapp", "connected": true, "lastInboundAt": 1700000045000 },
-    "zulip": { "name": "zulip", "connected": true, "lastInboundAt": 1700000048000 },
-    "wecom": { "name": "wecom", "connected": true, "lastInboundAt": 1700000050000 }
-  }
-}
-```
-
-- `GET /healthz` (liveness) returns HTTP `200` (`ok: true`) while the gateway is ready and at least one channel is connected (`503` on total outage), preventing single-channel flaps from crash-looping containers.
-- `GET /readyz` (readiness) strictly returns `200` only when all configured channels are connected (`status === "ok"`).
-- `GET /status` returns full sanitized diagnostics; set `HEALTH_TOKEN` to require `Authorization: Bearer <token>` (unauthenticated non-loopback requests automatically strip `lastError` details).
-- From any chat, run `/channels` to print the live connection status, last inbound/outbound ages, and any per-channel errors for **all 20 adapters**.
+With `"wait": true` you get `{ "ok": true, "messageId": "...", "replies": [...] }` back synchronously. Otherwise subscribe to `GET /v1/events` (SSE) or set `WEBHOOK_CALLBACK_URL`. Requests can be signed with `X-Webhook-Signature: sha256=<hmac>` plus `X-Webhook-Timestamp` and `X-Webhook-Id` for replay protection. The gateway refuses to bind a non-loopback host without a token or secret.
+</details>
 
 ---
 
-## Slash Commands / 斜杠命令
+## 📦 Deployment / 部署
 
-### Always Dispatchable While Busy / 运行中随时可触发
+### Run as a service / 开机自启
 
-| Command | Aliases | Purpose |
-| :--- | :--- | :--- |
-| `/stop` | `/cancel` | Cancel the active turn immediately |
-| `/new` | `/reset` | Cancel active turn, clear queue, and start a fresh ACP session |
-| `/status` | — | Show gateway health, uptime, active session, model, effort, mode, CWD, queue, loops |
-| `/channels` | — | Show all registered channels, connection state, and last inbound/outbound timing |
-| `/usage` | — | Run zero-token Antigravity 5h &amp; weekly quota check |
-| `/queue [prompt\|list\|clear]` | `/q` | Enqueue a follow-up prompt, inspect queue, or clear queued prompts |
-| `/steer <prompt>` | `/s` | Cancel active turn and redirect immediately with `<prompt>` |
-| `/busy [queue\|interrupt\|steer]` | — | Choose how messages arriving mid-turn are handled |
-| `/progress [auto\|edit\|silence\|off\|keep\|delete]` | — | View or switch live tool-call progress mode and whether the card is kept (`-h` for help) |
-| `/approve [once\|session\|always]` | — | Approve a pending interactive tool permission request |
-| `/deny [reason]` | — | Deny a pending interactive tool permission request |
-| `/yolo` | — | Toggle `auto` approval mode for the current chat |
-| `/whoami` | — | Display normalized sender ID, chat ID, service, and auth source |
-| `/help` | `/commands` | Display command reference |
-| `/version` | `/v` | Display gateway and Node.js versions |
+```bash
+pnpm build
+pnpm cli service install     # macOS launchd · Linux systemd --user · Windows Task Scheduler
+```
 
-### Session, Config &amp; Automation (When Idle) / 会话配置与定时任务
+Prefer plain scripts? See [`scripts/`](scripts/): `install-launchd.sh`, `install-systemd.sh`, `install-task.ps1`, and the crash-backoff supervisors `start-gateway.sh` / `start-gateway.ps1` (2s→60s backoff, 5 MB log rotation).
 
-| Command | Aliases | Purpose |
-| :--- | :--- | :--- |
-| `/model [slug]` | — | Show or switch model (supports composite slugs like `gemini-4-neon-high`) |
-| `/effort [low\|medium\|high\|xhigh]` | — | Show or set reasoning effort (`thought_level`) |
-| `/mode [default\|accept-edits\|auto\|plan]` | — | Show or set ACP session mode |
-| `/approvals [auto\|interactive\|sandbox]` | — | Show or set tool approval policy |
-| `/sessions` | — | List recent ACP sessions for the active workspace |
-| `/resume <id\|index>` | — | Attach and resume a saved ACP session by ID or `/sessions` index |
-| `/title [name]` | — | View or set a friendly title for the current chat session |
-| `/compact` | `/compress` | Summarize and compact active conversation context |
-| `/cwd [path]` | — | View or switch working directory (starts a clean session there) |
-| `/discard` | — | Discard local session state and clear pending queue |
-| `/loop [list\|add <dur> <prompt>\|rm <id>\|pause <id>\|resume <id>]` | — | Manage recurring prompt loops (e.g. `30m`, `2h`, `1d`) |
-| `/remind <dur> <text>` | — | Schedule a one-way reminder push (`0` AI tokens) |
+### Docker
 
-### Photon iMessage Native Commands / iMessage 原生命令
+```bash
+cp .env.example .env               # fill in at least one channel
+docker compose pull && docker compose up -d     # or: docker compose up -d --build
+curl http://127.0.0.1:18790/healthz
+```
 
-Available on the `photon` channel (`spectrum-ts@^12.16.0`):
+Image: `ghcr.io/relogys/antigravity-gateway` (`latest` and `vX.Y.Z`, `amd64` + `arm64`). It runs as non-root, reads `.env` read-only, keeps state in `./data`, and publishes only `127.0.0.1:18790`. `agy` isn't bundled: mount your binary and credentials, or set `GEMINI_API_KEY`. On Linux, run `mkdir -p data && sudo chown -R 1000:1000 data` first. Details in the [Docker guide](docs/QUICKSTART.md#4-docker--容器部署).
 
-| Command | Purpose |
-| :--- | :--- |
-| `/poll <question> \| <opt1> \| <opt2>` | Send a native iMessage poll (at least two options) |
-| `/bg [preset\|clear\|list]` | Apply one of 24 built-in Messages backgrounds, clear it, or list presets |
-| `/unsend` | Unsend the bot's most recent outbound message (~2-minute Apple window) |
-| `/card` | Share the native "Share Name and Photo" contact card |
+### Notify from GitHub Actions
+
+```yaml
+- uses: Relogys/Antigravity-gateway/.github/actions/notify@v0.3.0
+  with:
+    url: ${{ secrets.GATEWAY_WEBHOOK_URL }}
+    secret: ${{ secrets.GATEWAY_WEBHOOK_SECRET }}
+    chat-id: ops-alerts
+    text: "Deployed ${{ github.ref_name }}"
+```
 
 ---
 
-## Build a Custom `ChannelAdapter` / 扩展新通道
+## 🔐 Security / 安全
 
-Add a new module `src/channels/<name>.ts` exporting `createAdapter(config: GatewayConfig): ChannelAdapter` (extend [`BaseChannelAdapter`](src/channels/base.ts) for built-in stats and error isolation), and register its config block in [`src/config.ts`](src/config.ts):
+- **Fail-closed access.** Unknown senders get nothing but a pairing code: 8 unambiguous characters, valid for 1 hour, locked after 5 wrong tries.
+- **Group approvals are bound to the requester.** Only the person who triggered a tool call, or an `ADMIN_SENDERS` member, can approve it. `/yolo` in groups is admin-only.
+- **Clean child environment.** Before spawning `agy acp`, the gateway strips every channel credential and internal token, passing only OS runtime variables, `GEMINI_API_KEY` and keys you list in `AGY_PASSTHROUGH_ENV`.
+- **Verified callbacks.** Webhook (Bearer + HMAC + anti-replay), Google Chat (RS256 OIDC via `GOOGLECHAT_AUDIENCE`), WeCom (WXBizMsgCrypt), LINE, WhatsApp and Teams signatures are checked before dispatch.
+- **No leaks into chat.** `file:///` IDE paths are stripped on every channel, outbound `MEDIA:` refuses `.env*`, `.ssh` and private keys, and health errors are redacted.
+- **Durable state.** Cross-process store lock, `.bak` rollback and corrupt-file quarantine.
+- **CI checks.** CodeQL, a dependency audit and `pnpm audit:secrets` on every push.
+
+Found a vulnerability? Please follow [SECURITY.md](SECURITY.md) rather than opening a public issue.
+
+---
+
+## 🧱 Add your own channel / 扩展新平台
+
+Create `src/channels/<name>.ts`, extend [`BaseChannelAdapter`](src/channels/base.ts), export `createAdapter(config)`, and add its config block in [`src/config.ts`](src/config.ts):
 
 ```ts
 import type { GatewayConfig } from "../config.js";
@@ -613,14 +447,14 @@ export class MyChatAdapter extends BaseChannelAdapter {
   async start(onMessage: InboundHandler): Promise<void> {
     this.handler = onMessage;
     this.setConnected(true);
-    // Emit raw chatId & senderId via `await this.emit({ ... })`; MultiChannelHub namespaces chatId.
+    // call `await this.emit({ ... })` with the raw chatId and senderId
   }
 
   async stop(): Promise<void> {
     this.setConnected(false);
   }
 
-  async sendMessage(msg: OutboundMessage): Promise<{ messageId?: string } | void> {
+  async sendMessage(msg: OutboundMessage) {
     this.noteOutbound();
     return { messageId: "outbound-id" };
   }
@@ -631,61 +465,52 @@ export function createAdapter(config: GatewayConfig): ChannelAdapter {
 }
 ```
 
-Optional hooks (`sendTyping`, `markRead`, `react`, `editMessage`, `deleteMessage`) are automatically detected and invoked best-effort by `GatewayRouter`. `editMessage`/`deleteMessage` enable the in-place live tool-call progress card (see [Rendering &amp; Live Progress](#rendering--live-progress--渲染与实时进度)).
+Optional hooks (`sendTyping`, `markRead`, `react`, `editMessage`, `deleteMessage`) are detected automatically. Implement `editMessage` and `deleteMessage` to get the live progress card.
 
 ---
 
-## Autostart &amp; Service Scripts / 开机自启与后台服务
-
-First-class native service management on **macOS (Apple Silicon &amp; Intel `launchd`)**, **Linux (`systemd --user`)**, and **Windows (Task Scheduler)** via one command:
+## 🧪 Development / 开发
 
 ```bash
-pnpm build
-pnpm cli service install     # macOS launchd / Linux systemd --user / Windows Task Scheduler
-pnpm cli service status      # Check service status
-pnpm cli service uninstall   # Stop & remove service
+pnpm install
+pnpm dev            # run from source with tsx
+pnpm typecheck
+pnpm test           # vitest: 500+ tests across 38 files
+pnpm probe:acp      # smoke-test the agy ACP connection
+pnpm audit:secrets
 ```
 
-Or use the portable scripts in [`scripts/`](scripts/) directly (all paths resolved dynamically — zero hardcoded directories):
+CI runs on Ubuntu (Node 22 and 24), macOS (Apple Silicon, Node 24), Windows (Node 24) and a Docker build. Tagging `vX.Y.Z` publishes the GHCR image and a GitHub Release with the npm tarball and `SHA256SUMS.txt`.
 
-| Platform | Script | Purpose |
-| :--- | :--- | :--- |
-| **macOS** | [`scripts/install-launchd.sh`](scripts/install-launchd.sh) / [`uninstall-launchd.sh`](scripts/uninstall-launchd.sh) | Installs/removes `~/Library/LaunchAgents/com.antigravity.gateway.plist` with Homebrew `/opt/homebrew/bin` PATH &amp; crash-only `KeepAlive` |
-| **Linux** | [`scripts/install-systemd.sh`](scripts/install-systemd.sh) / [`uninstall-systemd.sh`](scripts/uninstall-systemd.sh) | Installs/removes `~/.config/systemd/user/antigravity-gateway.service` (`Restart=on-failure`, `NoNewPrivileges=true`) |
-| **macOS &amp; Linux** | [`scripts/start-gateway.sh`](scripts/start-gateway.sh) | Bash crash-backoff supervisor (`2s`→`60s`, 5 MB log rotation, `--one-shot`) |
-| **Windows** | [`scripts/install-task.ps1`](scripts/install-task.ps1) / [`uninstall-task.ps1`](scripts/uninstall-task.ps1) | Registers/unregisters Windows Scheduled Task `AntigravityGateway` (`AtLogOn`, hidden window) |
-| **Windows** | [`scripts/start-gateway.ps1`](scripts/start-gateway.ps1) | PowerShell crash-backoff supervisor (`2s`→`60s`, 5 MB log rotation, `-OneShot`) |
+<details>
+<summary>Project layout / 目录结构</summary>
 
----
-
-## GitHub Actions &amp; Releases / CI 集成与发版产物
-
-- **Cross-OS CI Matrix**: Every push and pull request is verified on **Ubuntu (Node 22 &amp; 24)**, **macOS Apple Silicon (Node 24)**, **Windows (Node 24)**, **Docker build**, and **CodeQL v4 + Secret Audit**.
-- **Pre-built Container Images (GHCR)**: Every tagged release publishes a multi-architecture (`linux/amd64`, `linux/arm64`) image to `ghcr.io/relogys/antigravity-gateway:latest` (and `:vX.Y.Z`), plus precompiled npm tarballs + `SHA256SUMS.txt` on GitHub Releases.
-- **Reusable Notify Action (`.github/actions/notify`)**: Send HMAC-signed, anti-replay (`X-Webhook-Timestamp` + `X-Webhook-Id`) notifications or Agent prompts from any GitHub Actions workflow directly into your gateway's Webhook channel:
-
-```yaml
-- uses: Relogys/Antigravity-gateway/.github/actions/notify@v0.3.0
-  with:
-    url: ${{ secrets.GATEWAY_WEBHOOK_URL }}
-    chat-id: ops-alerts
-    text: "Deployment finished on ${{ github.ref_name }}"
-    secret: ${{ secrets.GATEWAY_WEBHOOK_SECRET }}
 ```
+src/
+├── acp/           # agy acp client, sessions, permissions, quota
+├── channels/      # 20 adapters + hub, registry, formatting, media
+├── gateway/       # router, burst coalescing, progress, scheduler, store
+│   └── commands/  # session, system, loop and Photon slash commands
+├── photon/        # iMessage adapter, formatting, staleness probe
+├── cli.ts         # admin CLI (start/stop/doctor/pair/service/…)
+├── wizard.ts      # pnpm setup onboarding
+├── health.ts      # /healthz /readyz /status
+└── index.ts       # entry point
+scripts/           # service installers, supervisors, audits
+docs/QUICKSTART.md # per-platform setup and troubleshooting
+```
+</details>
 
 ---
 
-## Security &amp; Compliance / 安全与合规
+## 📚 More / 更多
 
-- **Official Protocol &amp; Auth Compliance**: Connects strictly through official `agy acp` using your local cached `agy` session or `GEMINI_API_KEY`. Never extracts or reverse-proxies OAuth tokens. (Note: `GEMINI_API_KEY` mode disables `/usage` quota reporting inside `agy`.)
-- **Child Process Environment Isolation**: Before spawning `agy acp`, `buildChildProcessEnv` strips credentials and configuration variables belonging to all 20 IM channels (plus internal gateway tokens), keeping only OS runtime variables, explicit `GEMINI_API_KEY`, and any user-selected `AGY_PASSTHROUGH_ENV` keys.
-- **Requester-Bound Group Approvals**: Pending tool permissions in group chats are bound to the originating `requesterSenderId`; only the requester or configured `ADMIN_SENDERS` can approve/deny, and `/yolo` in groups is restricted to `ADMIN_SENDERS`.
-- **Zero Public Listening Ports by Default**: The 14 outbound transports (`photon`, `telegram`, `discord`, `slack`, `feishu`, `dingtalk`, `onebot`, `qqbot`, `matrix`, `mattermost`, `irc`, `zulip`, `rocketchat`, `signal`) dial out over long polling / WebSocket / TLS and require zero inbound ports. The 6 callback receivers (`webhook` `127.0.0.1:18791`, `wecom` `127.0.0.1:18792`, `line` `127.0.0.1:18793`, `whatsapp` `127.0.0.1:18794`, `teams` `127.0.0.1:18795`, `googlechat` `127.0.0.1:18796`) and `HealthServer` (`127.0.0.1:18790` with `/healthz` liveness + `/readyz` readiness + `/status`) are disabled or loopback-only by default.
-- **Signed &amp; Anti-Replay Callbacks**: Inbound HTTP callbacks are verified before dispatch — `webhook` (Bearer + HMAC-SHA256 with `X-Webhook-Timestamp`/`X-Webhook-Id` anti-replay and optional `WEBHOOK_FIXED_SENDER`), `googlechat` (native RS256 OIDC Bearer JWT via `GOOGLECHAT_AUDIENCE` + Google JWKS), `wecom` (SHA1 + AES-256-CBC WXBizMsgCrypt), `line` (`X-Line-Signature` HMAC-SHA256), `whatsapp` (`X-Hub-Signature-256` HMAC-SHA256), and `teams` (`Authorization: HMAC`).
-- **Fail-Closed Auth, Durable State &amp; Secret Audit**: Default-deny DM pairing (8-char unambiguous code, 1h TTL, 5-attempt lockout) across all 20 channels, cross-process store locking with automatic `.bak` corruption recovery, outbound `MEDIA:<path>` guard against `.env*`/`.ssh`/private keys, global IDE `file:///` link sanitization on every channel, and `pnpm audit:secrets` + CodeQL in CI.
+- [docs/QUICKSTART.md](docs/QUICKSTART.md): credentials for each platform, Docker, daily operations and troubleshooting
+- [CHANGELOG.md](CHANGELOG.md): what changed in each release
+- [SECURITY.md](SECURITY.md): reporting vulnerabilities
 
----
+## 📄 License
 
-## License
+[MIT](LICENSE) © Relogys
 
-MIT
+<sub>Antigravity Gateway is an independent open-source project and is not affiliated with or endorsed by Google.</sub>
