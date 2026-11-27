@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## [0.4.2] - 2026-11-26
+
+### Interactive UX, Modularity & Zero High Prod Advisories
+
+- **Native interactive tool-approval buttons (Telegram & Discord)**: `GatewayRouter.notifyPermission()` now attaches `OutboundActionButton[]` (`✅ Allow Once`, `🔓 Allow Session`, `⭐ Always`, `🛑 Deny`) alongside the plain-text command fallback. `TelegramChannelAdapter` renders a 2-column `inline_keyboard` and handles `callback_query` updates (with immediate `answerCallbackQuery` acknowledgement and deduplication); `DiscordChannelAdapter` renders native ActionRow button components and handles `interactionCreate` button taps. Button clicks flow through the exact same fail-closed allowlist and requester-bound group permission checks as typed `/approve` / `/deny` commands.
+- **Modular `TurnExecutor` extraction**: Extracted turn execution, typing keep-alive, live progress cards, silence/stall watchdogs, isolated scheduled-loop execution, and outbound reply assembly into `src/gateway/turn-executor.ts`, shrinking `src/gateway/router.ts` by ~370 lines for clearer ownership and testability.
+- **Zero high production dependency advisories**: Upgraded `zod` from `3.25.76` to `^4.6.7` (supported by `@agentclientprotocol/sdk`), resolving `GHSA-mrhx-c7xc-m3w5` so `pnpm audit --prod --audit-level=high` exits `0` cleanly.
+
 ## [0.4.1] - 2026-11-26
 
 ### Security (Zero CodeQL High Alerts)

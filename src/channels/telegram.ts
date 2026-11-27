@@ -6,6 +6,7 @@ import type {
   ChannelAdapter,
   InboundAttachment,
   InboundMessage,
+  OutboundActionButton,
   OutboundAttachment,
   OutboundMessage,
 } from "../types.js";
@@ -15,6 +16,7 @@ import { MAX_INBOUND_MEDIA_BYTES, downloadInboundMedia } from "./media.js";
 import {
   BoundedDedupeCache,
   MAX_INLINE_MEDIA_BYTES,
+  actionCallbackToCommand,
   chunkText,
   downloadToBuffer,
   errorMessage,
@@ -93,9 +95,17 @@ interface TgMessage {
   };
 }
 
+interface TgCallbackQuery {
+  id: string;
+  from: TgUser;
+  message?: TgMessage;
+  data?: string;
+}
+
 interface TgUpdate {
   update_id: number;
   message?: TgMessage;
+  callback_query?: TgCallbackQuery;
 }
 
 interface TgApiResponse<T> {
@@ -216,6 +226,29 @@ export class TelegramChannelAdapter extends BaseChannelAdapter {
 
   // ---------------------------------------------------------------- outbound
 
+  private buildInlineKeyboard(
+    actions: OutboundActionButton[] | undefined,
+  ): { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> } | undefined {
+    if (!actions || actions.length === 0) {
+      return undefined;
+    }
+    const buttons = actions
+      .filter((a) => a.id.trim() && a.label.trim())
+      .map((a) => ({
+        text: a.label.trim().slice(0, 64),
+        // Telegram limits callback_data to 64 UTF-8 bytes.
+        callback_data: a.id.trim().slice(0, 64),
+      }));
+    if (buttons.length === 0) {
+      return undefined;
+    }
+    const rows: Array<Array<{ text: string; callback_data: string }>> = [];
+    for (let i = 0; i < buttons.length; i += 2) {
+      rows.push(buttons.slice(i, i + 2));
+    }
+    return { inline_keyboard: rows };
+  }
+
   async sendMessage(msg: OutboundMessage): Promise<{ messageId?: string } | void> {
     let lastId: string | undefined;
     const markdown = msg.markdown === true;
@@ -223,19 +256,23 @@ export class TelegramChannelAdapter extends BaseChannelAdapter {
       msg.text ?? "",
       markdown ? TELEGRAM_MARKDOWN_MAX_TEXT : TELEGRAM_MAX_TEXT,
     );
+    const replyMarkup = this.buildInlineKeyboard(msg.actions);
     const replyTo = msg.replyToMessageId ? Number(msg.replyToMessageId) : undefined;
     let replyParams: Record<string, unknown> | undefined =
       replyTo !== undefined && Number.isFinite(replyTo)
         ? { message_id: replyTo, allow_sending_without_reply: true }
         : undefined;
 
-    for (const chunk of chunks) {
+    for (let i = 0; i < chunks.length; i += 1) {
+      const chunk = chunks[i]!;
+      const markup = i === chunks.length - 1 ? replyMarkup : undefined;
       const sent = markdown
-        ? await this.sendMarkdownChunk(msg.chatId, chunk, replyParams)
+        ? await this.sendMarkdownChunk(msg.chatId, chunk, replyParams, markup)
         : await this.call<{ message_id: number }>("sendMessage", {
             chat_id: msg.chatId,
             text: chunk,
             ...(replyParams ? { reply_parameters: replyParams } : {}),
+            ...(markup ? { reply_markup: markup } : {}),
           });
       replyParams = undefined; // only the first chunk quotes the original
       lastId = String(sent.message_id);
@@ -260,10 +297,12 @@ export class TelegramChannelAdapter extends BaseChannelAdapter {
     chatId: string,
     chunk: string,
     replyParams?: Record<string, unknown>,
+    replyMarkup?: Record<string, unknown>,
   ): Promise<{ message_id: number }> {
     const base: Record<string, unknown> = {
       chat_id: chatId,
       ...(replyParams ? { reply_parameters: replyParams } : {}),
+      ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
     };
     try {
       return await this.call<{ message_id: number }>("sendMessage", {
@@ -391,7 +430,7 @@ export class TelegramChannelAdapter extends BaseChannelAdapter {
           {
             offset: this.offset || undefined,
             timeout: this.pollTimeoutSec,
-            allowed_updates: ["message"],
+            allowed_updates: ["message", "callback_query"],
           },
           signal,
           (this.pollTimeoutSec + 15) * 1000,
@@ -422,11 +461,17 @@ export class TelegramChannelAdapter extends BaseChannelAdapter {
   }
 
   private async handleUpdate(update: TgUpdate): Promise<void> {
-    const message = update.message;
-    if (!message) {
+    if (this.dedupe.seen(`update:${update.update_id}`)) {
       return;
     }
-    if (this.dedupe.seen(`update:${update.update_id}`)) {
+
+    if (update.callback_query) {
+      await this.handleCallbackQuery(update.callback_query);
+      return;
+    }
+
+    const message = update.message;
+    if (!message) {
       return;
     }
     if (this.dedupe.seen(`msg:${message.chat.id}:${message.message_id}`)) {
@@ -441,6 +486,41 @@ export class TelegramChannelAdapter extends BaseChannelAdapter {
       return;
     }
     await this.emit(inbound);
+  }
+
+  private async handleCallbackQuery(cb: TgCallbackQuery): Promise<void> {
+    if (this.dedupe.seen(`cb:${cb.id}`)) {
+      return;
+    }
+    if (cb.from?.is_bot) {
+      return;
+    }
+    const command = actionCallbackToCommand(cb.data ?? "");
+    // Always acknowledge the callback query quickly so Telegram clears its loading spinner.
+    await this.call("answerCallbackQuery", {
+      callback_query_id: cb.id,
+      text: command ? "Sent" : "Unsupported action",
+    }).catch(() => {});
+
+    if (!command || !cb.message?.chat) {
+      return;
+    }
+    const chatId = String(cb.message.chat.id);
+    const isGroup =
+      cb.message.chat.type === "group" || cb.message.chat.type === "supergroup";
+    await this.emit({
+      id: `cb:${cb.id}`,
+      channel: this.name,
+      chatId,
+      senderId: String(cb.from.id),
+      isGroup,
+      text: command,
+      attachments: [],
+      replyToMessageId: String(cb.message.message_id),
+      timestamp: Date.now(),
+      mentionsBot: true,
+      raw: cb,
+    });
   }
 
   private async toInbound(message: TgMessage): Promise<InboundMessage | undefined> {

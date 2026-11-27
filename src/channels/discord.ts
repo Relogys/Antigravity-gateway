@@ -5,6 +5,7 @@ import type {
   ChannelAdapter,
   InboundAttachment,
   InboundMessage,
+  OutboundActionButton,
   OutboundMessage,
 } from "../types.js";
 import { BaseChannelAdapter, type InboundHandler } from "./base.js";
@@ -13,6 +14,7 @@ import { MAX_INBOUND_MEDIA_BYTES, downloadInboundMedia } from "./media.js";
 import {
   BoundedDedupeCache,
   MAX_INLINE_MEDIA_BYTES,
+  actionCallbackToCommand,
   chunkText,
   downloadToBuffer,
   isMentioned,
@@ -62,6 +64,19 @@ export interface DiscordMessageLike {
   channel?: {
     messages?: { cache?: { get?(id: string): DiscordMessageLike | undefined } };
   };
+}
+
+export interface DiscordButtonInteractionLike {
+  id: string;
+  type?: number;
+  customId?: string;
+  channelId?: string | null;
+  guildId?: string | null;
+  user?: { id: string; bot?: boolean };
+  message?: { id?: string };
+  isButton?(): boolean;
+  deferUpdate?(): Promise<unknown>;
+  reply?(options: Record<string, unknown>): Promise<unknown>;
 }
 
 export interface DiscordSendableChannel {
@@ -220,6 +235,9 @@ export class DiscordChannelAdapter extends BaseChannelAdapter {
     client.on("messageCreate", (message: DiscordMessageLike) => {
       void this.handleMessage(message).catch((err) => this.noteError(err));
     });
+    client.on("interactionCreate", (interaction: DiscordButtonInteractionLike) => {
+      void this.handleInteraction(interaction).catch((err) => this.noteError(err));
+    });
     client.on("shardResume", () => this.setConnected(true));
     client.on("shardReconnecting", () => this.setConnected(false));
     client.on("shardDisconnect", () => this.setConnected(false));
@@ -307,6 +325,11 @@ export class DiscordChannelAdapter extends BaseChannelAdapter {
       return;
     }
 
+    const components = this.buildActionRows(msg.actions);
+    if (components && payloads.length > 0) {
+      payloads[payloads.length - 1]!.components = components;
+    }
+
     if (msg.replyToMessageId) {
       payloads[0]!.reply = {
         messageReference: msg.replyToMessageId,
@@ -322,6 +345,82 @@ export class DiscordChannelAdapter extends BaseChannelAdapter {
     }
     this.noteOutbound();
     return lastId ? { messageId: lastId } : undefined;
+  }
+
+  private buildActionRows(
+    actions: OutboundActionButton[] | undefined,
+  ): Array<Record<string, unknown>> | undefined {
+    if (!actions || actions.length === 0) {
+      return undefined;
+    }
+    const buttons = actions
+      .filter((a) => a.id.trim() && a.label.trim())
+      .map((a) => ({
+        type: 2, // Discord ComponentType.Button
+        custom_id: a.id.trim().slice(0, 100),
+        label: a.label.trim().slice(0, 80),
+        style: a.style === "danger" ? 4 : a.style === "primary" ? 1 : 2,
+      }));
+    if (buttons.length === 0) {
+      return undefined;
+    }
+    const rows: Array<Record<string, unknown>> = [];
+    for (let i = 0; i < buttons.length && rows.length < 5; i += 5) {
+      rows.push({
+        type: 1, // Discord ComponentType.ActionRow
+        components: buttons.slice(i, i + 5),
+      });
+    }
+    return rows;
+  }
+
+  private async handleInteraction(
+    interaction: DiscordButtonInteractionLike,
+  ): Promise<void> {
+    if (!interaction || !interaction.id) {
+      return;
+    }
+    const isBtn =
+      typeof interaction.isButton === "function"
+        ? interaction.isButton()
+        : interaction.type === 3 && typeof interaction.customId === "string";
+    if (!isBtn) {
+      return;
+    }
+    if (this.dedupe.seen(`int:${interaction.id}`)) {
+      return;
+    }
+    if (!interaction.user || interaction.user.bot) {
+      return;
+    }
+    const command = actionCallbackToCommand(interaction.customId ?? "");
+    if (!command) {
+      return;
+    }
+
+    if (typeof interaction.deferUpdate === "function") {
+      await interaction.deferUpdate().catch(() => {});
+    } else if (typeof interaction.reply === "function") {
+      await interaction.reply({ content: "Sent", flags: 64 }).catch(() => {});
+    }
+
+    const chatId = interaction.channelId;
+    if (!chatId) {
+      return;
+    }
+    await this.emit({
+      id: `int:${interaction.id}`,
+      channel: this.name,
+      chatId,
+      senderId: interaction.user.id,
+      isGroup: Boolean(interaction.guildId),
+      text: command,
+      attachments: [],
+      replyToMessageId: interaction.message?.id,
+      timestamp: Date.now(),
+      mentionsBot: true,
+      raw: interaction,
+    });
   }
 
   async sendTyping(chatId: string, active: boolean): Promise<void> {

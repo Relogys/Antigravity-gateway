@@ -50,6 +50,15 @@ export interface OutboundAttachment {
   mimeType?: string;
 }
 
+export interface OutboundActionButton {
+  /** Action identifier emitted back on button click (e.g. `perm:once`, `perm:deny`). */
+  id: string;
+  /** Visible button text. */
+  label: string;
+  /** Semantic style mapped natively on platforms that support styled buttons. */
+  style?: "primary" | "secondary" | "danger";
+}
+
 export interface OutboundMessage {
   chatId: string;
   text?: string;
@@ -57,6 +66,8 @@ export interface OutboundMessage {
   replyToMessageId?: string;
   attachments?: OutboundAttachment[];
   effect?: string;
+  /** Optional interactive action buttons (rendered as Telegram inline keyboard / Discord buttons; safely ignored on plain-text channels). */
+  actions?: OutboundActionButton[];
 }
 
 export interface ChannelAdapter {

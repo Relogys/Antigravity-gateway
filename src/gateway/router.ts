@@ -4,7 +4,6 @@ import type {
   PermissionResolveResult,
 } from "../acp/permissions.js";
 import { fetchAgyQuota } from "../acp/quota.js";
-import { stripIdeFileLinks } from "../channels/format.js";
 import { splitQualifiedChatId } from "../channels/hub.js";
 import {
   getChannelAllowedUsers,
@@ -15,7 +14,6 @@ import {
   type ChannelName,
   type GatewayConfig,
 } from "../config.js";
-import { extractOutboundMedia } from "../photon/format.js";
 import type {
   AcpSessionSummary,
   AgentBackend,
@@ -28,6 +26,7 @@ import type {
   InboundMessage,
   LoopJob,
   ModelCatalogEntry,
+  OutboundActionButton,
   PendingPermission,
   QuotaSummary,
   SessionInfo,
@@ -39,20 +38,19 @@ import { handleLoopCommand } from "./commands/loop.js";
 import { handlePhotonNativeCommand } from "./commands/photon.js";
 import { handleSessionCommand } from "./commands/session.js";
 import {
-  formatUptime,
   handleSystemCommand,
   type RouterCommandContext,
   type VerbosityLevel,
 } from "./commands/system.js";
 import { BotLoopGuard } from "./guards.js";
-import { LiveProgressTracker, sanitizeToolTitle } from "./progress.js";
 import { LoopScheduler } from "./scheduler.js";
 import type { GatewayStore } from "./store.js";
+import { TurnExecutor } from "./turn-executor.js";
 
 const DEFAULT_TYPING_INTERVAL_MS = 5000;
 const DEFAULT_PROGRESS_POLL_INTERVAL_MS = 15_000;
 const QUOTA_CHECK_INTERVAL_MS = 5 * 60 * 1000;
-const GATEWAY_VERSION = "0.4.1";
+const GATEWAY_VERSION = "0.4.2";
 const MAX_SESSION_LIST_CACHE = 500;
 const MAX_LAST_PROMPTS = 500;
 const REPLY_QUOTE_SNIPPET_MAX = 500;
@@ -197,11 +195,6 @@ function escapeRegExp(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function isCancellationError(err: unknown): boolean {
-  const msg = err instanceof Error ? err.message : String(err);
-  return /\b(cancel|cancelled|canceled|aborted)\b/i.test(msg);
-}
-
 /**
  * Central gateway router handling fail-closed authentication, slash commands,
  * serialized/queued turn execution, media extraction, quota notices, and health state.
@@ -227,7 +220,6 @@ export class GatewayRouter {
   private lastOutboundAt?: number;
   private lastError?: string;
 
-  private readonly activeTurnChats = new Set<string>();
   private readonly cancelledByUser = new Set<string>();
   private readonly stopDrainChats = new Set<string>();
   private readonly sessionGenerations = new Map<string, number>();
@@ -240,7 +232,7 @@ export class GatewayRouter {
   private readonly toolProgressModeByChatId = new Map<string, ToolProgressMode>();
   private readonly toolProgressKeepByChatId = new Map<string, boolean>();
   private readonly lastPromptByChatId = new Map<string, string>();
-  private readonly activeTurnCleanups = new Set<() => void>();
+  private readonly turnExecutor: TurnExecutor;
   private cachedQuota?: QuotaSummary;
 
   constructor(deps: GatewayRouterDeps) {
@@ -274,6 +266,36 @@ export class GatewayRouter {
               : {}),
           },
         }));
+    this.turnExecutor = new TurnExecutor({
+      config: this.config,
+      channel: this.channel,
+      backend: this.backend,
+      store: this.store,
+      typingIntervalMs: this.typingIntervalMs,
+      progressPollIntervalMs: this.progressPollIntervalMs,
+      rememberLastPrompt: (chatId, prompt) => this.rememberLastPrompt(chatId, prompt),
+      withReplyQuote: (msg, text) => this.withReplyQuote(msg, text),
+      getSessionGeneration: (chatId) => this.getSessionGeneration(chatId),
+      consumeStopDrain: (chatId) => this.stopDrainChats.delete(chatId),
+      consumeUserCancel: (chatId) => this.cancelledByUser.delete(chatId),
+      shiftChatQueue: (chatId) => this.shiftChatQueue(chatId),
+      reactionsEnabled: (ch) => this.reactionsEnabled(ch),
+      resolveDefaultCwd: (chatId) => this.resolveDefaultCwd(chatId),
+      resolveChannelGroup: (chatId) => this.resolveChannelGroup(chatId),
+      getChatApprovalMode: (chatId) => this.getChatApprovalMode(chatId),
+      getChatBusyMode: (chatId) => this.getChatBusyMode(chatId),
+      getChatVerbosity: (chatId) => this.getChatVerbosity(chatId),
+      getChatToolProgressMode: (chatId) => this.getChatToolProgressMode(chatId),
+      getChatToolProgressKeep: (chatId) => this.getChatToolProgressKeep(chatId),
+      shouldUseLiveProgressEdit: (chatId, ch) => this.shouldUseLiveProgressEdit(chatId, ch),
+      ensureSessionRecord: (chatId, patch) => this.ensureSessionRecord(chatId, patch),
+      maybeGetLowQuotaNotice: () => this.maybeGetLowQuotaNotice(),
+      recordError: (message) => {
+        this.lastError = message;
+      },
+      sendReply: (chatId, text, replyToMessageId, mediaPaths, actions) =>
+        this.sendReply(chatId, text, replyToMessageId, mediaPaths, actions),
+    });
 
     this.scheduler.setPromptRunner?.((job) => this.runLoopPrompt(job));
   }
@@ -285,18 +307,13 @@ export class GatewayRouter {
   /** Stops pending burst timers and active typing/progress timers so nothing leaks after shutdown. */
   stop(): void {
     this.burstCoalescer.stop();
-    for (const cleanup of [...this.activeTurnCleanups]) {
-      try {
-        cleanup();
-      } catch {
-        // Best-effort shutdown cleanup.
-      }
-    }
-    this.activeTurnCleanups.clear();
+    this.turnExecutor.stop();
   }
 
   /**
-   * Called by AgyAgentBackend's permissionNotifier to alert the user in iMessage.
+   * Called by AgyAgentBackend's permissionNotifier to alert the user.
+   * Attaches interactive action buttons (rendered natively on Telegram/Discord)
+   * alongside the text command fallback for plain-text channels.
    */
   async notifyPermission(
     chatId: string,
@@ -313,7 +330,13 @@ export class GatewayRouter {
       "• /approve always",
       "• /deny",
     ];
-    await this.sendReply(chatId, lines.join("\n"));
+    const actions: OutboundActionButton[] = [
+      { id: "perm:once", label: "✅ Allow Once", style: "primary" },
+      { id: "perm:session", label: "🔓 Allow Session", style: "secondary" },
+      { id: "perm:always", label: "⭐ Always", style: "secondary" },
+      { id: "perm:deny", label: "🛑 Deny", style: "danger" },
+    ];
+    await this.sendReply(chatId, lines.join("\n"), undefined, [], actions);
   }
 
   async handleInbound(msg: InboundMessage): Promise<void> {
@@ -448,7 +471,7 @@ export class GatewayRouter {
       uptimeMs: Date.now() - this.startedAt,
       channelConnected,
       activeSessions,
-      activeTurns: backendStats?.activeTurns ?? this.activeTurnChats.size,
+      activeTurns: backendStats?.activeTurns ?? this.turnExecutor.activeTurnCount(),
       pendingPermissions: backendStats?.pendingPermissions ?? 0,
       activeLoops: this.scheduler.activeCount(),
       lastInboundAt: channelStats?.lastInboundAt ?? this.lastInboundAt,
@@ -713,7 +736,8 @@ export class GatewayRouter {
 
   private isChatBusy(chatId: string): boolean {
     return (
-      this.activeTurnChats.has(chatId) || (this.backend.isBusy?.(chatId) ?? false)
+      this.turnExecutor.isChatActive(chatId) ||
+      (this.backend.isBusy?.(chatId) ?? false)
     );
   }
 
@@ -1076,340 +1100,7 @@ export class GatewayRouter {
     attachments: InboundAttachment[],
     options: { overrideCwd?: string; isLoop?: boolean; loopJobId?: string } = {},
   ): Promise<void> {
-    const { chatId } = msg;
-    const isLoop = options.isLoop === true;
-    if (!isLoop) {
-      this.rememberLastPrompt(chatId, text);
-      this.activeTurnChats.add(chatId);
-    }
-
-    try {
-      let currentMsg = msg;
-      let currentText = isLoop ? text : this.withReplyQuote(msg, text);
-      let currentAttachments = attachments;
-      let currentOptions = options;
-
-      while (true) {
-        const turnGeneration = this.getSessionGeneration(chatId);
-        await this.runSingleTurn(
-          currentMsg,
-          currentText,
-          currentAttachments,
-          turnGeneration,
-          currentOptions,
-        );
-
-        if (isLoop) {
-          break;
-        }
-        if (this.stopDrainChats.delete(chatId)) {
-          break;
-        }
-        const nextPrompt = this.shiftChatQueue(chatId);
-        if (!nextPrompt) {
-          break;
-        }
-        currentMsg = {
-          ...currentMsg,
-          text: nextPrompt,
-          attachments: [],
-        };
-        currentText = nextPrompt;
-        currentAttachments = [];
-        currentOptions = {};
-      }
-    } finally {
-      if (!isLoop) {
-        this.activeTurnChats.delete(chatId);
-      }
-    }
-  }
-
-  private async runSingleTurn(
-    msg: InboundMessage,
-    text: string,
-    attachments: InboundAttachment[],
-    turnGeneration: number,
-    options: { overrideCwd?: string; isLoop?: boolean; loopJobId?: string } = {},
-  ): Promise<void> {
-    const { chatId } = msg;
-    const isLoop = options.isLoop === true;
-    const backendChatId = isLoop
-      ? `${chatId}::loop:${options.loopJobId ?? "job"}`
-      : chatId;
-
-    if (this.reactionsEnabled(msg.channel) && this.channel.react && !isLoop) {
-      this.channel.react(chatId, msg.id, "👀").catch(() => {});
-    }
-
-    let typingTimer: ReturnType<typeof setInterval> | undefined;
-    let progressTimer: ReturnType<typeof setInterval> | undefined;
-    let typingActive = false;
-    const stopTyping = () => {
-      if (typingTimer) {
-        clearInterval(typingTimer);
-        typingTimer = undefined;
-      }
-      if (typingActive) {
-        typingActive = false;
-        this.channel.sendTyping?.(chatId, false).catch(() => {});
-      }
-    };
-    const cleanupTurnTimers = () => {
-      if (progressTimer) {
-        clearInterval(progressTimer);
-        progressTimer = undefined;
-      }
-      stopTyping();
-    };
-    this.activeTurnCleanups.add(cleanupTurnTimers);
-
-    if (this.channel.sendTyping && !isLoop) {
-      typingActive = true;
-      this.channel.sendTyping(chatId, true).catch(() => {});
-      if (this.typingIntervalMs > 0) {
-        typingTimer = setInterval(() => {
-          void this.channel.sendTyping?.(chatId, true).catch(() => {});
-        }, this.typingIntervalMs);
-        typingTimer.unref?.();
-      }
-    }
-
-    const stored = this.store.getSession(chatId);
-    const cwd = options.overrideCwd ?? this.resolveDefaultCwd(chatId);
-    const approvalMode = this.getChatApprovalMode(chatId);
-    const model = stored?.model ?? this.config.defaultModel;
-    const effort = stored?.effort ?? this.config.defaultEffort;
-
-    const useLiveProgress =
-      !options.isLoop && this.shouldUseLiveProgressEdit(chatId, msg.channel);
-    const toolProgressMode = this.getChatToolProgressMode(chatId);
-    const liveProgress = useLiveProgress
-      ? new LiveProgressTracker({
-          chatId,
-          modelLabel: model ?? "default",
-          channel: this.channel,
-          keepOnComplete: this.getChatToolProgressKeep(chatId),
-          editIntervalMs: this.config.toolProgressEditIntervalMs ?? 1500,
-          verbosity: this.getChatVerbosity(chatId),
-          replyToMessageId: msg.id,
-        })
-      : undefined;
-
-    try {
-      // Silence progress & stall watchdog (interactive turns only).
-      if (
-        !options.isLoop &&
-        (this.config.progressSilenceMs > 0 ||
-          this.config.sessionStallTimeoutMs > 0)
-      ) {
-        const verbosity = this.getChatVerbosity(chatId);
-        const turnStartedAt = Date.now();
-        let lastProgressNotifyAt = turnStartedAt;
-        let stallNotified = false;
-        progressTimer = setInterval(() => {
-          try {
-            const now = Date.now();
-            const activity = this.backend.getTurnActivity?.(chatId);
-            const elapsed = formatUptime(now - turnStartedAt);
-            const modelLabel = activity?.model ?? model ?? "default";
-            const lastActivityAt = activity?.lastActivityAt ?? turnStartedAt;
-
-            if (
-              this.config.sessionStallTimeoutMs > 0 &&
-              !stallNotified &&
-              now - lastActivityAt >= this.config.sessionStallTimeoutMs
-            ) {
-              stallNotified = true;
-              lastProgressNotifyAt = now;
-              const silentFor = formatUptime(now - lastActivityAt);
-              void this.sendReply(
-                chatId,
-                `⚠️ 当前会话已静默 ${silentFor} 无模型/工具活动（模型：${modelLabel}）。发送 /stop 可取消当前任务，或 /new 开启新会话。`,
-              ).catch(() => {});
-              return;
-            }
-
-            // `off`, explicit `off` mode, and live edited cards all suppress pulses,
-            // but the stall alert above always fires.
-            if (verbosity === "off" || toolProgressMode === "off" || useLiveProgress) {
-              return;
-            }
-
-            if (
-              this.config.progressSilenceMs > 0 &&
-              now - lastProgressNotifyAt >= this.config.progressSilenceMs
-            ) {
-              lastProgressNotifyAt = now;
-              let progressText: string;
-              if (activity?.phase === "retrying") {
-                const reason = activity.lastRetryReason
-                  ? `（${activity.lastRetryReason}）`
-                  : "";
-                progressText = `⏳ [${modelLabel}] 遇到临时异常，正在第 ${activity.retryCount}/${activity.maxRetries} 次重试${reason}，已耗时 ${elapsed}…`;
-              } else if (activity?.phase === "tool" && activity.currentTool) {
-                const toolTitle = sanitizeToolTitle(activity.currentTool, 48);
-                progressText = `⏳ [${modelLabel}] 处理中（已耗时 ${elapsed}）：正在执行工具「${toolTitle}」（已调用 ${activity.toolCount} 次）。发送 /stop 可取消。`;
-              } else {
-                const toolNote = activity?.toolCount
-                  ? `，已调用 ${activity.toolCount} 次工具`
-                  : "";
-                const retryNote = activity?.retryCount
-                  ? `，已重试 ${activity.retryCount} 次`
-                  : "";
-                progressText = `⏳ [${modelLabel}] 思考/处理中（已耗时 ${elapsed}${toolNote}${retryNote}）。发送 /stop 可取消。`;
-              }
-              if (verbosity === "full") {
-                const detail = [
-                  `模型 ${modelLabel}`,
-                  activity?.effort ? `effort ${activity.effort}` : "",
-                  `阶段 ${activity?.phase ?? "thinking"}`,
-                  `工具 ${activity?.toolCount ?? 0} 次`,
-                  `重试 ${activity?.retryCount ?? 0}/${activity?.maxRetries ?? 0}`,
-                ]
-                  .filter(Boolean)
-                  .join(" | ");
-                progressText += `\n📊 ${detail}`;
-              }
-              void this.sendReply(chatId, progressText).catch(() => {});
-            }
-          } catch {
-            // Sampling must never break the turn.
-          }
-        }, this.progressPollIntervalMs);
-        progressTimer.unref?.();
-      }
-
-      const requesterSenderId = options.isLoop
-        ? undefined
-        : senderKeyFor(
-            msg.channel || this.channel.name,
-            msg.senderId || msg.rawSenderId || "",
-          ) || undefined;
-
-      const result = await this.backend.sendTurn({
-        chatId: backendChatId,
-        sessionId: isLoop ? undefined : stored?.sessionId || undefined,
-        cwd,
-        text,
-        attachments,
-        model,
-        effort,
-        approvalMode,
-        requesterSenderId,
-        callbacks: liveProgress
-          ? { onToolCall: (event) => liveProgress.onToolCall(event) }
-          : undefined,
-      });
-
-      const wasResetDuringTurn =
-        !isLoop && this.getSessionGeneration(chatId) !== turnGeneration;
-      const wasUserCancelled =
-        !isLoop &&
-        (this.cancelledByUser.delete(chatId) ||
-          result.stopReason === "cancelled");
-
-      if (wasResetDuringTurn) {
-        await liveProgress?.finish("cancelled");
-        return;
-      }
-
-      const isFirstCompleted =
-        !isLoop && !stored?.onboarded && !wasUserCancelled;
-
-      if (!isLoop) {
-        await this.ensureSessionRecord(chatId, {
-          sessionId: result.sessionId,
-          cwd,
-          approvalMode,
-          busyMode: this.getChatBusyMode(chatId),
-          ...(isFirstCompleted ? { onboarded: true } : {}),
-        });
-      }
-
-      const reactionsOn =
-        this.reactionsEnabled(msg.channel) && Boolean(this.channel.react) && !options.isLoop;
-
-      if (wasUserCancelled && !result.text.trim()) {
-        await liveProgress?.finish("cancelled");
-        if (reactionsOn) {
-          this.channel.react!(chatId, msg.id, "🛑").catch(() => {});
-        }
-        return;
-      }
-
-      const { cleanText, mediaPaths } = extractOutboundMedia(result.text, cwd);
-      const strippedText = stripIdeFileLinks(cleanText);
-      const quotaNotice = await this.maybeGetLowQuotaNotice();
-      // Keep media-only replies pristine; the one-shot tip rides on the first text answer.
-      const onboardingFooter =
-        isFirstCompleted && mediaPaths.length === 0
-          ? `💡 已自动建立 [${this.resolveChannelGroup(chatId)}] 分组会话；发 /model 切换模型，发 /help 查看全部指令。`
-          : "";
-      const combinedText = [strippedText, quotaNotice, onboardingFooter]
-        .filter(Boolean)
-        .join("\n\n");
-      const emptyResult = !combinedText && mediaPaths.length === 0;
-
-      // Stop typing and watchdog before sending the final reply.
-      if (progressTimer) {
-        clearInterval(progressTimer);
-        progressTimer = undefined;
-      }
-      stopTyping();
-
-      // Finalize the live card first: deletes it cleanly (keep=false) or stamps
-      // ✅ (keep=true) BEFORE the final answer lands beneath it.
-      await liveProgress?.finish(wasUserCancelled ? "cancelled" : "completed");
-
-      if (!emptyResult) {
-        await this.sendReply(
-          chatId,
-          combinedText,
-          options.isLoop ? undefined : msg.id,
-          mediaPaths,
-        );
-      }
-
-      if (reactionsOn) {
-        // A user-cancelled or empty turn is a deliberate stop, not a successful reply.
-        this.channel.react!(
-          chatId,
-          msg.id,
-          wasUserCancelled || emptyResult ? "🛑" : "👍",
-        ).catch(() => {});
-      }
-    } catch (err) {
-      const wasResetDuringTurn =
-        this.getSessionGeneration(chatId) !== turnGeneration;
-      const wasUserCancelled =
-        this.cancelledByUser.delete(chatId) && isCancellationError(err);
-
-      if (wasResetDuringTurn || wasUserCancelled) {
-        await liveProgress?.finish("cancelled");
-      }
-
-      if (!wasResetDuringTurn && !wasUserCancelled) {
-        const message = err instanceof Error ? err.message : String(err);
-        await liveProgress?.finish("failed", message);
-        this.lastError = message;
-        if (this.reactionsEnabled(msg.channel) && this.channel.react && !options.isLoop) {
-          this.channel.react(chatId, msg.id, "👎").catch(() => {});
-        }
-        await this.sendReply(
-          chatId,
-          `Error: ${message.slice(0, 600)}`,
-          options.isLoop ? undefined : msg.id,
-        ).catch(() => {});
-      }
-    } finally {
-      this.activeTurnCleanups.delete(cleanupTurnTimers);
-      cleanupTurnTimers();
-      if (isLoop) {
-        // Release the ephemeral loop backend session so recurring cron runs never leak sessions.
-        await this.backend.resetSession(backendChatId).catch(() => {});
-      }
-    }
+    await this.turnExecutor.executeTurn(msg, text, attachments, options);
   }
 
   private async maybeGetLowQuotaNotice(): Promise<string> {
@@ -1443,6 +1134,7 @@ export class GatewayRouter {
     text: string,
     replyToMessageId?: string,
     mediaPaths: string[] = [],
+    actions?: OutboundActionButton[],
   ): Promise<void> {
     await this.channel.sendMessage({
       chatId,
@@ -1453,6 +1145,7 @@ export class GatewayRouter {
         mediaPaths.length > 0
           ? mediaPaths.map((p) => ({ path: p }))
           : undefined,
+      ...(actions && actions.length > 0 ? { actions } : {}),
     });
     this.lastOutboundAt = Date.now();
   }

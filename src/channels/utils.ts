@@ -397,6 +397,26 @@ export function extractAuthSchemeToken(
   return token.length > 0 ? token : undefined;
 }
 
+/**
+ * Translate a gateway interactive button callback ID (e.g. `perm:once`) into the
+ * equivalent slash command so button taps flow through the exact same fail-closed
+ * authorization and requester-bound group permission checks as typed commands.
+ */
+export function actionCallbackToCommand(actionId: string): string | undefined {
+  switch (actionId.trim().toLowerCase()) {
+    case "perm:once":
+      return "/approve once";
+    case "perm:session":
+      return "/approve session";
+    case "perm:always":
+      return "/approve always";
+    case "perm:deny":
+      return "/deny";
+    default:
+      return undefined;
+  }
+}
+
 /** Parse a request URL against localhost, throwing `onInvalid()` on malformed paths. */
 export function parseRequestUrl(rawUrl: string | undefined, onInvalid: () => Error): URL {
   try {
